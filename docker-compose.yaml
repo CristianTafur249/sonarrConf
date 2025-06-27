@@ -1,0 +1,120 @@
+services:
+  # qbittorrent:
+  #   container_name: qbittorrent
+  #   image: linuxserver/qbittorrent:5.1.1
+  #   networks:
+  #     - mynetwork
+  #   environment:
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=America/Bogota
+  #     - WEBUI_PORT=5080
+  #   volumes:
+  #     - ./qbittorrent-config:/config
+  #     - ./1tb1/Bittorrent:/downloads
+  #     - ./media/Peliculas:/movies
+  #     - ./media/series:/tvshows
+  #   ports:
+  #     - 5080:5080
+  #     - 6881:6881
+  #     - 6881:6881/udp
+  #   restart: "unless-stopped"
+
+  transmission:
+    image: jaymoulin/transmission:4.0.6
+    networks:
+      - mynetwork
+    command: transmission-daemon -f -g /config
+    volumes:
+      - ./transmission:/config
+      - ./config/1tb1/Bittorrent:/downloads
+      - ./media/Peliculas:/movies
+      - ./media/series:/tvshows
+    ports:
+      - 9091:9091
+      - 51413:51413
+      - 51413:51413/udp
+    restart: "unless-stopped"
+
+  radarr:
+    container_name: radarr
+    image: lscr.io/linuxserver/radarr:latest
+    networks:
+      - mynetwork
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Bogota
+    ports:
+      - 7878:7878
+    volumes:
+      - ./config/radarr-config:/config
+      - ./media/Peliculas:/movies
+      - ./config/1tb1/Bittorrent:/downloads
+
+    restart: "unless-stopped"
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    networks:
+      - mynetwork
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Bogota
+    volumes:
+      - ./config/sonarr-config:/config
+      - ./media/series:/tvshows
+      - ./config/1tb1/Bittorrent:/downloads
+    ports:
+      - 8989:8989
+    restart: unless-stopped
+
+  prowlarr:
+    container_name: prowlarr
+    image: lscr.io/linuxserver/prowlarr:latest
+    networks:
+      - mynetwork
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Bogota
+    volumes:
+      - ./config/prowlarr-config:/config
+    ports:
+      - 9696:9696
+    restart: unless-stopped
+
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    networks:
+      - mynetwork
+    volumes:
+      - ./config/jellyfin-config:/config
+      - ./config/jellyfin-cache:/cache
+      - ./media/Peliculas:/movies
+      - ./media/series:/tvshows
+    ports:
+      - 8096:8096
+    restart: unless-stopped
+
+  jellyseerr:
+    image: fallenbagel/jellyseerr:latest
+    container_name: jellyseerr
+    environment:
+      - LOG_LEVEL=debug
+      - TZ=America/Bogota
+      - PORT=5055
+    networks:
+      - mynetwork
+    ports:
+      - 5055:5055
+    volumes:
+      - ./config/jellyseerr-config:/app/config
+    restart: unless-stopped
+
+networks:
+  mynetwork:
+    external: false

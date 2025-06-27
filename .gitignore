@@ -1,0 +1,5 @@
+config/*
+transmission/*
+!transmission/settings.json
+media/*
+magnets.txt
