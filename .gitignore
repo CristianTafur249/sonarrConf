@@ -3,3 +3,6 @@ transmission/*
 !transmission/settings.json
 media/*
 magnets.txt
+scripts/logs/*
+scripts/pending-compression.txt
+scripts/__pycache__

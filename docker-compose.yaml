@@ -50,6 +50,7 @@ services:
     volumes:
       - ./config/radarr-config:/config
       - ./media/Peliculas:/movies
+      - ./scripts:/scripts
       - ./config/1tb1/Bittorrent:/downloads
 
     restart: "unless-stopped"
@@ -65,6 +66,7 @@ services:
       - TZ=America/Bogota
     volumes:
       - ./config/sonarr-config:/config
+      - ./scripts:/scripts
       - ./media/series:/tvshows
       - ./config/1tb1/Bittorrent:/downloads
     ports:
