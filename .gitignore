@@ -4,5 +4,5 @@ transmission/*
 media/*
 magnets.txt
 scripts/logs/*
-scripts/pending-compression.txt
+scripts/pending-*
 scripts/__pycache__
