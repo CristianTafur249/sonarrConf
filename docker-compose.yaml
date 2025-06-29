@@ -91,6 +91,10 @@ services:
   jellyfin:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"
     networks:
       - mynetwork
     volumes:

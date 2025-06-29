@@ -43,10 +43,12 @@ mkdir -p ./scripts/logs
     serie_name=$(echo "$file_name" | sed -E "s/(S[0-9]{2}E[0-9]{2}|[0-9]{1,2}x[0-9]{2}).*$//" |
                  sed 's/[._]/ /g' | sed 's/ *$//' | sed 's/\s\+/ /g')
 
-    # Capitalizar pero sin alterar los guiones
+    # Capitalizar manteniendo los guiones
     serie_name_capitalized=$(echo "$serie_name" |
-      awk 'BEGIN{OFS=FS="-"} {for(i=1;i<=NF;i++){gsub(/(^|\s)([a-z])/, "\\1\\U\\2", $i)}; print}' |
-      sed 's/^\s*//;s/\s*$//')
+      sed 's/-/ - /g' |
+      awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2)); print}' |
+      sed 's/ - /-/g' |
+      sed 's/ *$//')
 
     if [[ -z "$serie_name_capitalized" ]]; then
       echo "No se pudo detectar serie en: $input"

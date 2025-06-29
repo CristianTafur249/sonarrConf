@@ -22,49 +22,31 @@ mkdir -p ./scripts/logs
 
     dir_path="$(dirname "$input")"
     file_name="$(basename "$input")"
+    base_name="${file_name%.*}"  # Sin extensión
 
-    name=$(echo "$file_name" | sed -E 's/\.[^.]+$//' | sed 's/[._]/ /g' | sed 's/\s\+/ /g' | sed 's/ *$//')
-    title=$(echo "$name" | sed -E 's/([12][0-9]{3}).*//')
-    year=$(echo "$name" | grep -oE '[12][0-9]{3}' | head -n1)
+    final_output="$dir_path/$base_name.mkv"
+    temp_output="$dir_path/$base_name.compressed.mkv"
 
-    # Tags
-    quality=$(echo "$file_name" | grep -oEi "(2160p|1080p|720p|480p)" | head -n1)
-    source=$(echo "$file_name" | grep -oEi "(WEB[-\.]?DL|BluRay|HDTV|DVDRip)" | head -n1 | sed 's/[-.]/-/g')
-    language=$(echo "$file_name" | grep -oEi "(Dual[-\.]?Lat|Sub[-\.]?Esp|Latino|Español)" | head -n1 | sed 's/[-.]/-/g')
-
-    extra_tags=""
-    [[ -n "$source" ]] && extra_tags+="$source "
-    [[ -n "$quality" ]] && extra_tags+="$quality "
-    [[ -n "$language" ]] && extra_tags+="$language"
-    extra_tags=$(echo "$extra_tags" | sed 's/ *$//')
-
-    title_clean=$(echo "$title" | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2)); print}' | sed 's/ *$//')
-
-    new_name="$title_clean"
-    [[ -n "$year" ]] && new_name+=" ($year)"
-    [[ -n "$extra_tags" ]] && new_name+=" [$extra_tags]"
-    new_name=$(echo "$new_name" | sed 's/ *$//').mkv
-
-    output="$dir_path/$new_name"
     file_size=$(stat -c %s "$input")
 
     if (( file_size < 1073741824 )); then
-      echo "Película < 1GB, solo movida: $input → $output"
-      mv "$input" "$output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOVIDA: $input → $output" >> "$LOGFILE"
+      echo "Película < 1GB, solo renombrada si es necesario: $input → $final_output"
+      [[ "$input" != "$final_output" ]] && mv "$input" "$final_output"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOVIDA: $input → $final_output" >> "$LOGFILE"
       continue
     fi
 
-    echo "Comenzando compresión: $input → $output"
+    echo "Comenzando compresión: $input → $temp_output"
 
-    if /usr/bin/ffmpeg -i "$input" -vcodec libx264 -crf 24 -preset veryfast -acodec copy "$output" < /dev/null; then
+    if /usr/bin/ffmpeg -i "$input" -vcodec libx264 -crf 24 -preset veryfast -acodec copy "$temp_output" < /dev/null; then
       rm "$input"
-      echo "Comprimida y movida: $input → $output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDA: $input → $output" >> "$LOGFILE"
+      mv "$temp_output" "$final_output"
+      echo "Comprimida y movida: $input → $final_output"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDA: $input → $final_output" >> "$LOGFILE"
     else
       echo "Falló la compresión: $input"
       echo "$input" >> "$PENDING"
-      rm -f "$output"
+      rm -f "$temp_output"
     fi
 
   done < "$TEMP"
