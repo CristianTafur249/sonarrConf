@@ -36,6 +36,22 @@ services:
       - 51413:51413/udp
     restart: "unless-stopped"
 
+
+  samba:
+    image: dperson/samba # no hay tag con versiones, solo latest
+    restart: always
+    command: '-u "pi;password" -s "media;/media;yes;no" -s "downloads;/downloads;yes;no"'
+    stdin_open: true
+    tty: true
+    environment:
+      - TZ=America/Bogota
+    ports:
+      - 139:139
+      - 445:445
+    volumes:
+      - ./media:/media
+      - ./config/1tb1/Bittorrent:/downloads
+
   radarr:
     container_name: radarr
     image: lscr.io/linuxserver/radarr:latest
@@ -88,11 +104,32 @@ services:
       - 9696:9696
     restart: unless-stopped
 
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    networks:
+      - mynetwork
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Bogota
+    ports:
+      - 6767:6767
+    volumes:
+      - ./config/bazarr-config:/config
+      - ./media/Peliculas:/movies
+      - ./media/series:/tvshows
+      - ./config/1tb1/Bittorrent:/downloads
+    restart: unless-stopped
+
+
   jellyfin:
     image: jellyfin/jellyfin:latest
     container_name: jellyfin
     devices:
       - /dev/dri:/dev/dri
+    environment:
+      - TZ=America/Bogota
     group_add:
       - "44"
     networks:
@@ -105,6 +142,26 @@ services:
     ports:
       - 8096:8096
     restart: unless-stopped
+
+  # plex:
+  #   image: jaymoulin/plex:1.41.8.9834
+  #   expose:
+  #     - 32400
+  #     - 33400
+  #   # Descomentar si NO usas network_mode: "host"
+  #   # ports:
+  #   #  - 32400:32400
+  #   #  - 33400:33400
+  #   environment:
+  #     - TZ=${TZ}
+  #   volumes:
+  #     - ./config/plex/PlexMediaServer:/root/Library/Application Support/Plex Media Server
+  #     - ./media/:/media
+  #     - ./config/plex/tmp:/tmp
+  #   restart: unless-stopped
+  #   security_opt:
+  #     - no-new-privileges:false
+  #   network_mode: "host" # Solo funciona en Linux
 
   jellyseerr:
     image: fallenbagel/jellyseerr:latest

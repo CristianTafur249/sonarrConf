@@ -39,11 +39,11 @@ mkdir -p ./scripts/logs
       episode_code=$(echo "$episode_code" | awk '{print toupper($0)}')
     fi
 
-    # Extraer nombre de serie (hasta antes del código del episodio) — NO reemplazar guiones
+    # Extraer nombre de serie
     serie_name=$(echo "$file_name" | sed -E "s/(S[0-9]{2}E[0-9]{2}|[0-9]{1,2}x[0-9]{2}).*$//" |
                  sed 's/[._]/ /g' | sed 's/ *$//' | sed 's/\s\+/ /g')
 
-    # Capitalizar manteniendo los guiones
+    # Capitalizar
     serie_name_capitalized=$(echo "$serie_name" |
       sed 's/-/ - /g' |
       awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) tolower(substr($i,2)); print}' |
@@ -56,16 +56,15 @@ mkdir -p ./scripts/logs
       continue
     fi
 
-    # Detectar nombre del episodio si está
+    # Nombre del episodio
     episode_title=$(echo "$file_name" | sed -E "s/^.*$episode_code[ _.-]*//; s/\.[^.]+$//" |
                     sed 's/[._-]/ /g' | sed 's/\s\+/ /g' | sed 's/ *$//' | sed 's/^ *//')
 
-    # Detectar temporada
+    # Temporada
     season_num=$(echo "$episode_code" | grep -oE "S[0-9]{2}" | tr -d 'S' | sed 's/^0*//')
     [[ -z "$season_num" ]] && season_num="1"
-    season_dir="Season $season_num"
 
-    # Tags extra (calidad, fuente, idioma)
+    # Tags
     quality=$(echo "$file_name" | grep -oEi "(2160p|1080p|720p|480p)" | head -n1)
     source=$(echo "$file_name" | grep -oEi "(WEB[-\.]?DL|BluRay|HDTV|DVDRip)" | head -n1 | sed 's/[-.]/-/g')
     language=$(echo "$file_name" | grep -oEi "(Dual[-\.]?Lat|Sub[-\.]?Esp|Latino|Español)" | head -n1 | sed 's/[-.]/-/g')
@@ -84,29 +83,31 @@ mkdir -p ./scripts/logs
     [[ -n "$extra_tags" ]] && new_name+=" $extra_tags"
     new_name=$(echo "$new_name" | sed 's/ *$//').mkv
 
-    relative_dir="media/series/$serie_name_capitalized/$season_dir"
-    mkdir -p "$relative_dir"
-    output="$relative_dir/$new_name"
+    dir_name="$(dirname "$input")"
+    temp_output="$dir_name/$(basename "$input" .mkv).compressing.mkv"
+    final_output="$dir_name/$new_name"
 
     file_size=$(stat -c %s "$input")
 
     if (( file_size < 1073741824 )); then
-      echo "Archivo < 1GB, solo renombrado y movido: $input → $output"
-      mv "$input" "$output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOVIDO: $input → $output" >> "$LOGFILE"
+      echo "Archivo < 1GB, solo renombrado y movido: $input → $final_output"
+      mv "$input" "$final_output"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] MOVIDO: $input → $final_output" >> "$LOGFILE"
       continue
     fi
 
-    echo "Comenzando compresión: $input → $output"
+    echo "Comenzando compresión: $input → $final_output"
 
-    if /usr/bin/ffmpeg -i "$input" -vcodec libx264 -crf 24 -preset veryfast -acodec copy "$output" < /dev/null; then
-      rm "$input"
-      echo "Comprimido, renombrado y eliminado original: $input → $output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $output" >> "$LOGFILE"
+    if /usr/bin/ffmpeg -i "$input" -vcodec libx264 -crf 24 -preset veryfast -acodec copy "$temp_output" < /dev/null; then
+      mv "$input" "$input.bak"
+      mv "$temp_output" "$final_output"
+      rm "$input.bak"
+      echo "Comprimido y renombrado: $input → $final_output"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $final_output" >> "$LOGFILE"
     else
       echo "Falló la compresión: $input"
       echo "$input" >> "$PENDING"
-      rm -f "$output"
+      rm -f "$temp_output"
     fi
 
   done < "$TEMP"
