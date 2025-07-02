@@ -62,4 +62,4 @@ fi
 
 rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE"
 
-/home/tafurc/mediaJelly/scripts/process-movies.sh
+/home/tafurc/mediaJelly/scripts/process-movies.sh 

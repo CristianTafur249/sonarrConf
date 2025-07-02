@@ -38,7 +38,10 @@ mkdir -p ./scripts/logs
 
     echo "Comenzando compresión: $input → $temp_output"
 
-    if /usr/bin/ffmpeg -i "$input" -vcodec libx264 -crf 24 -preset veryfast -acodec copy "$temp_output" < /dev/null; then
+    if ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 \
+      -i "$input" -vf 'format=nv12,hwupload' \
+      -c:v h264_vaapi -qp 24 -preset fast -c:a copy "$temp_output" < /dev/null; then
+
       rm "$input"
       mv "$temp_output" "$final_output"
       echo "Comprimida y movida: $input → $final_output"

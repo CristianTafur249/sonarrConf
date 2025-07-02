@@ -70,4 +70,4 @@ fi
 rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE"
 sleep 10
 
-/home/tafurc/mediaJelly/scripts/process-compression.sh
+/home/tafurc/mediaJelly/scripts/process-compression.sh 
