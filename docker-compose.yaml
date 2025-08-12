@@ -26,7 +26,7 @@ services:
       - mynetwork
     command: transmission-daemon -f -g /config
     volumes:
-      - ./transmission:/config
+      - ./config/transmission:/config
       - ./config/1tb1/Bittorrent:/downloads
       - ./media/Peliculas:/movies
       - ./media/series:/tvshows
@@ -39,18 +39,20 @@ services:
 
   samba:
     image: dperson/samba # no hay tag con versiones, solo latest
-    restart: always
-    command: '-u "pi;password" -s "media;/media;yes;no" -s "downloads;/downloads;yes;no"'
+    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi"'
     stdin_open: true
     tty: true
     environment:
       - TZ=America/Bogota
+      - PUID=1000
+      - PGID=1000
     ports:
       - 139:139
       - 445:445
     volumes:
       - ./media:/media
       - ./config/1tb1/Bittorrent:/downloads
+    restart: unless-stopped
 
   radarr:
     container_name: radarr
@@ -68,7 +70,6 @@ services:
       - ./media/Peliculas:/movies
       - ./scripts:/scripts
       - ./config/1tb1/Bittorrent:/downloads
-
     restart: "unless-stopped"
 
   sonarr:

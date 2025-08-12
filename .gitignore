@@ -1,8 +1,8 @@
 config/*
-transmission/*
-!transmission/settings.json
+!config/transmission/settings.json
 media/*
 magnets.txt
 scripts/logs/*
 scripts/pending-*
+scripts/tmp/
 scripts/__pycache__
