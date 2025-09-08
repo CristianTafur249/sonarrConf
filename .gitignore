@@ -1,8 +1,32 @@
+# Configuraciones sensibles
 config/*
 !config/transmission/settings.json
+!config/telegram.conf.example
+!config/crontab.example
+config/telegram.conf
+
+# Archivos de medios
 media/*
+
+# Archivos de trabajo
 magnets.txt
 scripts/logs/*
 scripts/pending-*
 scripts/tmp/
 scripts/__pycache__
+
+# Archivos de sistema y temporales
+*.log
+*.tmp
+*.bak
+*.compressed.mp4
+.DS_Store
+Thumbs.db
+
+# Archivos de bloqueo
+*.lock
+last_run
+
+# Archivos de respaldo de configuración
+*.old
+*.backup
