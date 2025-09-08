@@ -18,6 +18,38 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+# Función para limpiar archivos compressed.mp4 parciales
+cleanup_partial_files() {
+  local folder="$1"
+  local cleaned=0
+  
+  while IFS= read -r -d '' compressed_file; do
+    if [ -f "$compressed_file" ]; then
+      local base_name="${compressed_file%.compressed.mp4}"
+      local original_file=""
+      
+      # Buscar el archivo original correspondiente
+      for ext in "${EXTENSIONS[@]}"; do
+        if [ -f "${base_name}.${ext}" ]; then
+          original_file="${base_name}.${ext}"
+          break
+        fi
+      done
+      
+      # Si existe el original, el compressed.mp4 es parcial
+      if [ -n "$original_file" ]; then
+        log "LIMPIEZA: Eliminando archivo compressed.mp4 parcial: $compressed_file"
+        rm -f "$compressed_file"
+        cleaned=$((cleaned + 1))
+      fi
+    fi
+  done < <(find "$folder" -name "*.compressed.mp4" -not -path "*/.*" -print0 2>/dev/null)
+  
+  if [ "$cleaned" -gt 0 ]; then
+    log "Limpieza completada: $cleaned archivos compressed.mp4 parciales eliminados"
+  fi
+}
+
 scan_folder() {
   local folder="$1"
   if [ ! -d "$folder" ]; then
@@ -26,6 +58,9 @@ scan_folder() {
   fi
 
   log "Escaneando: $folder"
+  
+  # Limpiar archivos compressed.mp4 parciales antes de escanear
+  cleanup_partial_files "$folder"
 
   # Construir expresión con múltiples -iname conectadas por -o
   find_expr=()
@@ -34,7 +69,8 @@ scan_folder() {
   done
   unset 'find_expr[${#find_expr[@]}-1]'  # Quitar último -o
 
-  find "$folder" -type f \( "${find_expr[@]}" \) -exec realpath {} \; >> "$TMP_FILE"
+  # Excluir carpetas que comienzan con punto (como .deleted, .trash, etc.)
+  find "$folder" -type f \( "${find_expr[@]}" \) -not -path "*/.*" -exec realpath {} \; >> "$TMP_FILE"
 }
 
 # --- EJECUCIÓN ---
@@ -53,7 +89,17 @@ for folder in "$@"; do
   scan_folder "$abs_folder"
 done
 
-sort -u "$TMP_FILE" > "$NEW_SORTED"
+# Validar que los archivos realmente existen antes de procesarlos
+VALIDATED_TMP=$(mktemp)
+while IFS= read -r file_path; do
+  if [ -f "$file_path" ]; then
+    echo "$file_path" >> "$VALIDATED_TMP"
+  else
+    log "ADVERTENCIA: Archivo no encontrado, omitido: $file_path"
+  fi
+done < "$TMP_FILE"
+
+sort -u "$VALIDATED_TMP" > "$NEW_SORTED"
 sort -u "$OUTPUT_FILE" > "$EXISTING_SORTED"
 
 comm -23 "$NEW_SORTED" "$EXISTING_SORTED" > "$DIFF_FILE"
@@ -65,9 +111,20 @@ log "Nuevas rutas detectadas: $nuevas"
 
 if [ "$nuevas" -gt 0 ]; then
   cat "$DIFF_FILE" >> "$OUTPUT_FILE"
+  log "Agregadas $nuevas nuevas rutas al archivo de pendientes"
+else
+  log "No hay nuevas rutas para procesar"
 fi
 
-rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE"
-sleep 10
+rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE" "$VALIDATED_TMP"
 
-/home/tafurc/mediaJelly/scripts/process-compression.sh 
+# Gestionar logs antes de continuar
+/home/tafurc/mediaJelly/scripts/manage-logs.sh
+
+# Solo procesar compresión si hay archivos pendientes
+if [ -s "$OUTPUT_FILE" ]; then
+  log "Iniciando procesamiento de compresión..."
+  /home/tafurc/mediaJelly/scripts/process-compression.sh
+else
+  log "No hay archivos pendientes para comprimir"
+fi

@@ -39,7 +39,7 @@ services:
 
   samba:
     image: dperson/samba # no hay tag con versiones, solo latest
-    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi"'
+    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s "scripts;/scripts;yes;no;yes;all;pi"'
     stdin_open: true
     tty: true
     environment:

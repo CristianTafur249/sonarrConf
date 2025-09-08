@@ -5,6 +5,7 @@ PENDING="./scripts/pending-compression.txt"
 TEMP="./scripts/pending-compression.tmp"
 LOGFILE="./scripts/logs/compression-success.log"
 NO_SPANISH_LOG="./scripts/logs/no-spanish.log"
+ERROR_LOG="./scripts/logs/compression-errors.log"
 
 mkdir -p ./scripts/tmp
 mkdir -p ./scripts/logs
@@ -12,20 +13,34 @@ mkdir -p ./scripts/logs
 (
   flock 9
 
+  # Verificar si hay archivos pendientes
+  if [ ! -s "$PENDING" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] No hay archivos pendientes para comprimir" >> "$LOGFILE"
+    exit 0
+  fi
+
   cp "$PENDING" "$TEMP" 2>/dev/null || exit 0
   > "$PENDING"
 
+  files_processed=0
+  files_compressed=0
+  files_renamed=0
+  files_skipped=0
+  error_files=()
+  
   while IFS= read -r input || [ -n "$input" ]; do
     # Validar ruta válida
     if [[ ! "$input" =~ ^/ ]] || [[ ! -f "$input" ]]; then
-      echo "Línea inválida ignorada: '$input'" >&2
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Línea inválida ignorada: '$input'" >> "$ERROR_LOG"
       continue
     fi
 
+    files_processed=$((files_processed + 1))
+
     # Saltar si el archivo ya es .mp4
     if [[ "$input" == *.mp4 ]]; then
-      echo "Archivo ya es MP4, ignorado: $input"
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] YA ES MP4: $input" >> "$LOGFILE"
+      files_skipped=$((files_skipped + 1))
       continue
     fi
 
@@ -36,17 +51,31 @@ mkdir -p ./scripts/logs
     temp_output="$dir_path/$base_name.compressed.mp4"
     final_output="$dir_path/$base_name.mp4"
 
+    # Verificar si existe un archivo compressed.mp4 parcial y eliminarlo
+    if [ -f "$temp_output" ]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ADVERTENCIA: Archivo temporal encontrado, eliminando: $temp_output" >> "$ERROR_LOG"
+      rm -f "$temp_output"
+    fi
+
     file_size=$(stat -c %s "$input")
 
     # Si pesa menos de 500 MB, solo renombrar a .mp4
     if (( file_size < 524288000 )); then
-      echo "Archivo < 500MB, renombrado a MP4: $input"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO (<500MB): $input → $final_output" >> "$LOGFILE"
       mv "$input" "$final_output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO: $input → $final_output" >> "$LOGFILE"
+      files_renamed=$((files_renamed + 1))
       continue
     fi
 
-    echo "Comenzando compresión: $input → $temp_output"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Comenzando compresión: $input → $temp_output" >> "$LOGFILE"
+
+    # Verificar integridad del archivo antes de procesarlo
+    if ! ffprobe -v error "$input" > /dev/null 2>&1; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo corrupto o inválido: $input" >> "$ERROR_LOG"
+      echo "$input" >> "$PENDING"
+      error_files+=("$input (archivo corrupto/inválido)")
+      continue
+    fi
 
     # Obtener todos los idiomas de audio y subtítulos
     audio_languages=$(ffprobe -v error -select_streams a -show_entries stream_tags=language -of csv=p=0 "$input" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
@@ -80,6 +109,18 @@ mkdir -p ./scripts/logs
       echo "   ---" >> "$NO_SPANISH_LOG"
     fi
 
+    # Configuración de compresión más agresiva para películas grandes
+    compression_settings=""
+    if (( file_size > 2147483648 )); then  # > 2GB
+      # Compresión más agresiva para archivos grandes
+      compression_settings="-qp 32 -preset slow"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Archivo grande (>2GB), usando compresión agresiva" >> "$LOGFILE"
+    elif (( file_size > 1073741824 )); then  # > 1GB
+      compression_settings="-qp 30 -preset medium"
+    else
+      compression_settings="-qp 28 -preset fast"
+    fi
+
     # Comprimir y convertir a MP4
     if ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 \
       -i "$input" \
@@ -87,28 +128,63 @@ mkdir -p ./scripts/logs
       -map 0:v:0 \
       "${audio_map[@]}" \
       "${subs_map[@]}" \
-      -c:v h264_vaapi -qp 28 \
+      -c:v h264_vaapi $compression_settings \
       -c:a aac -b:a 128k -ac 2 \
       -c:s mov_text \
       -movflags +faststart \
       "$temp_output" < /dev/null; then
 
-      # Reemplazar el original por la versión comprimida
-      mv "$input" "$input.bak"
-      mv "$temp_output" "$final_output"
-      rm "$input.bak"
-
-      echo "Comprimido: $input → $final_output"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $final_output" >> "$LOGFILE"
+      # Verificar que el archivo comprimido sea válido
+      if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
+        # Verificar integridad del archivo comprimido
+        if ffprobe -v error "$temp_output" > /dev/null 2>&1; then
+          # Reemplazar el original por la versión comprimida
+          mv "$input" "$input.bak"
+          mv "$temp_output" "$final_output"
+          rm "$input.bak"
+          
+          original_size_mb=$((file_size / 1024 / 1024))
+          compressed_size=$(stat -c %s "$final_output")
+          compressed_size_mb=$((compressed_size / 1024 / 1024))
+          reduction_percent=$(( (file_size - compressed_size) * 100 / file_size ))
+          
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $final_output (${original_size_mb}MB → ${compressed_size_mb}MB, reducción: ${reduction_percent}%)" >> "$LOGFILE"
+          files_compressed=$((files_compressed + 1))
+        else
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido corrupto: $temp_output" >> "$ERROR_LOG"
+          echo "$input" >> "$PENDING"
+          error_files+=("$input (corrupto)")
+          rm -f "$temp_output"
+        fi
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido vacío o inexistente: $temp_output" >> "$ERROR_LOG"
+        echo "$input" >> "$PENDING"
+        error_files+=("$input (vacío)")
+        rm -f "$temp_output"
+      fi
     else
-      echo "Falló la compresión: $input"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Falló la compresión: $input" >> "$ERROR_LOG"
       echo "$input" >> "$PENDING"
+      error_files+=("$input (falló compresión)")
       rm -f "$temp_output"
     fi
 
   done < "$TEMP"
 
+  # Log de resumen
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESUMEN: Procesados: $files_processed, Comprimidos: $files_compressed, Renombrados: $files_renamed, Omitidos: $files_skipped" >> "$LOGFILE"
+
+  # Exportar archivos con errores para notificaciones
+  if [ ${#error_files[@]} -gt 0 ]; then
+    printf '%s\n' "${error_files[@]}" > "/home/tafurc/mediaJelly/scripts/tmp/error_files.tmp"
+  else
+    rm -f "/home/tafurc/mediaJelly/scripts/tmp/error_files.tmp"
+  fi
+
   rm -f "$TEMP"
   sort -u "$PENDING" -o "$PENDING"
+
+  # Gestionar logs al final
+  /home/tafurc/mediaJelly/scripts/manage-logs.sh
 
 ) 9>"$LOCKFILE"

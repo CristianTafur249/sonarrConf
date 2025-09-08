@@ -1,0 +1,10 @@
+# Configuración de Telegram Bot
+# Obtén el BOT_TOKEN creando un bot con @BotFather en Telegram
+# Obtén el CHAT_ID enviando un mensaje a tu bot y usando: https://api.telegram.org/bot<TOKEN>/getUpdates
+TELEGRAM_BOT_TOKEN="1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"
+TELEGRAM_CHAT_ID="123456789"
+
+# Configuración de notificaciones
+NOTIFY_ON_SUCCESS=true
+NOTIFY_ON_ERROR=true
+NOTIFY_ON_NO_FILES=false
