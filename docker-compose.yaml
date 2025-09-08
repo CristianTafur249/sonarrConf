@@ -52,6 +52,7 @@ services:
     volumes:
       - ./media:/media
       - ./config/1tb1/Bittorrent:/downloads
+      - ./scripts:/scripts
     restart: unless-stopped
 
   radarr:
