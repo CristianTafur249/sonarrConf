@@ -35,6 +35,51 @@ send_telegram_message() {
     fi
 }
 
+# Función para enviar mensajes largos dividiéndolos en partes
+send_long_message() {
+    local full_message="$1"
+    local max_length=4096  # Límite real de Telegram (4096 caracteres UTF-8)
+    local chunk_size=3000   # Tamaño de cada parte
+    
+    local message_length=${#full_message}
+    
+    if [ "$message_length" -le "$max_length" ]; then
+        # Mensaje corto, enviar directamente
+        send_telegram_message "$full_message"
+        return $?
+    fi
+    
+    # Mensaje largo, dividir en partes de chunk_size caracteres
+    local start=0
+    local part_num=1
+    
+    while [ "$start" -lt "$message_length" ]; do
+        local end=$((start + chunk_size))
+        if [ "$end" -gt "$message_length" ]; then
+            end="$message_length"
+        fi
+        
+        local chunk="${full_message:start:chunk_size}"
+        
+        # Agregar indicador de parte si hay múltiples partes
+        if [ "$message_length" -gt "$chunk_size" ]; then
+            chunk="(Parte $part_num) $chunk"
+        fi
+        
+        if ! send_telegram_message "$chunk"; then
+            return 1
+        fi
+        
+        start="$end"
+        part_num=$((part_num + 1))
+        
+        # Pequeña pausa para evitar rate limits
+        sleep 0.5
+    done
+    
+    return 0
+}
+
 # Función para crear resumen de procesamiento
 create_processing_summary() {
     local log_file="$1"
@@ -111,14 +156,14 @@ notify_scan_result() {
     fi
     
     # Agregar resumen de errores si existen
-    local error_summary=$(create_processing_summary "/home/tafurc/mediaJelly/scripts/logs/compression-success.log" "/home/tafurc/mediaJelly/scripts/logs/compression-errors.log")
+    local error_summary=$(create_processing_summary "/home/tafurc/mediaJelly/.scripts/logs/compression-success.log" "/home/tafurc/mediaJelly/.scripts/logs/compression-errors.log")
     if [ -n "$error_summary" ]; then
         message="$message
 
 $error_summary"
     fi
     
-    send_telegram_message "$message"
+    send_long_message "$message"
 }
 
 # Función para notificar errores críticos
@@ -135,7 +180,7 @@ notify_critical_error() {
         message="${message}$(tail -3 "$log_file" | sed 's/^/• /')"
     fi
     
-    send_telegram_message "$message"
+    send_long_message "$message"
 }
 
 # Si se llama directamente, usar los argumentos
@@ -150,7 +195,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             notify_critical_error "$@"
             ;;
         "test")
-            send_telegram_message "🧪 <b>MediaJelly - Prueba de notificación</b>\n\nSi recibes este mensaje, las notificaciones están funcionando correctamente.\n\n📅 $(date '+%Y-%m-%d %H:%M:%S')"
+            send_long_message "🧪 <b>MediaJelly - Prueba de notificación</b>\n\nSi recibes este mensaje, las notificaciones están funcionando correctamente.\n\n📅 $(date '+%Y-%m-%d %H:%M:%S')"
             ;;
         *)
             echo "Uso: $0 {scan_result|critical_error|test} [argumentos...]"

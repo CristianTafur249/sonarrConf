@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # --- CONFIGURACIÓN ---
-OUTPUT_FILE="/home/tafurc/mediaJelly/scripts/pending-compression.txt"
-LOG_FILE="/home/tafurc/mediaJelly/scripts/logs/scan.log"
+OUTPUT_FILE="/home/tafurc/mediaJelly/.scripts/pending-compression.txt"
+LOG_FILE="/home/tafurc/mediaJelly/.scripts/logs/scan.log"
+COMPLETED="/home/tafurc/mediaJelly/.scripts/completed.txt"
 
 EXTENSIONS=("mkv" "mp4" "avi" "mov" "webm")
 
@@ -99,8 +100,10 @@ while IFS= read -r file_path; do
   fi
 done < "$TMP_FILE"
 
+touch "$COMPLETED"  # Asegurar que el archivo existe
+
 sort -u "$VALIDATED_TMP" > "$NEW_SORTED"
-sort -u "$OUTPUT_FILE" > "$EXISTING_SORTED"
+sort -u "$OUTPUT_FILE" "$COMPLETED" > "$EXISTING_SORTED"
 
 comm -23 "$NEW_SORTED" "$EXISTING_SORTED" > "$DIFF_FILE"
 total_encontrados=$(wc -l < "$NEW_SORTED")
@@ -119,12 +122,12 @@ fi
 rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE" "$VALIDATED_TMP"
 
 # Gestionar logs antes de continuar
-/home/tafurc/mediaJelly/scripts/manage-logs.sh
+/home/tafurc/mediaJelly/.scripts/manage-logs.sh
 
 # Solo procesar compresión si hay archivos pendientes
 if [ -s "$OUTPUT_FILE" ]; then
   log "Iniciando procesamiento de compresión..."
-  /home/tafurc/mediaJelly/scripts/process-compression.sh
+  /home/tafurc/mediaJelly/.scripts/process-compression.sh
 else
   log "No hay archivos pendientes para comprimir"
 fi

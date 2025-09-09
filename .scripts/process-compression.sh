@@ -1,17 +1,33 @@
 #!/bin/bash
 
-LOCKFILE="./scripts/tmp/compress.lock"
-PENDING="./scripts/pending-compression.txt"
-TEMP="./scripts/pending-compression.tmp"
-LOGFILE="./scripts/logs/compression-success.log"
-NO_SPANISH_LOG="./scripts/logs/no-spanish.log"
-ERROR_LOG="./scripts/logs/compression-errors.log"
+LOCKFILE="./.scripts/tmp/compress.lock"
+PENDING="./.scripts/pending-compression.txt"
+TEMP="./.scripts/pending-compression.tmp"
+LOGFILE="./.scripts/logs/compression-success.log"
+NO_SPANISH_LOG="./.scripts/logs/no-spanish.log"
+ERROR_LOG="./.scripts/logs/compression-errors.log"
+COMPLETED="./.scripts/completed.txt"
 
-mkdir -p ./scripts/tmp
-mkdir -p ./scripts/logs
+mkdir -p ./.scripts/tmp
+mkdir -p ./.scripts/logs
+touch "$COMPLETED"
 
 (
   flock 9
+
+  # Limpiar archivos .compressed.mp4 incompletos de ejecuciones anteriores
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Buscando archivos .compressed.mp4 incompletos..." >> "$LOGFILE"
+  find /home/tafurc/mediaJelly/media -name "*.compressed.mp4" -type f | while read -r compressed_file; do
+    original_file="${compressed_file%.compressed.mp4}"
+    if [ -f "$original_file" ]; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Eliminando archivo incompleto y reprocesando: $compressed_file" >> "$LOGFILE"
+      rm -f "$compressed_file"
+      echo "$original_file" >> "$PENDING"
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Archivo incompleto sin original, eliminando: $compressed_file" >> "$LOGFILE"
+      rm -f "$compressed_file"
+    fi
+  done
 
   # Verificar si hay archivos pendientes
   if [ ! -s "$PENDING" ]; then
@@ -64,6 +80,7 @@ mkdir -p ./scripts/logs
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO (<500MB): $input → $final_output" >> "$LOGFILE"
       mv "$input" "$final_output"
       files_renamed=$((files_renamed + 1))
+      echo "$input" >> "$COMPLETED"
       continue
     fi
 
@@ -121,8 +138,9 @@ mkdir -p ./scripts/logs
       compression_settings="-qp 28 -preset fast"
     fi
 
-    # Comprimir y convertir a MP4
-    if ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 \
+    # Comprimir y convertir a MP4 con timeout de 2 horas por archivo
+    compression_log="./.scripts/logs/ffmpeg_$(basename "$input" | tr ' ' '_').log"
+    if timeout 7200 ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 \
       -i "$input" \
       -vf 'format=nv12,hwupload' \
       -map 0:v:0 \
@@ -132,7 +150,8 @@ mkdir -p ./scripts/logs
       -c:a aac -b:a 128k -ac 2 \
       -c:s mov_text \
       -movflags +faststart \
-      "$temp_output" < /dev/null; then
+      -progress pipe:1 \
+      "$temp_output" < /dev/null > "$compression_log" 2>&1; then
 
       # Verificar que el archivo comprimido sea válido
       if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
@@ -150,23 +169,36 @@ mkdir -p ./scripts/logs
           
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $final_output (${original_size_mb}MB → ${compressed_size_mb}MB, reducción: ${reduction_percent}%)" >> "$LOGFILE"
           files_compressed=$((files_compressed + 1))
+          
+          # Agregar a lista de completados
+          echo "$input" >> "$COMPLETED"
+          
+          # Limpiar log de compresión si fue exitosa
+          rm -f "$compression_log"
         else
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido corrupto: $temp_output" >> "$ERROR_LOG"
           echo "$input" >> "$PENDING"
           error_files+=("$input (corrupto)")
-          rm -f "$temp_output"
+          rm -f "$temp_output" "$compression_log"
         fi
       else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido vacío o inexistente: $temp_output" >> "$ERROR_LOG"
         echo "$input" >> "$PENDING"
         error_files+=("$input (vacío)")
-        rm -f "$temp_output"
+        rm -f "$temp_output" "$compression_log"
       fi
     else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Falló la compresión: $input" >> "$ERROR_LOG"
-      echo "$input" >> "$PENDING"
-      error_files+=("$input (falló compresión)")
-      rm -f "$temp_output"
+      local ffmpeg_exit_code=$?
+      if [ $ffmpeg_exit_code -eq 124 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Timeout alcanzado (2 horas) en compresión: $input" >> "$ERROR_LOG"
+        echo "$input" >> "$PENDING"
+        error_files+=("$input (timeout 2h)")
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Falló la compresión (código $ffmpeg_exit_code): $input" >> "$ERROR_LOG"
+        echo "$input" >> "$PENDING"
+        error_files+=("$input (falló compresión)")
+      fi
+      rm -f "$temp_output" "$compression_log"
     fi
 
   done < "$TEMP"
@@ -176,15 +208,15 @@ mkdir -p ./scripts/logs
 
   # Exportar archivos con errores para notificaciones
   if [ ${#error_files[@]} -gt 0 ]; then
-    printf '%s\n' "${error_files[@]}" > "/home/tafurc/mediaJelly/scripts/tmp/error_files.tmp"
+    printf '%s\n' "${error_files[@]}" > "/home/tafurc/mediaJelly/.scripts/tmp/error_files.tmp"
   else
-    rm -f "/home/tafurc/mediaJelly/scripts/tmp/error_files.tmp"
+    rm -f "/home/tafurc/mediaJelly/.scripts/tmp/error_files.tmp"
   fi
 
   rm -f "$TEMP"
   sort -u "$PENDING" -o "$PENDING"
 
   # Gestionar logs al final
-  /home/tafurc/mediaJelly/scripts/manage-logs.sh
+  /home/tafurc/mediaJelly/.scripts/manage-logs.sh
 
 ) 9>"$LOCKFILE"

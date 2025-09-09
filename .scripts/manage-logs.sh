@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- CONFIGURACIÓN ---
-LOG_DIR="/home/tafurc/mediaJelly/scripts/logs"
+LOG_DIR="/home/tafurc/mediaJelly/.scripts/logs"
 MAX_LOG_SIZE_MB=10
 MAX_COMPRESSED_LOGS=5
 

@@ -18,11 +18,11 @@ fi
 
 # Crear directorios necesarios
 echo "📁 Creando directorios..."
-mkdir -p scripts/logs scripts/tmp media/Peliculas media/series config
+mkdir -p .scripts/logs .scripts/tmp media/Peliculas media/series config
 
 # Dar permisos de ejecución a todos los scripts
 echo "🔧 Configurando permisos..."
-chmod +x scripts/*.sh
+chmod +x .scripts/*.sh
 chmod +x install.sh
 
 # Crear archivo de configuración de Telegram si no existe
@@ -37,12 +37,12 @@ echo ""
 echo "⏰ Para configurar la ejecución automática, añade esta línea a tu crontab:"
 echo "   (ejecuta: crontab -e)"
 echo ""
-echo "0 */6 * * * $INSTALL_DIR/scripts/cron-runner.sh"
+echo "0 */6 * * * $INSTALL_DIR/.scripts/cron-runner.sh"
 echo ""
 
 # Probar configuración básica
 echo "🧪 Probando configuración..."
-if ./scripts/manage-logs.sh; then
+if ./.scripts/manage-logs.sh; then
     echo "✅ Gestión de logs funcionando"
 else
     echo "❌ Error en gestión de logs"
@@ -56,6 +56,6 @@ echo "1. Configura docker-compose.yaml con tus rutas específicas"
 echo "2. Edita config/telegram.conf con tus credenciales"
 echo "3. Inicia los servicios: docker compose up -d"
 echo "4. Configura el cron job para automatización"
-echo "5. Ejecuta manualmente: ./scripts/scan-to-pending.sh /ruta/a/medios"
+echo "5. Ejecuta manualmente: ./.scripts/scan-to-pending.sh /ruta/a/medios"
 echo ""
 echo "📖 Ver README.md para más información"

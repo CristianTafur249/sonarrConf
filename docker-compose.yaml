@@ -39,7 +39,7 @@ services:
 
   samba:
     image: dperson/samba # no hay tag con versiones, solo latest
-    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s "scripts;/scripts;yes;no;yes;all;pi"'
+    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s ".scripts;/.scripts;yes;no;yes;all;pi"'
     stdin_open: true
     tty: true
     environment:
@@ -52,7 +52,7 @@ services:
     volumes:
       - ./media:/media
       - ./config/1tb1/Bittorrent:/downloads
-      - ./scripts:/scripts
+      - ./.scripts:/scripts
     restart: unless-stopped
 
   radarr:
@@ -69,7 +69,7 @@ services:
     volumes:
       - ./config/radarr-config:/config
       - ./media/Peliculas:/movies
-      - ./scripts:/scripts
+      - ./.scripts:/scripts
       - ./config/1tb1/Bittorrent:/downloads
     restart: "unless-stopped"
 
@@ -84,7 +84,7 @@ services:
       - TZ=America/Bogota
     volumes:
       - ./config/sonarr-config:/config
-      - ./scripts:/scripts
+      - ./.scripts:/scripts
       - ./media/series:/tvshows
       - ./config/1tb1/Bittorrent:/downloads
     ports:
