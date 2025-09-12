@@ -24,9 +24,9 @@ cleanup_partial_compressed() {
   while IFS= read -r -d '' compressed_file; do
     log "Encontrado archivo compressed.mp4: $compressed_file"
     
-    # Verificar si el archivo existe y tiene tamaño
+    # Verifica si el archivo existe y tiene tamaño
     if [ -f "$compressed_file" ] && [ -s "$compressed_file" ]; then
-      # Verificar integridad con ffprobe
+      # Verifica integridad con ffprobe
       if ! ffprobe -v error "$compressed_file" > /dev/null 2>&1; then
         log "CORRUPTO: Eliminando archivo corrupto: $compressed_file"
         rm -f "$compressed_file"

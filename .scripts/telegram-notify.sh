@@ -84,6 +84,7 @@ send_long_message() {
 create_processing_summary() {
     local log_file="$1"
     local error_log="$2"
+    local no_spanish_log="/home/tafurc/mediaJelly/.scripts/logs/no-spanish.log"
     local summary=""
     
     if [ -f "$log_file" ]; then
@@ -102,6 +103,31 @@ $last_summary
 $(tail -5 "$error_log" | sed 's/^/• /')
 
 "
+    fi
+    
+    # Agrega información de archivos sin español
+    if [ -f "$no_spanish_log" ] && [ -s "$no_spanish_log" ]; then
+        local no_spanish_count=$(grep -c "SIN ESPAÑOL:" "$no_spanish_log")
+        if [ "$no_spanish_count" -gt 0 ]; then
+            summary="${summary}🌍 Archivos sin español detectados: $no_spanish_count
+
+"
+            # Muestra hasta 10 archivos sin español
+            local shown=0
+            while IFS= read -r line && [ "$shown" -lt 10 ]; do
+                if [[ "$line" == *"SIN ESPAÑOL:"* ]]; then
+                    local file_name=$(echo "$line" | sed 's/.*SIN ESPAÑOL: //' | xargs basename)
+                    summary="${summary}• $file_name
+"
+                    shown=$((shown + 1))
+                fi
+            done < "$no_spanish_log"
+            
+            if [ "$no_spanish_count" -gt 10 ]; then
+                summary="${summary}... y $((no_spanish_count - 10)) más
+"
+            fi
+        fi
     fi
     
     echo "$summary"

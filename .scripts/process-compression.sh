@@ -53,13 +53,6 @@ touch "$COMPLETED"
 
     files_processed=$((files_processed + 1))
 
-    # Saltar si el archivo ya es .mp4
-    if [[ "$input" == *.mp4 ]]; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] YA ES MP4: $input" >> "$LOGFILE"
-      files_skipped=$((files_skipped + 1))
-      continue
-    fi
-
     dir_path="$(dirname "$input")"
     file_name="$(basename "$input")"
     base_name="${file_name%.*}"
@@ -75,13 +68,20 @@ touch "$COMPLETED"
 
     file_size=$(stat -c %s "$input")
 
-    # Si pesa menos de 500 MB, solo renombrar a .mp4
+    # Si pesa menos de 500 MB, solo renombrar a .mp4 (si no es ya .mp4)
     if (( file_size < 524288000 )); then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO (<500MB): $input → $final_output" >> "$LOGFILE"
-      mv "$input" "$final_output"
-      files_renamed=$((files_renamed + 1))
-      echo "$input" >> "$COMPLETED"
-      continue
+      if [[ "$input" == *.mp4 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] YA ES MP4 (<500MB): $input" >> "$LOGFILE"
+        files_skipped=$((files_skipped + 1))
+        echo "$(basename "$input")" >> "$COMPLETED"
+        continue
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO (<500MB): $input → $final_output" >> "$LOGFILE"
+        mv "$input" "$final_output"
+        files_renamed=$((files_renamed + 1))
+        echo "$(basename "$final_output")" >> "$COMPLETED"
+        continue
+      fi
     fi
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Comenzando compresión: $input → $temp_output" >> "$LOGFILE"
@@ -139,7 +139,6 @@ touch "$COMPLETED"
     fi
 
     # Comprimir y convertir a MP4 con timeout de 2 horas por archivo
-    compression_log="./.scripts/logs/ffmpeg_$(basename "$input" | tr ' ' '_').log"
     if timeout 7200 ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 \
       -i "$input" \
       -vf 'format=nv12,hwupload' \
@@ -150,8 +149,7 @@ touch "$COMPLETED"
       -c:a aac -b:a 128k -ac 2 \
       -c:s mov_text \
       -movflags +faststart \
-      -progress pipe:1 \
-      "$temp_output" < /dev/null > "$compression_log" 2>&1; then
+      "$temp_output" < /dev/null > /dev/null 2>&1; then
 
       # Verificar que el archivo comprimido sea válido
       if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
@@ -171,21 +169,18 @@ touch "$COMPLETED"
           files_compressed=$((files_compressed + 1))
           
           # Agregar a lista de completados
-          echo "$input" >> "$COMPLETED"
-          
-          # Limpiar log de compresión si fue exitosa
-          rm -f "$compression_log"
+          echo "$(basename "$final_output")" >> "$COMPLETED"
         else
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido corrupto: $temp_output" >> "$ERROR_LOG"
           echo "$input" >> "$PENDING"
           error_files+=("$input (corrupto)")
-          rm -f "$temp_output" "$compression_log"
+          rm -f "$temp_output"
         fi
       else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido vacío o inexistente: $temp_output" >> "$ERROR_LOG"
         echo "$input" >> "$PENDING"
         error_files+=("$input (vacío)")
-        rm -f "$temp_output" "$compression_log"
+        rm -f "$temp_output"
       fi
     else
       local ffmpeg_exit_code=$?
@@ -198,7 +193,7 @@ touch "$COMPLETED"
         echo "$input" >> "$PENDING"
         error_files+=("$input (falló compresión)")
       fi
-      rm -f "$temp_output" "$compression_log"
+      rm -f "$temp_output"
     fi
 
   done < "$TEMP"

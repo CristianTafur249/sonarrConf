@@ -13,6 +13,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 TMP_FILE=$(mktemp)
 EXISTING_SORTED=$(mktemp)
 NEW_SORTED=$(mktemp)
+FILTERED_NEW=$(mktemp)
 DIFF_FILE=$(mktemp)
 
 log() {
@@ -29,7 +30,7 @@ cleanup_partial_files() {
       local base_name="${compressed_file%.compressed.mp4}"
       local original_file=""
       
-      # Buscar el archivo original correspondiente
+      # Busca el archivo original correspondiente
       for ext in "${EXTENSIONS[@]}"; do
         if [ -f "${base_name}.${ext}" ]; then
           original_file="${base_name}.${ext}"
@@ -60,17 +61,17 @@ scan_folder() {
 
   log "Escaneando: $folder"
   
-  # Limpiar archivos compressed.mp4 parciales antes de escanear
+  # Limpia archivos compressed.mp4 parciales antes de escanear
   cleanup_partial_files "$folder"
 
-  # Construir expresión con múltiples -iname conectadas por -o
+  # Construye expresión con múltiples -iname conectadas por -o
   find_expr=()
   for ext in "${EXTENSIONS[@]}"; do
     find_expr+=(-iname "*.${ext}" -o)
   done
   unset 'find_expr[${#find_expr[@]}-1]'  # Quitar último -o
 
-  # Excluir carpetas que comienzan con punto (como .deleted, .trash, etc.)
+  # Excluye carpetas que comienzan con punto (como .deleted, .trash, etc.)
   find "$folder" -type f \( "${find_expr[@]}" \) -not -path "*/.*" -exec realpath {} \; >> "$TMP_FILE"
 }
 
@@ -90,7 +91,7 @@ for folder in "$@"; do
   scan_folder "$abs_folder"
 done
 
-# Validar que los archivos realmente existen antes de procesarlos
+# Valida que los archivos realmente existen antes de procesarlos
 VALIDATED_TMP=$(mktemp)
 while IFS= read -r file_path; do
   if [ -f "$file_path" ]; then
@@ -100,10 +101,27 @@ while IFS= read -r file_path; do
   fi
 done < "$TMP_FILE"
 
-touch "$COMPLETED"  # Asegurar que el archivo existe
+touch "$COMPLETED"  # Asegura que el archivo existe
 
-sort -u "$VALIDATED_TMP" > "$NEW_SORTED"
-sort -u "$OUTPUT_FILE" "$COMPLETED" > "$EXISTING_SORTED"
+# Ordena archivos por tamaño descendente (más pesados primero)
+SORTED_BY_SIZE=$(mktemp)
+while IFS= read -r file_path; do
+  file_size=$(stat -c %s "$file_path" 2>/dev/null || echo "0")
+  printf "%020d %s\n" "$file_size" "$file_path"
+done < "$VALIDATED_TMP" | sort -nr | cut -d' ' -f2- > "$SORTED_BY_SIZE"
+
+# Filtra archivos ya procesados por nombre
+while IFS= read -r file_path; do
+  file_name=$(basename "$file_path")
+  if ! grep -q "^$file_name$" "$COMPLETED"; then
+    echo "$file_path" >> "$FILTERED_NEW"
+  else
+    log "Saltando archivo ya procesado: $file_name"
+  fi
+done < "$SORTED_BY_SIZE"
+
+sort -u "$FILTERED_NEW" > "$NEW_SORTED"
+sort -u "$OUTPUT_FILE" > "$EXISTING_SORTED"
 
 comm -23 "$NEW_SORTED" "$EXISTING_SORTED" > "$DIFF_FILE"
 total_encontrados=$(wc -l < "$NEW_SORTED")
@@ -119,12 +137,12 @@ else
   log "No hay nuevas rutas para procesar"
 fi
 
-rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE" "$VALIDATED_TMP"
+rm -f "$TMP_FILE" "$NEW_SORTED" "$EXISTING_SORTED" "$DIFF_FILE" "$VALIDATED_TMP" "$FILTERED_NEW" "$SORTED_BY_SIZE"
 
-# Gestionar logs antes de continuar
+# Gestiona logs antes de continuar
 /home/tafurc/mediaJelly/.scripts/manage-logs.sh
 
-# Solo procesar compresión si hay archivos pendientes
+# Solo procesar la compresión si hay archivos pendientes
 if [ -s "$OUTPUT_FILE" ]; then
   log "Iniciando procesamiento de compresión..."
   /home/tafurc/mediaJelly/.scripts/process-compression.sh
