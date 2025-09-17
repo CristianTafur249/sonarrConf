@@ -116,7 +116,8 @@ $(tail -5 "$error_log" | sed 's/^/• /')
             local shown=0
             while IFS= read -r line && [ "$shown" -lt 10 ]; do
                 if [[ "$line" == *"SIN ESPAÑOL:"* ]]; then
-                    local file_name=$(echo "$line" | sed 's/.*SIN ESPAÑOL: //' | xargs basename)
+                    local file_path=$(echo "$line" | sed 's/.*SIN ESPAÑOL: //')
+                    local file_name=$(basename "$file_path" 2>/dev/null || echo "$file_path")
                     summary="${summary}• $file_name
 "
                     shown=$((shown + 1))
@@ -133,6 +134,66 @@ $(tail -5 "$error_log" | sed 's/^/• /')
     echo "$summary"
 }
 
+# Función para detectar si hubo procesamiento real
+has_new_processing() {
+    local success_log="/home/tafurc/mediaJelly/.scripts/logs/compression-success.log"
+    local pending_file="/home/tafurc/mediaJelly/.scripts/pending-compression.txt"
+    local completed_file="/home/tafurc/mediaJelly/.scripts/completed.txt"
+    local state_file="/home/tafurc/mediaJelly/.scripts/tmp/last_notification_state"
+    
+    # Crear directorio tmp si no existe
+    mkdir -p "/home/tafurc/mediaJelly/.scripts/tmp"
+    
+    # Obtener estado actual
+    local current_pending_count=0
+    local current_completed_count=0
+    local current_last_log_line=""
+    
+    if [ -f "$pending_file" ]; then
+        current_pending_count=$(wc -l < "$pending_file" 2>/dev/null || echo "0")
+    fi
+    
+    if [ -f "$completed_file" ]; then
+        current_completed_count=$(wc -l < "$completed_file" 2>/dev/null || echo "0")
+    fi
+    
+    if [ -f "$success_log" ]; then
+        current_last_log_line=$(tail -1 "$success_log" 2>/dev/null || echo "")
+    fi
+    
+    # Leer estado anterior si existe
+    local previous_pending_count=0
+    local previous_completed_count=0
+    local previous_last_log_line=""
+    
+    if [ -f "$state_file" ]; then
+        local line_num=0
+        while IFS= read -r line; do
+            line_num=$((line_num + 1))
+            case $line_num in
+                1) previous_pending_count="$line" ;;
+                2) previous_completed_count="$line" ;;
+                3) previous_last_log_line="$line" ;;
+            esac
+        done < "$state_file"
+    fi
+    
+    # Guardar estado actual para la próxima vez
+    cat > "$state_file" << EOF
+$current_pending_count
+$current_completed_count
+$current_last_log_line
+EOF
+    
+    # Determinar si hubo cambios
+    if [ "$current_completed_count" != "$previous_completed_count" ] || 
+       [ "$current_last_log_line" != "$previous_last_log_line" ]; then
+        return 0  # Hubo procesamiento nuevo
+    else
+        return 1  # No hubo procesamiento nuevo
+    fi
+}
+
 # Función principal para notificar resultado del escaneo
 notify_scan_result() {
     local status="$1"
@@ -145,6 +206,24 @@ notify_scan_result() {
     shift 7  # Remover los 7 primeros argumentos
     local error_files=("$@")  # Los argumentos restantes son los archivos con errores
     
+    # Verificar si realmente hubo procesamiento nuevo
+    if ! has_new_processing; then
+        # No hubo procesamiento nuevo, enviar mensaje simple
+        local message="🔍 MediaJelly - Escaneo Completado
+
+📁 Archivos encontrados: $files_found
+🆕 Archivos nuevos: $files_new
+
+ℹ️ No se encontraron archivos nuevos para procesar
+✅ El sistema está al día
+
+📅 Fecha: $(date '+%Y-%m-%d %H:%M:%S')"
+
+        send_long_message "$message"
+        return 0
+    fi
+    
+    # Hubo procesamiento nuevo, mostrar estadísticas completas
     local emoji="✅"
     local title="MediaJelly - Procesamiento Completado"
     
@@ -192,23 +271,49 @@ $error_summary"
     send_long_message "$message"
 }
 
+# Función para notificar cuando no hay archivos pendientes
+notify_no_pending_files() {
+    local total_files="$1"
+    local completed_files="$2"
+    
+    local message="🔍 MediaJelly - Escaneo Completado
+
+📁 Total de archivos: $total_files
+✅ Archivos completados: $completed_files
+📋 Archivos pendientes: 0
+
+ℹ️ No hay archivos pendientes para procesar
+🎉 ¡Todo está actualizado!
+
+📅 Fecha: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    send_long_message "$message"
+}
+
+# Función para notificar errores críticos
 # Función para notificar errores críticos
 notify_critical_error() {
     local error_message="$1"
     local log_file="$2"
     
-    local message="🚨 <b>MediaJelly - Error Crítico</b>\n\n"
-    message="${message}❌ <b>Error:</b> $error_message\n"
-    message="${message}📅 <b>Fecha:</b> $(date '+%Y-%m-%d %H:%M:%S')\n"
+    local message="🚨 MediaJelly - Error Crítico
+
+❌ Error: $error_message
+📅 Fecha: $(date '+%Y-%m-%d %H:%M:%S')"
     
     if [ -f "$log_file" ]; then
-        message="${message}\n📄 <b>Últimas líneas del log:</b>\n"
-        message="${message}$(tail -3 "$log_file" | sed 's/^/• /')"
+        message="$message
+
+📄 Últimas líneas del log:"
+        local last_lines=$(tail -3 "$log_file" | sed 's/^/• /')
+        if [ -n "$last_lines" ]; then
+            message="$message
+$last_lines"
+        fi
     fi
     
     send_long_message "$message"
 }
-
 # Si se llama directamente, usar los argumentos
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     case "$1" in
@@ -216,15 +321,35 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
             shift
             notify_scan_result "$@"
             ;;
+        "no_pending")
+            shift
+            notify_no_pending_files "$@"
+            ;;
         "critical_error")
             shift
             notify_critical_error "$@"
             ;;
         "test")
-            send_long_message "🧪 <b>MediaJelly - Prueba de notificación</b>\n\nSi recibes este mensaje, las notificaciones están funcionando correctamente.\n\n📅 $(date '+%Y-%m-%d %H:%M:%S')"
+            send_long_message "🧪 MediaJelly - Prueba de notificación
+
+Si recibes este mensaje, las notificaciones están funcionando correctamente.
+
+📅 $(date '+%Y-%m-%d %H:%M:%S')"
+            ;;
+        "reset_state")
+            # Función para resetear el estado de notificaciones
+            rm -f "/home/tafurc/mediaJelly/.scripts/tmp/last_notification_state"
+            echo "Estado de notificaciones reseteado"
             ;;
         *)
-            echo "Uso: $0 {scan_result|critical_error|test} [argumentos...]"
+            echo "Uso: $0 {scan_result|no_pending|critical_error|test|reset_state} [argumentos...]"
+            echo ""
+            echo "Comandos disponibles:"
+            echo "  scan_result <status> <found> <new> <processed> <compressed> <renamed> <skipped> [error_files...]"
+            echo "  no_pending <total_files> <completed_files>"
+            echo "  critical_error <error_message> [log_file]"
+            echo "  test - Enviar mensaje de prueba"
+            echo "  reset_state - Resetear estado para forzar próxima notificación"
             exit 1
             ;;
     esac
