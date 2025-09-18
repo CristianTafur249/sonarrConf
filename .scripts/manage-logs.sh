@@ -1,7 +1,16 @@
 #!/bin/bash
 
+# Detecta si estamos en contenedor o en host
+if [ -d "/mediajelly" ]; then
+    # Estamos en contenedor
+    BASE_DIR="/mediajelly"
+else
+    # Estamos en host
+    BASE_DIR="/home/tafurc/mediaJelly"
+fi
+
 # --- CONFIGURACIÓN ---
-LOG_DIR="/home/tafurc/mediaJelly/.scripts/logs"
+LOG_DIR="$BASE_DIR/.scripts/logs"
 MAX_LOG_SIZE_MB=10
 MAX_COMPRESSED_LOGS=5
 

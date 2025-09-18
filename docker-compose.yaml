@@ -69,6 +69,7 @@ services:
     volumes:
       - ./config/radarr-config:/config
       - ./media/Peliculas:/movies
+      - ./media/anime:/anime
       - ./.scripts:/scripts
       - ./config/1tb1/Bittorrent:/downloads
     restart: "unless-stopped"
@@ -86,6 +87,7 @@ services:
       - ./config/sonarr-config:/config
       - ./.scripts:/scripts
       - ./media/series:/tvshows
+      - ./media/anime:/anime
       - ./config/1tb1/Bittorrent:/downloads
     ports:
       - 8989:8989
@@ -121,6 +123,7 @@ services:
       - ./config/bazarr-config:/config
       - ./media/Peliculas:/movies
       - ./media/series:/tvshows
+      - ./media/anime:/anime
       - ./config/1tb1/Bittorrent:/downloads
     restart: unless-stopped
 
@@ -141,6 +144,7 @@ services:
       - ./config/jellyfin-cache:/cache
       - ./media/Peliculas:/movies
       - ./media/series:/tvshows
+      - ./media/anime:/anime
     ports:
       - 8096:8096
     restart: unless-stopped
@@ -179,6 +183,28 @@ services:
     volumes:
       - ./config/jellyseerr-config:/app/config
     restart: unless-stopped
+
+  mediajelly-cron:
+    build:
+      context: .
+      dockerfile: Dockerfile.cron
+    container_name: mediajelly-cron
+    environment:
+      - TZ=America/Bogota
+      - PUID=1000
+      - PGID=1000
+    networks:
+      - mynetwork
+    volumes:
+      - ./.scripts:/mediajelly/.scripts
+      - ./config:/mediajelly/config
+      - ./media:/mediajelly/media
+      - ./config/1tb1/Bittorrent:/mediajelly/downloads
+    restart: unless-stopped
+    depends_on:
+      - transmission
+      - radarr
+      - sonarr
 
 networks:
   mynetwork:

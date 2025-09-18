@@ -1,9 +1,18 @@
 #!/bin/bash
 
+# Detecta si estamos en contenedor o en host
+if [ -d "/mediajelly" ]; then
+    # Estamos en contenedor
+    BASE_DIR="/mediajelly"
+else
+    # Estamos en host
+    BASE_DIR="/home/tafurc/mediaJelly"
+fi
+
 # --- CONFIGURACIÓN ---
-OUTPUT_FILE="/home/tafurc/mediaJelly/.scripts/pending-compression.txt"
-LOG_FILE="/home/tafurc/mediaJelly/.scripts/logs/scan.log"
-COMPLETED="/home/tafurc/mediaJelly/.scripts/completed.txt"
+OUTPUT_FILE="$BASE_DIR/.scripts/pending-compression.txt"
+LOG_FILE="$BASE_DIR/.scripts/logs/scan.log"
+COMPLETED="$BASE_DIR/.scripts/completed.txt"
 
 EXTENSIONS=("mkv" "mp4" "avi" "mov" "webm")
 

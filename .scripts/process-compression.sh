@@ -1,6 +1,43 @@
 #!/bin/bash
 
-LOCKFILE="./.scripts/tmp/compress.lock"
+# Detecta si estamos en contenedor o en host
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Buscando archivos .compressed.mp4 incompletos..." >> "$LOGFILE"
+  find "$MEDIA_DIR" -name "*.compressed.mp4" -type f | while read -r compressed_file; dof [ -d "/mediajelly" ]; then
+    # Estamos en contenedor
+    BASE_DIR="/mediajelly"
+    MEDIA_DIR="/mediajelly/media"
+else
+    # Estamos en host
+    BASE_DIR="/home/tafurc/me  # Exportar archivos con errores para notificaciones
+  if [ ${#error_files[@]} -gt 0 ]; then
+    printf '%s\n' "${error_files[@]}" > "$BASE_DIR/.scripts/tmp/error_files.tmp"
+  else
+    rm -f "$BASE_DIR/.scripts/tmp/error_files.tmp"
+  fi
+
+  # Exportar archivos sin español para notificaciones
+  if [ ${#no_spanish_files[@]} -gt 0 ]; then
+    printf '%s\n' "${no_spanish_files[@]}" > "$BASE_DIR/.scripts/tmp/no_spanish_files.tmp"
+  else
+    rm -f "$BASE_DIR/.scripts/tmp/no_spanish_files.tmp"
+  fi MEDIA_DIR="/home/tafurc/mediaJelly/media"
+fi
+
+LOCKFILE="$BASE_DIR/.scripts/tmp/compress.lock"
+PENDING="$BASE_DIR/.scripts/pending-compression.txt"
+TEMP="$BASE_DIR/.scripts/pending-compression.tmp"
+LOGFILE="$BASE_DIR/.scripts/logs/compression-success.log"
+NO_SPANISH_LOG="$BASE_DIR/.scripts/logs/no-spanish.log"
+ERROR_LOG="$BASE_DIR/.scripts/logs/compression-errors.log"
+COMPLETED="$BASE_DIR/.scripts/completed.txt"
+
+mkdir -p "$BASE_DIR/.scripts/tmp"
+mkdir -p "$BASE_DIR/.scripts/logs"
+touch "$COMPLETED"
+
+# Limpiar archivos temporales de ejecución anterior
+rm -f "$BASE_DIR/.scripts/tmp/error_files.tmp"
+rm -f "$BASE_DIR/.scripts/tmp/no_spanish_files.tmp"FILE="./.scripts/tmp/compress.lock"
 PENDING="./.scripts/pending-compression.txt"
 TEMP="./.scripts/pending-compression.tmp"
 LOGFILE="./.scripts/logs/compression-success.log"
@@ -12,10 +49,14 @@ mkdir -p ./.scripts/tmp
 mkdir -p ./.scripts/logs
 touch "$COMPLETED"
 
+# Limpia archivos temporales de ejecución anterior
+rm -f "/home/tafurc/mediaJelly/.scripts/tmp/error_files.tmp"
+rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
+
 (
   flock 9
 
-  # Limpiar archivos .compressed.mp4 incompletos de ejecuciones anteriores
+  # Limpia archivos .compressed.mp4 incompletos de ejecuciones anteriores
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] Buscando archivos .compressed.mp4 incompletos..." >> "$LOGFILE"
   find /home/tafurc/mediaJelly/media -name "*.compressed.mp4" -type f | while read -r compressed_file; do
     original_file="${compressed_file%.compressed.mp4}"
@@ -29,7 +70,7 @@ touch "$COMPLETED"
     fi
   done
 
-  # Verificar si hay archivos pendientes
+  # Verifica si hay archivos pendientes
   if [ ! -s "$PENDING" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] No hay archivos pendientes para comprimir" >> "$LOGFILE"
     exit 0
@@ -43,6 +84,7 @@ touch "$COMPLETED"
   files_renamed=0
   files_skipped=0
   error_files=()
+  no_spanish_files=()
   
   while IFS= read -r input || [ -n "$input" ]; do
     # Validar ruta válida
@@ -60,7 +102,7 @@ touch "$COMPLETED"
     temp_output="$dir_path/$base_name.compressed.mp4"
     final_output="$dir_path/$base_name.mp4"
 
-    # Verificar si existe un archivo compressed.mp4 parcial y eliminarlo
+    # Verifica si existe un archivo compressed.mp4 parcial y eliminarlo
     if [ -f "$temp_output" ]; then
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ADVERTENCIA: Archivo temporal encontrado, eliminando: $temp_output" >> "$ERROR_LOG"
       rm -f "$temp_output"
@@ -124,6 +166,7 @@ touch "$COMPLETED"
       echo "   Idiomas de audio: $audio_languages" >> "$NO_SPANISH_LOG"
       echo "   Idiomas de subtítulos: $sub_languages" >> "$NO_SPANISH_LOG"
       echo "   ---" >> "$NO_SPANISH_LOG"
+      no_spanish_files+=("$(basename "$input")")
     fi
 
     # Configuración de compresión más agresiva para películas grandes
@@ -208,10 +251,17 @@ touch "$COMPLETED"
     rm -f "/home/tafurc/mediaJelly/.scripts/tmp/error_files.tmp"
   fi
 
+  # Exporta los archivos sin español para notificaciones
+  if [ ${#no_spanish_files[@]} -gt 0 ]; then
+    printf '%s\n' "${no_spanish_files[@]}" > "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
+  else
+    rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
+  fi
+
   rm -f "$TEMP"
   sort -u "$PENDING" -o "$PENDING"
 
   # Gestionar logs al final
-  /home/tafurc/mediaJelly/.scripts/manage-logs.sh
+  "$BASE_DIR/.scripts/manage-logs.sh"
 
 ) 9>"$LOCKFILE"

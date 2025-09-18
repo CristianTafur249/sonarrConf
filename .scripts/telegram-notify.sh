@@ -1,9 +1,19 @@
 #!/bin/bash
 
 # Script para enviar notificaciones a Telegram
-CONFIG_FILE="/home/tafurc/mediaJelly/config/telegram.conf"
 
-# Cargar configuración
+# Detecta si estamos en contenedor o en host
+if [ -d "/mediajelly" ]; then
+    # Estamos en contenedor
+    BASE_DIR="/mediajelly"
+else
+    # Estamos en host
+    BASE_DIR="/home/tafurc/mediaJelly"
+fi
+
+CONFIG_FILE="$BASE_DIR/config/telegram.conf"
+
+# Carga la configuración
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 else
@@ -21,12 +31,12 @@ send_telegram_message() {
         return 1
     fi
     
-    # Usar modo sin formato para evitar problemas con caracteres especiales
+    # Usa el modo sin formato para evitar problemas con caracteres especiales
     local response=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d chat_id="$TELEGRAM_CHAT_ID" \
         -d text="$message")
     
-    # Verificar si fue exitoso
+    # Verifica si fue exitoso
     if echo "$response" | grep -q '"ok":true'; then
         return 0
     else
@@ -61,7 +71,7 @@ send_long_message() {
         
         local chunk="${full_message:start:chunk_size}"
         
-        # Agregar indicador de parte si hay múltiples partes
+        # Agrega un indicador de parte si hay múltiples partes
         if [ "$message_length" -gt "$chunk_size" ]; then
             chunk="(Parte $part_num) $chunk"
         fi
@@ -84,7 +94,8 @@ send_long_message() {
 create_processing_summary() {
     local log_file="$1"
     local error_log="$2"
-    local no_spanish_log="/home/tafurc/mediaJelly/.scripts/logs/no-spanish.log"
+    local error_files_tmp="$BASE_DIR/.scripts/tmp/error_files.tmp"
+    local no_spanish_files_tmp="$BASE_DIR/.scripts/tmp/no_spanish_files.tmp"
     local summary=""
     
     if [ -f "$log_file" ]; then
@@ -96,33 +107,42 @@ $last_summary
 "
         fi
     fi
-    
-    if [ -f "$error_log" ] && [ -s "$error_log" ]; then
-        local error_count=$(wc -l < "$error_log")
-        summary="${summary}❌ Errores encontrados: $error_count
-$(tail -5 "$error_log" | sed 's/^/• /')
 
+    # Muestra errores solo de la ejecución actual
+    if [ -f "$error_files_tmp" ] && [ -s "$error_files_tmp" ]; then
+        local error_count=$(wc -l < "$error_files_tmp")
+        summary="${summary}❌ Errores encontrados: $error_count
+"
+        # Mostrar hasta 5 errores
+        local shown=0
+        while IFS= read -r error_file && [ "$shown" -lt 5 ]; do
+            summary="${summary}• $error_file
+"
+            shown=$((shown + 1))
+        done < "$error_files_tmp"
+        
+        if [ "$error_count" -gt 5 ]; then
+            summary="${summary}... y $((error_count - 5)) más
+"
+        fi
+        summary="${summary}
 "
     fi
-    
-    # Agrega información de archivos sin español
-    if [ -f "$no_spanish_log" ] && [ -s "$no_spanish_log" ]; then
-        local no_spanish_count=$(grep -c "SIN ESPAÑOL:" "$no_spanish_log")
+
+    # Muestra archivos sin español solo de la ejecución actual
+    if [ -f "$no_spanish_files_tmp" ] && [ -s "$no_spanish_files_tmp" ]; then
+        local no_spanish_count=$(wc -l < "$no_spanish_files_tmp")
         if [ "$no_spanish_count" -gt 0 ]; then
             summary="${summary}🌍 Archivos sin español detectados: $no_spanish_count
 
 "
             # Muestra hasta 10 archivos sin español
             local shown=0
-            while IFS= read -r line && [ "$shown" -lt 10 ]; do
-                if [[ "$line" == *"SIN ESPAÑOL:"* ]]; then
-                    local file_path=$(echo "$line" | sed 's/.*SIN ESPAÑOL: //')
-                    local file_name=$(basename "$file_path" 2>/dev/null || echo "$file_path")
-                    summary="${summary}• $file_name
+            while IFS= read -r file_name && [ "$shown" -lt 10 ]; do
+                summary="${summary}• $file_name
 "
-                    shown=$((shown + 1))
-                fi
-            done < "$no_spanish_log"
+                shown=$((shown + 1))
+            done < "$no_spanish_files_tmp"
             
             if [ "$no_spanish_count" -gt 10 ]; then
                 summary="${summary}... y $((no_spanish_count - 10)) más
@@ -136,15 +156,15 @@ $(tail -5 "$error_log" | sed 's/^/• /')
 
 # Función para detectar si hubo procesamiento real
 has_new_processing() {
-    local success_log="/home/tafurc/mediaJelly/.scripts/logs/compression-success.log"
-    local pending_file="/home/tafurc/mediaJelly/.scripts/pending-compression.txt"
-    local completed_file="/home/tafurc/mediaJelly/.scripts/completed.txt"
-    local state_file="/home/tafurc/mediaJelly/.scripts/tmp/last_notification_state"
+    local success_log="$BASE_DIR/.scripts/logs/compression-success.log"
+    local pending_file="$BASE_DIR/.scripts/pending-compression.txt"
+    local completed_file="$BASE_DIR/.scripts/completed.txt"
+    local state_file="$BASE_DIR/.scripts/tmp/last_notification_state"
     
-    # Crear directorio tmp si no existe
-    mkdir -p "/home/tafurc/mediaJelly/.scripts/tmp"
+    # Crea el directorio tmp si no existe
+    mkdir -p "$BASE_DIR/.scripts/tmp"
     
-    # Obtener estado actual
+    # Obtiene estado actual
     local current_pending_count=0
     local current_completed_count=0
     local current_last_log_line=""
@@ -160,8 +180,8 @@ has_new_processing() {
     if [ -f "$success_log" ]; then
         current_last_log_line=$(tail -1 "$success_log" 2>/dev/null || echo "")
     fi
-    
-    # Leer estado anterior si existe
+
+    # Lee el estado anterior si existe
     local previous_pending_count=0
     local previous_completed_count=0
     local previous_last_log_line=""
@@ -185,7 +205,7 @@ $current_completed_count
 $current_last_log_line
 EOF
     
-    # Determinar si hubo cambios
+    # Determina si hubo cambios
     if [ "$current_completed_count" != "$previous_completed_count" ] || 
        [ "$current_last_log_line" != "$previous_last_log_line" ]; then
         return 0  # Hubo procesamiento nuevo
@@ -203,10 +223,10 @@ notify_scan_result() {
     local files_compressed="$5"
     local files_renamed="$6"
     local files_skipped="$7"
-    shift 7  # Remover los 7 primeros argumentos
+    shift 7  # Remueve los 7 primeros argumentos
     local error_files=("$@")  # Los argumentos restantes son los archivos con errores
     
-    # Verificar si realmente hubo procesamiento nuevo
+    # Verifica si realmente hubo procesamiento nuevo
     if ! has_new_processing; then
         # No hubo procesamiento nuevo, enviar mensaje simple
         local message="🔍 MediaJelly - Escaneo Completado
@@ -249,7 +269,7 @@ notify_scan_result() {
 
 📅 Fecha: $(date '+%Y-%m-%d %H:%M:%S')"
     
-    # Agregar lista específica de archivos con errores si existen
+    # Agrega lista específica de archivos con errores si existen
     if [ ${#error_files[@]} -gt 0 ]; then
         message="$message
 
@@ -259,9 +279,9 @@ notify_scan_result() {
 • $error_file"
         done
     fi
-    
-    # Agregar resumen de errores si existen
-    local error_summary=$(create_processing_summary "/home/tafurc/mediaJelly/.scripts/logs/compression-success.log" "/home/tafurc/mediaJelly/.scripts/logs/compression-errors.log")
+
+    # Agrega resumen de errores si existen
+    local error_summary=$(create_processing_summary "$BASE_DIR/.scripts/logs/compression-success.log" "$BASE_DIR/.scripts/logs/compression-errors.log")
     if [ -n "$error_summary" ]; then
         message="$message
 
@@ -291,7 +311,6 @@ notify_no_pending_files() {
 }
 
 # Función para notificar errores críticos
-# Función para notificar errores críticos
 notify_critical_error() {
     local error_message="$1"
     local log_file="$2"
@@ -314,6 +333,7 @@ $last_lines"
     
     send_long_message "$message"
 }
+
 # Si se llama directamente, usar los argumentos
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     case "$1" in
@@ -338,7 +358,7 @@ Si recibes este mensaje, las notificaciones están funcionando correctamente.
             ;;
         "reset_state")
             # Función para resetear el estado de notificaciones
-            rm -f "/home/tafurc/mediaJelly/.scripts/tmp/last_notification_state"
+            rm -f "$BASE_DIR/.scripts/tmp/last_notification_state"
             echo "Estado de notificaciones reseteado"
             ;;
         *)
