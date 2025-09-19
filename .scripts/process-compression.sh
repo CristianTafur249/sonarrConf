@@ -115,13 +115,13 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
       if [[ "$input" == *.mp4 ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] YA ES MP4 (<500MB): $input" >> "$LOGFILE"
         files_skipped=$((files_skipped + 1))
-        echo "$(basename "$input")" >> "$COMPLETED"
+        echo "$input" >> "$COMPLETED"
         continue
       else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] RENOMBRADO (<500MB): $input → $final_output" >> "$LOGFILE"
         mv "$input" "$final_output"
         files_renamed=$((files_renamed + 1))
-        echo "$(basename "$final_output")" >> "$COMPLETED"
+        echo "$final_output" >> "$COMPLETED"
         continue
       fi
     fi
@@ -136,7 +136,7 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
       continue
     fi
 
-    # Obtener todos los idiomas de audio y subtítulos
+    # Obtiene todos los idiomas de audio y subtítulos
     audio_languages=$(ffprobe -v error -select_streams a -show_entries stream_tags=language -of csv=p=0 "$input" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
     sub_languages=$(ffprobe -v error -select_streams s -show_entries stream_tags=language -of csv=p=0 "$input" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
 
@@ -145,7 +145,7 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
     subs_map=()
     has_spanish=false
 
-    # Buscar pistas de audio en español
+  # Busca pistas de audio en español
     if ffprobe -v error -select_streams a -show_entries stream=index:stream_tags=language -of csv=p=0 "$input" | grep -i -E '(spa|esp|es|es-LA|es-ES)' > /dev/null; then
       audio_map=(-map 0:a:m:language:spa? -map 0:a:m:language:esp? -map 0:a:m:language:es? -map 0:a:m:language:es-LA? -map 0:a:m:language:es-ES?)
       has_spanish=true
@@ -154,7 +154,7 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
       audio_map=(-map 0:a:0)
     fi
 
-    # Buscar pistas de subtítulos en español
+  # Busca pistas de subtítulos en español
     if ffprobe -v error -select_streams s -show_entries stream=index:stream_tags=language -of csv=p=0 "$input" | grep -i -E '(spa|esp|es|es-LA|es-ES)' > /dev/null; then
       subs_map=(-map 0:s:m:language:spa? -map 0:s:m:language:esp? -map 0:s:m:language:es? -map 0:s:m:language:es-LA? -map 0:s:m:language:es-ES?)
       has_spanish=true
@@ -194,7 +194,7 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
       -movflags +faststart \
       "$temp_output" < /dev/null > /dev/null 2>&1; then
 
-      # Verificar que el archivo comprimido sea válido
+      # Verificar que el archivo comprimido sea válido 
       if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
         # Verificar integridad del archivo comprimido
         if ffprobe -v error "$temp_output" > /dev/null 2>&1; then
@@ -211,8 +211,8 @@ rm -f "/home/tafurc/mediaJelly/.scripts/tmp/no_spanish_files.tmp"
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] COMPRIMIDO: $input → $final_output (${original_size_mb}MB → ${compressed_size_mb}MB, reducción: ${reduction_percent}%)" >> "$LOGFILE"
           files_compressed=$((files_compressed + 1))
           
-          # Agregar a lista de completados
-          echo "$(basename "$final_output")" >> "$COMPLETED"
+          # Agrega a la lista de completados
+          echo "$final_output" >> "$COMPLETED"
         else
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Archivo comprimido corrupto: $temp_output" >> "$ERROR_LOG"
           echo "$input" >> "$PENDING"

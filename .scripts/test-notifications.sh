@@ -57,7 +57,7 @@ simulate_scenario() {
     echo ""
 }
 
-# Mostrar estado actual
+# Muestra estado actual
 show_current_state
 
 # Menú de opciones

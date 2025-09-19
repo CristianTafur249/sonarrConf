@@ -14,7 +14,7 @@ LOG_DIR="$BASE_DIR/.scripts/logs"
 MAX_LOG_SIZE_MB=10
 MAX_COMPRESSED_LOGS=5
 
-# Función para comprimir y rotar logs
+# Comprime y rota logs
 manage_log_file() {
     local log_file="$1"
     local base_name=$(basename "$log_file" .log)
@@ -23,7 +23,7 @@ manage_log_file() {
         return
     fi
     
-    # Obtener tamaño del archivo en MB
+    # Obtiene tamaño del archivo en MB
     local size_bytes=$(stat -c %s "$log_file" 2>/dev/null || echo "0")
     local size_mb=$((size_bytes / 1024 / 1024))
     
@@ -46,7 +46,7 @@ manage_log_file() {
     fi
 }
 
-# Función para limpiar logs comprimidos antiguos
+# Limpia logs comprimidos antiguos
 cleanup_old_compressed_logs() {
     local base_name="$1"
     
@@ -54,7 +54,7 @@ cleanup_old_compressed_logs() {
     local compressed_count=$(find "$LOG_DIR" -name "${base_name}_*.log.gz" | wc -l)
     
     if [ "$compressed_count" -gt "$MAX_COMPRESSED_LOGS" ]; then
-        # Eliminar los más antiguos, manteniendo solo MAX_COMPRESSED_LOGS
+    # Elimina los más antiguos, manteniendo solo MAX_COMPRESSED_LOGS
         find "$LOG_DIR" -name "${base_name}_*.log.gz" -type f -printf '%T@ %p\n' | \
         sort -n | \
         head -n -${MAX_COMPRESSED_LOGS} | \
@@ -69,7 +69,7 @@ cleanup_old_compressed_logs() {
 # --- EJECUCIÓN ---
 mkdir -p "$LOG_DIR"
 
-# Gestionar todos los logs en el directorio
+# Gestiona todos los logs en el directorio
 for log_file in "$LOG_DIR"/*.log; do
     if [ -f "$log_file" ]; then
         manage_log_file "$log_file"

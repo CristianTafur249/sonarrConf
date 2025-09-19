@@ -113,7 +113,7 @@ $last_summary
         local error_count=$(wc -l < "$error_files_tmp")
         summary="${summary}❌ Errores encontrados: $error_count
 "
-        # Mostrar hasta 5 errores
+    # Muestra hasta 5 errores
         local shown=0
         while IFS= read -r error_file && [ "$shown" -lt 5 ]; do
             summary="${summary}• $error_file
