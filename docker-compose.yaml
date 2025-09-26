@@ -5,9 +5,9 @@ services:
   #   networks:
   #     - mynetwork
   #   environment:
-  #     - PUID=1000
-  #     - PGID=1000
-  #     - TZ=America/Bogota
+  #     - PUID=${PUID}
+  #     - PGID=${PGID}
+  #     - TZ=${TZ}
   #     - WEBUI_PORT=5080
   #   volumes:
   #     - ./qbittorrent-config:/config
@@ -24,6 +24,8 @@ services:
     image: jaymoulin/transmission:4.0.6
     networks:
       - mynetwork
+    environment:
+      - TZ=${TZ}
     command: transmission-daemon -f -g /config
     volumes:
       - ./config/transmission:/config
@@ -39,20 +41,20 @@ services:
 
   samba:
     image: dperson/samba # no hay tag con versiones, solo latest
-    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s ".scripts;/.scripts;yes;no;yes;all;pi"'
+    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s "scripts;/scripts;yes;no;yes;all;pi"'
     stdin_open: true
     tty: true
     environment:
-      - TZ=America/Bogota
-      - PUID=1000
-      - PGID=1000
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
     ports:
       - 139:139
       - 445:445
     volumes:
       - ./media:/media
       - ./config/1tb1/Bittorrent:/downloads
-      - ./.scripts:/scripts
+      - ./scripts:/scripts
     restart: unless-stopped
 
   radarr:
@@ -61,16 +63,16 @@ services:
     networks:
       - mynetwork
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Bogota
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
     ports:
       - 7878:7878
     volumes:
       - ./config/radarr-config:/config
       - ./media/Peliculas:/movies
       - ./media/anime:/anime
-      - ./.scripts:/scripts
+      - ./scripts:/scripts
       - ./config/1tb1/Bittorrent:/downloads
     restart: "unless-stopped"
 
@@ -80,12 +82,12 @@ services:
     networks:
       - mynetwork
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Bogota
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
     volumes:
       - ./config/sonarr-config:/config
-      - ./.scripts:/scripts
+      - ./scripts:/scripts
       - ./media/series:/tvshows
       - ./media/anime:/anime
       - ./config/1tb1/Bittorrent:/downloads
@@ -99,9 +101,9 @@ services:
     networks:
       - mynetwork
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Bogota
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
     volumes:
       - ./config/prowlarr-config:/config
     ports:
@@ -114,9 +116,9 @@ services:
     networks:
       - mynetwork
     environment:
-      - PUID=1000
-      - PGID=1000
-      - TZ=America/Bogota
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
     ports:
       - 6767:6767
     volumes:
@@ -134,7 +136,7 @@ services:
     devices:
       - /dev/dri:/dev/dri
     environment:
-      - TZ=America/Bogota
+      - TZ=${TZ}
     group_add:
       - "44"
     networks:
@@ -174,7 +176,7 @@ services:
     container_name: jellyseerr
     environment:
       - LOG_LEVEL=debug
-      - TZ=America/Bogota
+      - TZ=${TZ}
       - PORT=5055
     networks:
       - mynetwork
@@ -187,19 +189,22 @@ services:
   mediajelly-cron:
     build:
       context: .
-      dockerfile: Dockerfile.cron
+      dockerfile: Dockerfile.hybrid
     container_name: mediajelly-cron
     environment:
-      - TZ=America/Bogota
-      - PUID=1000
-      - PGID=1000
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - MEDIAJELLY_MODE=${MEDIAJELLY_MODE}
     networks:
       - mynetwork
     volumes:
-      - ./.scripts:/mediajelly/.scripts
+      - ./scripts:/mediajelly/scripts
       - ./config:/mediajelly/config
       - ./media:/mediajelly/media
       - ./config/1tb1/Bittorrent:/mediajelly/downloads
+    devices:
+      - /dev/dri:/dev/dri  # Hardware acceleration
     restart: unless-stopped
     depends_on:
       - transmission

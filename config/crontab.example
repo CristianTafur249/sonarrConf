@@ -1,6 +1,6 @@
 # Configuración de cron para MediaJelly
 # Ejecuta cada 6 horas (pero el script verifica si han pasado 12 horas desde la última ejecución)
-0 */6 * * * /home/tafurc/mediaJelly/.scripts/cron-runner.sh
+0 */6 * * * /home/tafurc/mediaJelly/scripts/cron-runner.sh
 
 # Alternativas de configuración:
 # Cada 12 horas: 0 */12 * * *

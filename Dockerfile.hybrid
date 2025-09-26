@@ -1,0 +1,42 @@
+# Dockerfile híbrido para MediaJelly
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Configuración completa del sistema
+ENV TZ=America/Bogota
+
+RUN apt-get update && apt-get install -y \
+    cron \
+    curl \
+    ffmpeg \
+    intel-media-va-driver \
+    python3 \
+    python3-pip \
+    tzdata \
+    vainfo \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/"$TZ" /etc/localtime && echo "$TZ" > /etc/timezone \
+    && pip3 install requests psutil \
+    && groupadd -g 992 render \
+    && useradd -m -s /bin/bash -G video,render mediauser \
+    && mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp \
+    && chown -R mediauser:mediauser /mediajelly
+
+# Copiar scripts y configuraciones
+COPY config/crontab.example /etc/cron.d/mediajelly
+COPY config/crontab-python /etc/cron.d/mediajelly-python
+COPY scripts/*.py /mediajelly/scripts/
+COPY docker-entrypoint-hybrid.sh /usr/local/bin/
+
+# Configurar permisos finales
+RUN chmod 0644 /etc/cron.d/mediajelly* \
+    && chmod +x /mediajelly/scripts/*.py \
+    && chmod +x /usr/local/bin/docker-entrypoint-hybrid.sh
+
+# Variables de entorno por defecto
+ENV MEDIAJELLY_MODE=python
+ENV PYTHONUNBUFFERED=1
+
+# Punto de entrada híbrido
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-hybrid.sh"]

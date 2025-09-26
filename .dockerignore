@@ -1,0 +1,50 @@
+# Archivos y directorios a ignorar durante el build de Docker
+
+# Cache de aplicaciones
+config/jellyfin-cache/
+config/jellyfin-config/cache/
+config/jellyseerr-config/cache/
+config/plex/tmp/
+config/*/cache/
+config/*/tmp/
+
+# Logs de aplicaciones
+config/*/logs/
+config/*/*/logs/
+*.log
+*.log.*
+
+# Bases de datos y archivos temporales
+config/*/*.db
+config/*/*.db-*
+config/*/*/*.db
+config/*/*/*.db-*
+*.pid
+*.dat
+
+# Directorios de medios (no necesarios para build)
+media/
+config/1tb1/
+
+# Archivos de respaldo y temporales
+config/*/Backups/
+config/*/backup/
+config/*/restore/
+config/*/Sentry/
+scripts/tmp/
+scripts/logs/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile*
+docker-compose*.yaml
+docker-compose*.yml

@@ -10,13 +10,13 @@ media/*
 
 # Archivos de trabajo
 magnets.txt
-.scripts/logs/*
-.scripts/pending-*
-.scripts/tmp/
-.scripts/__pycache__
-.scripts/*.txt
-.scripts/completed.txt
-.scripts/pending-compression.txt
+scripts/logs/*
+scripts/pending-*
+scripts/tmp/
+scripts/__pycache__
+scripts/*.txt
+scripts/completed.txt
+scripts/pending-compression.txt
 
 # Archivos de sistema y temporales
 *.log
