@@ -288,6 +288,12 @@ class MediaJellyProcessor:
         if files_cleaned > 0:
             self.logger.info(f"Limpieza completada: {files_cleaned} archivos {COMPRESSED_FILE_SUFFIX} eliminados, "
                            f"{files_added_to_pending} archivos agregados a pendientes")
+            
+            # Limpia duplicados después de agregar archivos
+            if files_added_to_pending > 0:
+                duplicates_removed = self._clean_pending_duplicates()
+                if duplicates_removed > 0:
+                    self.logger.info(f"Duplicados eliminados del archivo pending: {duplicates_removed}")
         
         return files_cleaned, files_added_to_pending
 
@@ -312,6 +318,36 @@ class MediaJellyProcessor:
                     if file_path and Path(file_path).exists():
                         pending_files.append(Path(file_path))
         return pending_files
+
+    def _clean_pending_duplicates(self) -> int:
+        """Limpia duplicados del archivo pending-compression.txt"""
+        if not self.pending_file.exists():
+            return 0
+        
+        unique_files = set()
+        duplicates_removed = 0
+        
+        # Lee el archivo y mantiene solo rutas únicas
+        with open(self.pending_file, 'r') as f:
+            for line in f:
+                line_clean = line.strip()
+                if line_clean:
+                    # Normaliza la ruta para comparación consistente
+                    normalized_path = str(Path(line_clean).resolve())
+                    if normalized_path in unique_files:
+                        duplicates_removed += 1
+                        self.logger.info(f"Duplicado encontrado y eliminado: {line_clean}")
+                    else:
+                        unique_files.add(normalized_path)
+        
+        # Reescribe el archivo sin duplicados
+        if duplicates_removed > 0:
+            with open(self.pending_file, 'w') as f:
+                for file_path in sorted(unique_files):
+                    f.write(f"{file_path}\n")
+            self.logger.info(f"Limpieza completada: {duplicates_removed} duplicados eliminados")
+        
+        return duplicates_removed
 
     def scan_media_files(self) -> List[Path]:
         """Escanea archivos multimedia con pathlib optimizado"""
