@@ -8,6 +8,23 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 - Próximas mejoras y características
 
+## [v2.0.1] - 2025-01-12
+
+### 🔧 Mejorado
+
+- **Calidad de código**: Corrección de errores identificados por SonarQube
+  - Eliminación de import duplicado de 'json' en mediajelly_python.py
+  - Reemplazo de números mágicos con constantes descriptivas
+  - Agregado de REQUEST_TIMEOUT constante en mediajelly_notifier.py
+- **Funcionalidad de verificación**: Implementación de `_check_all_pending_processed()` para verificar archivos ya procesados
+- **Normalización de rutas**: Mejora en comparación de rutas para diferentes formatos (/home/tafurc/mediaJelly/ vs /mediajelly/)
+- **Validación de integridad**: Validación mejorada de archivos comprimidos con verificación de streams de audio
+
+### 🐛 Corregido
+
+- **Errores de SonarQube**: Resueltos problemas de calidad de código identificados por análisis estático
+- **Verificación de pendientes**: Archivos ya procesados ahora se verifican correctamente antes de reprocesamiento
+
 ## [v2.0.0] - 2025-09-08
 
 ### ✨ Añadido
