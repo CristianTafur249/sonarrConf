@@ -21,9 +21,9 @@ import signal
 import glob
 
 # Configura límites de recursos
-MAX_MEMORY_GB = 8  # Limita memoria por proceso ffmpeg
-MAX_CPU_PERCENT = 60  # Restringe porcentaje máximo de CPU total
-MAX_CONCURRENT_COMPRESSIONS = 2  # Permite máximo 2 compresiones simultáneas
+MAX_MEMORY_GB = 4  # Limita memoria por proceso ffmpeg
+MAX_CPU_PERCENT = 30  # Restringe porcentaje máximo de CPU total
+MAX_CONCURRENT_COMPRESSIONS = 2  # Permite 2 compresiones simultáneas
 FFMPEG_TIMEOUT = 7200  # Establece 2 horas por archivo
 
 # Constantes para archivos y formatos
@@ -659,7 +659,7 @@ class MediaJellyProcessor:
                     if abs(compressed_duration - original_duration) > 5.0:
                         return False, f"Duración muy diferente: original={original_duration:.1f}s, comprimido={compressed_duration:.1f}s"
                         
-            except (ValueError, json.JSONDecodeError):
+            except ValueError:
                 self.logger.warning(f"No se pudo verificar duración de {compressed_file.name}")
             
             return True, f"Archivo válido: {len(video_streams)} video, {len(audio_streams)} audio"
@@ -673,62 +673,67 @@ class MediaJellyProcessor:
                                   file_path: Path, temp_output: Path, 
                                   elapsed_time: float, used_gpu: bool = True) -> Dict:
         """Procesa el resultado de la compresión"""
-        result = {'compressed': False, 'renamed': False, 'success': False, 'error': None}
-        
         if process.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
-            # NUEVA VALIDACIÓN: Verifica integridad del archivo antes de continuar
-            is_valid, validation_msg = self._validate_compressed_file(temp_output, file_path)
-            
-            if not is_valid:
-                self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
-                result['error'] = f"Archivo comprimido corrupto: {validation_msg}"
-                
-                # Limpia archivo temporal corrupto
-                if temp_output.exists():
-                    temp_output.unlink()
-                return result
-            
-            self.logger.info(f"Validación exitosa para {file_path.name}: {validation_msg}")
-            
-            # Valida tamaños
-            original_size = file_path.stat().st_size
-            compressed_size = temp_output.stat().st_size
-            
-            if compressed_size >= original_size:
-                method_str = "GPU" if used_gpu else "CPU"
-                self.logger.info(f"Archivo comprimido es mayor, renombrando ({method_str}): {file_path.name}")
-                final_name = file_path.with_suffix('.mp4')
-                temp_output.rename(final_name)
-                file_path.unlink()
-                result['renamed'] = True
-            else:
-                reduction_percent = ((original_size - compressed_size) / original_size) * 100
-                method_str = "GPU" if used_gpu else "CPU"
-                self.logger.info(f"Compresión {method_str} exitosa: {file_path.name} ({elapsed_time:.1f}s, -{reduction_percent:.1f}%)")
-                file_path.unlink()
-                temp_output.rename(file_path.with_suffix('.mp4'))
-                result['compressed'] = True
-            
-            # Marca como completado
-            with open(self.completed_file, 'a') as f:
-                f.write(f"{file_path.with_suffix('.mp4')}\n")
-            
-            result['success'] = True
+            return self._handle_successful_compression(temp_output, file_path, elapsed_time, used_gpu)
         else:
-            # Error en compresión - incluye stderr para debug
-            error_msg = f"Falló compresión (código {process.returncode}): {file_path}"
-            if process.returncode == 124:  # Timeout
-                error_msg = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
-            
-            # Log stderr para debug
-            if process.stderr:
-                self.logger.error(f"FFmpeg stderr: {process.stderr[:500]}")  # Primeros 500 chars
-            
-            result['error'] = error_msg
-            
-            # Limpia archivo temporal
+            return self._handle_failed_compression(process, file_path, temp_output)
+
+    def _handle_successful_compression(self, temp_output: Path, file_path: Path, elapsed_time: float, used_gpu: bool) -> Dict:
+        """Maneja el caso de compresión exitosa"""
+        result = {'compressed': False, 'renamed': False, 'success': True, 'error': None}
+        
+        # Validación
+        is_valid, validation_msg = self._validate_compressed_file(temp_output, file_path)
+        
+        if not is_valid:
+            self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
+            result['error'] = f"Archivo comprimido corrupto: {validation_msg}"
             if temp_output.exists():
                 temp_output.unlink()
+            return result
+        
+        self.logger.info(f"Validación exitosa para {file_path.name}: {validation_msg}")
+        
+        # Tamaños
+        original_size = file_path.stat().st_size
+        compressed_size = temp_output.stat().st_size
+        
+        if compressed_size >= original_size:
+            method_str = "GPU" if used_gpu else "CPU"
+            self.logger.info(f"Archivo comprimido es mayor, renombrando ({method_str}): {file_path.name}")
+            final_name = file_path.with_suffix('.mp4')
+            temp_output.rename(final_name)
+            file_path.unlink()
+            result['renamed'] = True
+        else:
+            reduction_percent = ((original_size - compressed_size) / original_size) * 100
+            method_str = "GPU" if used_gpu else "CPU"
+            self.logger.info(f"Compresión {method_str} exitosa: {file_path.name} ({elapsed_time:.1f}s, -{reduction_percent:.1f}%)")
+            file_path.unlink()
+            temp_output.rename(file_path.with_suffix('.mp4'))
+            result['compressed'] = True
+        
+        # Marcar completado
+        with open(self.completed_file, 'a') as f:
+            f.write(f"{file_path.with_suffix('.mp4')}\n")
+        
+        return result
+
+    def _handle_failed_compression(self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path) -> Dict:
+        """Maneja el caso de compresión fallida"""
+        result = {'compressed': False, 'renamed': False, 'success': False, 'error': None}
+        
+        error_msg = f"Falló compresión (código {process.returncode}): {file_path}"
+        if process.returncode == 124:
+            error_msg = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
+        
+        if process.stderr:
+            self.logger.error(f"FFmpeg stderr: {process.stderr[:500]}")
+        
+        result['error'] = error_msg
+        
+        if temp_output.exists():
+            temp_output.unlink()
         
         return result
 
@@ -748,18 +753,13 @@ class MediaJellyProcessor:
             # Establece límites para este proceso
             self.set_resource_limits()
             
-            # Valida archivo
-            valid, validation_msg = self._validate_file_for_compression(file_path)
-            if not valid:
-                if validation_msg == "archivo_pequeno":
-                    result['skipped'] = True
-                    result['success'] = True
-                else:
-                    result['error'] = validation_msg
-                return result
+            # Prepara compresión: validación, detección de idiomas, selección de método
+            is_prepared, compression_info, temp_output, audio_langs, sub_langs = self._prepare_compression(file_path)
+            if not is_prepared:
+                return {**result, **compression_info}
             
-            # Detecta idiomas
-            has_spanish, audio_langs, sub_langs = self.detect_language_streams(file_path)
+            use_gpu = compression_info['use_gpu']
+            has_spanish = compression_info['has_spanish']
             
             if not has_spanish:
                 result['no_spanish'] = True
@@ -768,87 +768,14 @@ class MediaJellyProcessor:
                 self.no_spanish_logger.info(f"   Idiomas de subtítulos: {sub_langs}")
                 self.no_spanish_logger.info("   ---")
             
-            # Archivo temporal de salida
-            temp_output = file_path.with_suffix(COMPRESSED_FILE_SUFFIX)
-            
-            # Selección inteligente de método de compresión
-            use_gpu = self._should_use_gpu_compression(file_path)
-            
-            if use_gpu:
-                self.logger.info(f"Utilizando compresión GPU (VAAPI): {file_path.name}")
-                ffmpeg_cmd = self._build_ffmpeg_command(file_path, temp_output, has_spanish)
-                cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [GPU/audio/subs/output]"
-                self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
-            else:
-                self.logger.info(f"Utilizando compresión CPU (libx264): {file_path.name}")
-                ffmpeg_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output)
-                cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
-                self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
-            
             # Ejecuta compresión
-            start_time = time.time()
-            process = subprocess.run(
-                ffmpeg_cmd,
-                capture_output=True,
-                text=True,
-                timeout=FFMPEG_TIMEOUT
-            )
-            elapsed_time = time.time() - start_time
+            process, elapsed_time = self._execute_compression_attempt(file_path, temp_output, use_gpu, has_spanish)
             
             # Procesa resultado inicial
             compression_result = self._process_compression_result(process, file_path, temp_output, elapsed_time, use_gpu)
             
-            # Si hay fallo de validación y se usó GPU, intenta fallback CPU
-            if not compression_result['success'] and use_gpu and 'corrupto' in str(compression_result.get('error', '')):
-                self.logger.warning(f"Archivo corrupto con GPU, intentando fallback CPU: {file_path.name}")
-                
-                # Limpia archivo temporal corrupto
-                if temp_output.exists():
-                    temp_output.unlink()
-                
-                # Construye comando fallback
-                fallback_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output)
-                fallback_str = " ".join(fallback_cmd[:8]) + " ... [CPU-integrity-fallback/audio/output]"
-                self.logger.info(f"Comando ffmpeg CPU fallback por integridad: {fallback_str}")
-                
-                # Ejecuta fallback
-                start_time = time.time()
-                process = subprocess.run(
-                    fallback_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=FFMPEG_TIMEOUT
-                )
-                elapsed_time = time.time() - start_time
-                
-                # Procesa resultado del fallback
-                compression_result = self._process_compression_result(process, file_path, temp_output, elapsed_time, False)
-            
-            # Si la GPU falla en el proceso inicial, intenta con CPU como fallback único
-            elif process.returncode != 0 and use_gpu:
-                self.logger.warning(f"Compresión GPU falló, intentando fallback CPU: {file_path.name}")
-                
-                # Limpia archivo temporal si existe
-                if temp_output.exists():
-                    temp_output.unlink()
-                
-                # Construye comando fallback
-                fallback_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output)
-                fallback_str = " ".join(fallback_cmd[:8]) + " ... [CPU-fallback/audio/output]"
-                self.logger.info(f"Comando ffmpeg CPU fallback: {fallback_str}")
-                
-                # Ejecuta fallback
-                start_time = time.time()
-                process = subprocess.run(
-                    fallback_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=FFMPEG_TIMEOUT
-                )
-                elapsed_time = time.time() - start_time
-                
-                # Procesa resultado del fallback
-                compression_result = self._process_compression_result(process, file_path, temp_output, elapsed_time, False)
+            # Lógica de fallback en caso de fallo con GPU
+            compression_result = self._handle_fallback_logic(compression_result, process, file_path, temp_output, use_gpu, has_spanish)
             
             result.update(compression_result)
                     
@@ -861,6 +788,64 @@ class MediaJellyProcessor:
             result['error'] = f"Error inesperado: {file_path} - {str(e)}"
             
         return result
+
+    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Path, List, List]:
+        """Prepara la compresión: validación, idiomas, método"""
+        # Validación
+        valid, validation_msg = self._validate_file_for_compression(file_path)
+        if not valid:
+            result = {'skipped': validation_msg == "archivo_pequeno", 'error': validation_msg if validation_msg != "archivo_pequeno" else None}
+            return False, result, None, [], []
+        
+        # Idiomas
+        has_spanish, audio_langs, sub_langs = self.detect_language_streams(file_path)
+        
+        # Temporal
+        temp_output = file_path.with_suffix(COMPRESSED_FILE_SUFFIX)
+        
+        # Método
+        use_gpu = self._should_use_gpu_compression(file_path)
+        
+        return True, {'use_gpu': use_gpu, 'has_spanish': has_spanish}, temp_output, audio_langs, sub_langs
+
+    def _execute_compression_attempt(self, file_path: Path, temp_output: Path, use_gpu: bool, has_spanish: bool) -> Tuple[subprocess.CompletedProcess, float]:
+        """Ejecuta un intento de compresión"""
+        if use_gpu:
+            ffmpeg_cmd = self._build_ffmpeg_command(file_path, temp_output, has_spanish)
+            cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [GPU/audio/subs/output]"
+            self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
+        else:
+            ffmpeg_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output)
+            cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
+            self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
+        
+        start_time = time.time()
+        process = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            timeout=FFMPEG_TIMEOUT
+        )
+        elapsed_time = time.time() - start_time
+        
+        return process, elapsed_time
+
+    def _handle_fallback_logic(self, compression_result: Dict, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path, use_gpu: bool, has_spanish: bool) -> Dict:
+        """Maneja la lógica de fallback CPU"""
+        if not compression_result['success'] and use_gpu and 'corrupto' in str(compression_result.get('error', '')):
+            self.logger.warning(f"Archivo corrupto con GPU, intentando fallback CPU: {file_path.name}")
+            if temp_output.exists():
+                temp_output.unlink()
+            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, has_spanish)
+            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False)
+        elif process.returncode != 0 and use_gpu:
+            self.logger.warning(f"Compresión GPU falló, intentando fallback CPU: {file_path.name}")
+            if temp_output.exists():
+                temp_output.unlink()
+            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, has_spanish)
+            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False)
+        
+        return compression_result
 
     def _should_use_gpu_compression(self, file_path: Path) -> bool:
         """Decide si usar compresión GPU basado en historial y disponibilidad de hardware"""
@@ -1007,53 +992,60 @@ class MediaJellyProcessor:
         if not self.pending_file.exists():
             return
             
-        # Lee archivos completados y crea un conjunto de rutas base (sin extensión)
+        completed_base_paths = self._load_completed_base_paths()
+        
+        # Lee archivos pendientes actuales y filtra
+        remaining_pending, orphaned_files = self._filter_pending_files(completed_base_paths)
+        
+        # Reescribe el archivo con solo los archivos válidos pendientes
+        self._rewrite_pending_file(remaining_pending)
+
+        files_removed = len(completed_base_paths)
+        orphaned_count = len(orphaned_files)
+        files_kept = len(remaining_pending)
+        
+        self._log_cleanup_results(files_removed, orphaned_count, files_kept, orphaned_files)
+
+    def _load_completed_base_paths(self) -> set:
+        """Carga las rutas base de archivos completados"""
         completed_base_paths = set()
         if self.completed_file.exists():
             with open(self.completed_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line:
-                        # Obtiene la ruta base sin extensión para comparación
                         path_obj = Path(line)
                         base_path = str(path_obj.parent / path_obj.stem)
                         completed_base_paths.add(base_path)
-        
-        # Lee archivos pendientes actuales y filtra
+        return completed_base_paths
+
+    def _filter_pending_files(self, completed_base_paths: set) -> Tuple[List[str], List[str]]:
+        """Filtra archivos pendientes, separando válidos y huérfanos"""
         remaining_pending = []
         orphaned_files = []
         with open(self.pending_file, 'r') as f:
             for line in f:
                 file_path = line.strip()
                 if file_path:
-                    # Verifica si el archivo aún existe en el sistema
                     pending_path_obj = Path(file_path)
                     if not pending_path_obj.exists():
-                        # Archivo no existe, podría estar procesado o eliminado
-                        # Obtiene la ruta base sin extensión del archivo pendiente
                         pending_base_path = str(pending_path_obj.parent / pending_path_obj.stem)
-                        
-                        # Verifica si está en archivos completados
                         if pending_base_path in completed_base_paths:
-                            # Archivo procesado exitosamente, no lo mantiene
                             continue
                         else:
-                            # Archivo huérfano (no existe y no está completado)
                             orphaned_files.append(file_path)
                             continue
-                    
-                    # Archivo existe, lo mantiene en pendientes
                     remaining_pending.append(file_path)
-        
-        # Reescribe el archivo con solo los archivos válidos pendientes
+        return remaining_pending, orphaned_files
+
+    def _rewrite_pending_file(self, remaining_pending: List[str]) -> None:
+        """Reescribe el archivo de pendientes con archivos válidos"""
         with open(self.pending_file, 'w') as f:
             for file_path in remaining_pending:
                 f.write(f"{file_path}\n")
-                
-        files_removed = len(completed_base_paths)
-        orphaned_count = len(orphaned_files)
-        files_kept = len(remaining_pending)
-        
+
+    def _log_cleanup_results(self, files_removed: int, orphaned_count: int, files_kept: int, orphaned_files: List[str]) -> None:
+        """Loggea los resultados de la limpieza"""
         self.logger.info(f"Archivos procesados removidos de pendientes: {files_removed}")
         if orphaned_count > 0:
             self.logger.warning(f"Archivos huérfanos encontrados y removidos: {orphaned_count}")
@@ -1063,7 +1055,7 @@ class MediaJellyProcessor:
         
         if files_removed > 0 or orphaned_count > 0:
             self.logger.info("Limpieza de lista de pendientes completada")
-    
+
     def _check_all_pending_processed(self) -> None:
         """Verifica si todos los archivos pendientes ya están procesados y termina si es así"""
         if not self.pending_file.exists():

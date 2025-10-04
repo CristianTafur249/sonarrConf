@@ -30,19 +30,14 @@ echo "$(get_gear) Modo de operación: $MODE"
 
 if [ "$MODE" = "python" ]; then
     echo "$(get_snake) Configurando modo Python..."
-    
     # Instalar crontab Python
     crontab -u mediauser /etc/cron.d/mediajelly-python
-    
     echo "$(get_clipboard) Configuración de cron Python:"
     crontab -l -u mediauser
-    
     echo "$(get_magnifying_glass) Verificando scripts Python..."
     ls -la /mediajelly/scripts/*.py
-    
     # Dar permisos de ejecución a scripts Python
     chmod +x /mediajelly/scripts/*.py
-    
     echo "$(get_test_tube) Probando imports Python..."
     python3 -c "import requests, psutil; print('$(get_check_mark) Dependencias Python OK')"
     
