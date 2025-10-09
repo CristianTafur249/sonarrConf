@@ -239,7 +239,7 @@ class TelegramNotifier:
             f.write(f"{current_completed}\n")
             f.write(f"{current_last_log}\n")
         
-        # Determinar si hubo cambios
+        # Determina si hubo cambios
         has_changes = (
             current_completed != previous_state['completed'] or
             current_last_log != previous_state['last_log']

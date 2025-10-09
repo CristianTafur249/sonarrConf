@@ -204,7 +204,7 @@ class MediaScanner:
         self.logger.info(f"Nuevas rutas detectadas: {new_detected}")
 
     def scan_media_directories(self, media_dirs: List[Path]) -> tuple[int, int]:
-        """Escanea directorios de medios y actualiza archivo de pendientes."""
+        """Escanea los directorios de medios y actualiza archivo de pendientes."""
         # Carga estado actual
         completed_files = self.load_completed_files()
         
@@ -233,14 +233,14 @@ class MediaScanner:
         # Filtra archivos nuevos
         new_files_to_add = self._filter_new_files(all_found_files, existing_pending_normalized)
         
-        # Si no hay archivos nuevos, no modificar el archivo
+        # Si no hay archivos nuevos, no modifica el archivo
         if not new_files_to_add:
             self.logger.info("No hay archivos nuevos para agregar a pendientes")
             total_found = len(existing_pending_paths)
             new_detected = 0
             return total_found, new_detected
         
-        # Prepara lista final
+        # Prepara la lista final
         all_pending_objects = self._prepare_pending_list(existing_pending_paths, new_files_to_add)
         
         # Ordena por tamaño

@@ -53,10 +53,10 @@ class MediaJellyCronRunner:
         }
     
     def setup_logging(self):
-        """Configurar logging"""
+        """Configura el logging estructurado con rotación automática"""
         import time
         
-        # Configurar logging con zona horaria local
+        # Configura logging con zona horaria local
         class LocalTimeFormatter(logging.Formatter):
             def formatTime(self, record, datefmt=None):
                 dt = datetime.fromtimestamp(record.created)
@@ -74,7 +74,7 @@ class MediaJellyCronRunner:
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         
-        # Configurar logger
+        # Configura el logger
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
@@ -82,7 +82,7 @@ class MediaJellyCronRunner:
         self.logger.addHandler(console_handler)
     
     def acquire_lock(self) -> bool:
-        """Adquirir lock exclusivo"""
+        """Adquiere un lock exclusivo para evitar ejecuciones simultáneas"""
         try:
             self.lock_fd = open(self.lockfile, 'w')
             fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -92,7 +92,7 @@ class MediaJellyCronRunner:
             return False
     
     def release_lock(self):
-        """Liberar lock"""
+        """Libera el lock si está adquirido"""
         try:
             if hasattr(self, 'lock_fd'):
                 fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
@@ -103,7 +103,7 @@ class MediaJellyCronRunner:
             self.logger.warning(f"Error liberando lock: {e}")
     
     def run_scanner(self) -> bool:
-        """Ejecutar scanner de archivos"""
+        """Ejecuta el scanner de archivos para detectar nuevos archivos multimedia"""
         try:
             self.logger.info(f"Iniciando escaneo de {self.media_dir}")
             
@@ -141,7 +141,7 @@ class MediaJellyCronRunner:
             return False
     
     def run_processor(self) -> bool:
-        """Ejecutar procesador de archivos"""
+        """Ejecuta el procesador de archivos para comprimir y renombrar archivos multimedia"""
         try:
             self.logger.info("Iniciando procesamiento de archivos")
             
@@ -182,14 +182,14 @@ class MediaJellyCronRunner:
             self.logger.error(f"Error ejecutando procesador: {e}")
             return False
     
-    def send_notification(self, status: str = "success") -> bool:
-        """Enviar notificación via Telegram"""
+    def send_notification(self, notification_type: str) -> bool:
+        """Envía notificación vía Telegram según el tipo especificado"""
         try:
             self.logger.info("Enviando notificación...")
             
             cmd = [
                 sys.executable, str(self.notifier_script),
-                "scan_result", status,
+                "scan_result", notification_type,
                 str(self.stats['files_found']),
                 str(self.stats['files_new']),
                 str(self.stats['files_processed']),
@@ -236,7 +236,7 @@ class MediaJellyCronRunner:
             return False
     
     def check_pending_files(self) -> bool:
-        """Verificar si hay archivos pendientes para procesar"""
+        """Verifica si hay archivos pendientes para procesar"""
         pending_file = self.scripts_dir / "pending-compression.txt"
         if not pending_file.exists():
             return False
@@ -247,7 +247,7 @@ class MediaJellyCronRunner:
         return len(pending_lines) > 0
     
     def cleanup_completed_files(self) -> tuple[int, int, int]:
-        """Limpiar archivos que ya no existen del archivo completed.txt"""
+        """Limpia archivos que ya no existen del archivo completed.txt"""
         completed_file = self.scripts_dir / "completed.txt"
         if not completed_file.exists():
             self.logger.warning("Archivo completed.txt no encontrado")
@@ -286,7 +286,7 @@ class MediaJellyCronRunner:
         return files_checked, files_removed, files_kept
     
     def send_completed_cleanup_notification(self, files_checked: int, files_removed: int, files_kept: int) -> bool:
-        """Enviar notificación de limpieza del archivo completed.txt"""
+        """Envía una notificación de limpieza del archivo completed.txt"""
         try:
             self.logger.info("Enviando notificación de limpieza...")
             
@@ -316,19 +316,68 @@ class MediaJellyCronRunner:
             self.logger.error(f"Error enviando notificación de limpieza: {e}")
             return False
                 
+    def should_cleanup(self) -> bool:
+        """Verifica si debe ejecutarse la limpieza basada en la fecha de última ejecución"""
+        last_cleanup_file = self.scripts_dir / "last_cleanup.txt"
+        
+        if not last_cleanup_file.exists():
+            self.logger.info("No existe archivo de última limpieza, ejecutando limpieza")
+            return True
+        
+        try:
+            with open(last_cleanup_file, 'r') as f:
+                last_date_str = f.read().strip()
+            
+            last_date = datetime.fromisoformat(last_date_str)
+            now = datetime.now()
+            
+            # Verifica si han pasado al menos 60 días (aproximadamente 2 meses)
+            days_since_last = (now - last_date).days
+            if days_since_last >= 60:
+                self.logger.info(f"Han pasado {days_since_last} días desde la última limpieza, ejecutando limpieza")
+                return True
+            else:
+                self.logger.info(f"Solo han pasado {days_since_last} días, no es necesario limpiar aún")
+                return False
+                
+        except Exception as e:
+            self.logger.warning(f"Error leyendo fecha de última limpieza: {e}, ejecutando limpieza por seguridad")
+            return True
+                
+    def update_last_cleanup_date(self):
+        """Actualiza la fecha de la última limpieza"""
+        last_cleanup_file = self.scripts_dir / "last_cleanup.txt"
+        now_str = datetime.now().isoformat()
+        try:
+            with open(last_cleanup_file, 'w') as f:
+                f.write(now_str)
+            self.logger.info(f"Fecha de última limpieza actualizada: {now_str}")
+        except Exception as e:
+            self.logger.error(f"Error actualizando fecha de última limpieza: {e}")
+                
+    def check_and_cleanup_if_needed(self):
+        """Verifica y ejecuta limpieza si es necesario"""
+        if self.should_cleanup():
+            files_checked, files_removed, files_kept = self.cleanup_completed_files()
+            self.send_completed_cleanup_notification(files_checked, files_removed, files_kept)
+            self.update_last_cleanup_date()
+                
     def run_cleanup_only(self) -> bool:
-        """Ejecutar solo la limpieza mensual de archivos completados"""
+        """Ejecuta solo la limpieza mensual de archivos completados"""
         if not self.acquire_lock():
             return False
         
         try:
             self.logger.info("=== Iniciando limpieza mensual de archivos completados ===")
             
-            # Ejecutar limpieza
+            # Ejecuta la limpieza
             files_checked, files_removed, files_kept = self.cleanup_completed_files()
             
-            # Enviar notificación
+            # Envía la notificación
             self.send_completed_cleanup_notification(files_checked, files_removed, files_kept)
+            
+            # Actualiza la fecha de última limpieza
+            self.update_last_cleanup_date()
             
             self.logger.info("=== Limpieza mensual finalizada ===")
             return True
@@ -341,19 +390,19 @@ class MediaJellyCronRunner:
             self.release_lock()
     
     def run(self) -> bool:
-        """Ejecutar flujo completo"""
+        """Ejecuta el flujo completo de escaneo y procesamiento"""
         if not self.acquire_lock():
             return False
         
         try:
             self.logger.info("=== Iniciando ejecución automática Python ===")
             
-            # 1. Ejecutar scanner
+            # 1. Ejecuta el scanner
             if not self.run_scanner():
                 self.send_error_notification("Falló el escaneo automático")
                 return False
             
-            # 2. Verificar si hay archivos para procesar
+            # 2. Verifica si hay archivos para procesar
             if not self.check_pending_files():
                 self.logger.info("No hay archivos pendientes para procesar")
                 # Envía notificación de sistema al día
@@ -369,23 +418,24 @@ class MediaJellyCronRunner:
                 ]
                 subprocess.run(cmd, timeout=60)
                 
-                # Limpieza de archivos completados
-                self.cleanup_completed_files()
+                # Verifica y ejecuta limpieza si es necesario
+                self.check_and_cleanup_if_needed()
                 
+                # Guarda el estado final del progreso
                 self.logger.info("=== Ejecución automática Python finalizada ===")
                 return True
             
-            # 3. Ejecutar procesador
+            # 3. Ejecuta el procesador
             if not self.run_processor():
                 self.send_error_notification("Falló el procesamiento automático")
                 return False
             
-            # 4. Enviar notificación de éxito
+            # 4. Envía notificación de éxito
             self.send_notification("success")
             
-            # 5. Limpieza de archivos completados
-            files_checked, files_removed, files_kept = self.cleanup_completed_files()
-            self.send_completed_cleanup_notification(files_checked, files_removed, files_kept)
+            
+            # Verifica y ejecuta limpieza si es necesario
+            self.check_and_cleanup_if_needed()
             
             self.logger.info("=== Ejecución automática Python finalizada ===")
             return True
@@ -404,14 +454,14 @@ def signal_handler(signum, frame):
 
 def main():
     """Función principal"""
-    # Configura manejo de señales
+    # Configura el manejo de señales
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
     # Ejecuta el runner
     runner = MediaJellyCronRunner()
     
-    # Verificar si se ejecuta en modo cleanup
+    # Verifica si se ejecuta en modo cleanup
     if len(sys.argv) > 1 and sys.argv[1] == "cleanup":
         success = runner.run_cleanup_only()
     else:

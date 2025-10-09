@@ -32,7 +32,7 @@ def normalize_path(path_str, target_base):
     
     return path_str
 
-# Normalizar completed.txt
+# Normaliza completed.txt
 if completed_file.exists():
     print(f"Normalizando {completed_file}...")
     with open(completed_file, 'r') as f:
@@ -49,7 +49,7 @@ if completed_file.exists():
     
     print(f"Normalizadas {len(normalized_completed)} rutas en completed.txt")
 
-# Normalizar pending-compression.txt
+# Normaliza pending-compression.txt
 if pending_file.exists():
     print(f"Normalizando {pending_file}...")
     with open(pending_file, 'r') as f:

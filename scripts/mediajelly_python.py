@@ -86,7 +86,7 @@ class MediaJellyProcessor:
         
     def setup_logging(self):
         """Configura logging estructurado con rotación automática"""
-        # Limpia handlers existentes
+        # Limpia los handlers existentes
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
         
@@ -134,7 +134,7 @@ class MediaJellyProcessor:
         no_spanish_formatter = logging.Formatter('[%(asctime)s] SIN ESPAÑOL: %(message)s', '%Y-%m-%d %H:%M:%S')
         no_spanish_handler.setFormatter(no_spanish_formatter)
         
-        # Agrega handlers
+        # Agrega los handlers
         self.logger.addHandler(success_handler)
         self.logger.addHandler(error_handler)
         self.no_spanish_logger.addHandler(no_spanish_handler)
@@ -713,7 +713,7 @@ class MediaJellyProcessor:
             temp_output.rename(file_path.with_suffix('.mp4'))
             result['compressed'] = True
         
-        # Marcar completado
+        # Marca como completado
         with open(self.completed_file, 'a') as f:
             f.write(f"{file_path.with_suffix('.mp4')}\n")
         
@@ -962,19 +962,22 @@ class MediaJellyProcessor:
         try:
             self.logger.info("=== Iniciando MediaJelly Python ===")
             
+            # Limpia archivos pendientes procesados antes de escanear
+            self.cleanup_processed_files()
+            
             # Escanea archivos
             files = self.scan_media_files()
             
             if not files:
                 self.logger.info("No hay archivos pendientes para procesar")
-                # Aún así verifica si hay archivos en pending que deberían limpiarse
+                # Verifica si todos los archivos pendientes ya están procesados
                 self._check_all_pending_processed()
                 return self.stats
             
             # Procesa archivos
             self.stats = self.process_files_concurrent(files)
             
-            # Limpia archivos pendientes procesados exitosamente
+            # Limpia archivos pendientes procesados exitosamente (de nuevo por si acaso)
             self.cleanup_processed_files()
             
             # Verifica si todos los archivos pendientes ya están procesados
@@ -992,15 +995,14 @@ class MediaJellyProcessor:
         if not self.pending_file.exists():
             return
             
-        completed_base_paths = self._load_completed_base_paths()
+        completed_files = self._load_completed_files()
         
         # Lee archivos pendientes actuales y filtra
-        remaining_pending, orphaned_files = self._filter_pending_files(completed_base_paths)
+        remaining_pending, orphaned_files, files_removed = self._filter_pending_files(completed_files)
         
         # Reescribe el archivo con solo los archivos válidos pendientes
         self._rewrite_pending_file(remaining_pending)
 
-        files_removed = len(completed_base_paths)
         orphaned_count = len(orphaned_files)
         files_kept = len(remaining_pending)
         
@@ -1019,24 +1021,25 @@ class MediaJellyProcessor:
                         completed_base_paths.add(base_path)
         return completed_base_paths
 
-    def _filter_pending_files(self, completed_base_paths: set) -> Tuple[List[str], List[str]]:
+    def _filter_pending_files(self, completed_files: set) -> Tuple[List[str], List[str], int]:
         """Filtra archivos pendientes, separando válidos y huérfanos"""
         remaining_pending = []
         orphaned_files = []
+        files_removed = 0
         with open(self.pending_file, 'r') as f:
             for line in f:
                 file_path = line.strip()
                 if file_path:
                     pending_path_obj = Path(file_path)
-                    if not pending_path_obj.exists():
-                        pending_base_path = str(pending_path_obj.parent / pending_path_obj.stem)
-                        if pending_base_path in completed_base_paths:
-                            continue
-                        else:
-                            orphaned_files.append(file_path)
-                            continue
+                    mp4_path = pending_path_obj.with_suffix('.mp4')
+                    if str(mp4_path) in completed_files:
+                        files_removed += 1
+                        continue  # Remover archivos procesados
+                    elif not pending_path_obj.exists():
+                        orphaned_files.append(file_path)
+                        continue
                     remaining_pending.append(file_path)
-        return remaining_pending, orphaned_files
+        return remaining_pending, orphaned_files, files_removed
 
     def _rewrite_pending_file(self, remaining_pending: List[str]) -> None:
         """Reescribe el archivo de pendientes con archivos válidos"""
