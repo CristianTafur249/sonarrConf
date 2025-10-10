@@ -18,14 +18,14 @@ print(f"Base dir: {base_dir}")
 
 def normalize_path(path_str, target_base):
     """Normalizar ruta para que use la base correcta"""
-    # Remover prefijos conocidos
+    # Remoción de prefijos conocidos
     path_str = path_str.strip()
     
     # Si ya está bien, devolverla tal como está
     if path_str.startswith(str(target_base)):
         return path_str
     
-    # Extraer la parte relativa después de 'media/'
+    # Extracción de la parte relativa después de 'media/'
     if '/media/' in path_str:
         media_part = path_str.split('/media/', 1)[1]
         return str(target_base / "media" / media_part)

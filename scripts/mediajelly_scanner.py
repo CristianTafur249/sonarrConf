@@ -249,7 +249,7 @@ class MediaScanner:
         # Escribe archivo
         self._write_pending_file(all_pending)
         
-        # Limpia duplicados finales después de agregar nuevos
+        # Limpieza de duplicados finales después de agregar nuevos
         final_duplicates = self.clean_pending_duplicates()
         if final_duplicates > 0:
             self.logger.info(f"Post-limpieza: eliminados {final_duplicates} duplicados finales")
@@ -265,7 +265,7 @@ class MediaScanner:
         """Ejecutar escaneo completo"""
         start_time = time.time()
         
-        # Limpia duplicados del archivo pending antes de comenzar
+        # Limpieza de duplicados del archivo pending antes de comenzar
         duplicates_removed = self.clean_pending_duplicates()
         if duplicates_removed > 0:
             self.logger.info(f"Pre-limpieza: eliminados {duplicates_removed} duplicados")
@@ -297,7 +297,7 @@ def main():
     
     scanner = MediaScanner()
     
-    # Ejecutar escaneo
+    # Ejecución de escaneo
     media_paths = sys.argv[1:]
     total_found, new_detected = scanner.run(media_paths)
     

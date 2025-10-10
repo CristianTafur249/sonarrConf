@@ -126,14 +126,29 @@ class TelegramNotifier:
         
         return True
     
+    def _get_progress_info(self) -> Dict:
+        """Obtener información del progreso desde progress.json"""
+        progress_file = self.scripts_dir / "tmp" / "progress.json"
+        try:
+            if progress_file.exists():
+                with open(progress_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Error leyendo progress.json: {e}")
+        
+        return {
+            'current_file': 0,
+            'total_files': 0,
+            'current_file_name': 'N/A',
+            'percentage': 0,
+            'status': 'unknown',
+            'stats': {}
+        }
+    
     def _get_compression_summary(self) -> str:
-        """Obtener resumen de compresión del log"""
-        success_log = self.scripts_dir / "logs" / "compression-success.log"
-        if success_log.exists():
-            with open(success_log, 'r') as f:
-                for line in reversed(f.readlines()):
-                    if "RESUMEN:" in line:
-                        return f"{EmojiGenerator.stats()} Resumen del procesamiento:\n{line.strip()}\n\n"
+        """Obtener resumen de compresión adicional (solo detalles extras, no duplicar info principal)"""
+        # Esta función ahora solo devuelve información adicional que no está en la notificación principal
+        # Ya no duplicamos estadísticas básicas
         return ""
     
     def _get_error_summary(self) -> str:
@@ -247,24 +262,27 @@ class TelegramNotifier:
         
         return has_changes
     
-    def notify_scan_result(self, status: str, files_found: int, files_new: int, 
-                          files_processed: int, files_compressed: int, 
-                          files_renamed: int, files_skipped: int) -> bool:
-        """Notificar resultado del escaneo"""
+    def _build_scan_only_message(self, files_found: int, files_new: int, progress: dict) -> str:
+        """Construye mensaje para escaneo sin procesamiento"""
+        message = f"{EmojiGenerator.info()} MediaJelly - Escaneo Completado\n\n"
+        message += f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n"
+        message += f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n\n"
         
-        # Verifica si hubo procesamiento nuevo
-        if not self.has_new_processing():
-            # No hubo procesamiento nuevo
-            message = f"{EmojiGenerator.info()} MediaJelly - Escaneo Completado\n\n"
-            message += f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n"
-            message += f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n\n"
+        if progress.get('status') == 'processing':
+            message += f"{EmojiGenerator.gear()} Estado: En procesamiento ({progress.get('percentage', 0):.1f}%)\n"
+            if progress.get('current_file_name'):
+                message += f"{EmojiGenerator.memo()} Procesando: {progress.get('current_file_name')}\n\n"
+        else:
             message += f"{EmojiGenerator.info()} No se encontraron archivos nuevos para procesar\n"
             message += f"{EmojiGenerator.success()} El sistema está al día\n\n"
-            message += f"{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            return self.send_long_message(message)
         
-        # Hubo procesamiento nuevo
+        message += f"{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        return message
+    
+    def _build_processing_message(self, status: str, files_found: int, files_new: int, 
+                                files_processed: int, files_compressed: int, 
+                                files_renamed: int, files_skipped: int, progress: dict) -> str:
+        """Construye mensaje para procesamiento completado"""
         emoji = EmojiGenerator.success() if status == "success" else EmojiGenerator.error()
         title = "MediaJelly - Procesamiento Completado" if status == "success" else "MediaJelly - Error en Procesamiento"
         
@@ -272,18 +290,67 @@ class TelegramNotifier:
         message += f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n"
         message += f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n"
         
-        if files_processed > 0:
+        if files_processed > 0 or files_compressed > 0 or files_renamed > 0 or files_skipped > 0:
             message += f"{EmojiGenerator.gear()} Archivos procesados: {files_processed}\n"
             message += f"{EmojiGenerator.compression()} Comprimidos: {files_compressed}\n"
             message += f"{EmojiGenerator.memo()} Renombrados: {files_renamed}\n"
             message += f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
         
-        message += f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        if progress.get('status') == 'processing' and progress.get('percentage', 0) < 100:
+            message += f"\n{EmojiGenerator.stats()} Progreso: {progress.get('percentage', 0):.1f}%\n"
+            if progress.get('current_file_name'):
+                message += f"{EmojiGenerator.gear()} Procesando: {progress.get('current_file_name')}\n"
         
-        # Agrega resumen de errores si existen
-        summary = self.create_processing_summary()
-        if summary:
-            message += summary
+        message += f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        return message
+    
+    def _add_error_summaries(self, message: str) -> str:
+        """Agrega resúmenes de errores y archivos sin español al mensaje"""
+        error_summary = self._get_error_summary()
+        no_spanish_summary = self._get_no_spanish_summary()
+        
+        if error_summary or no_spanish_summary:
+            message += "\n"
+            if error_summary:
+                message += error_summary
+            if no_spanish_summary:
+                message += no_spanish_summary
+        
+        return message
+    
+    def notify_scan_result(self, status: str, files_found: int, files_new: int, 
+                          files_processed: int, files_compressed: int, 
+                          files_renamed: int, files_skipped: int) -> bool:
+        """Notificar resultado del escaneo"""
+        
+        # Obtiene información del progreso
+        progress = self._get_progress_info()
+        progress_stats = progress.get('stats', {})
+        
+        # Usa las estadísticas del progress.json si están disponibles
+        if progress_stats:
+            files_found = progress_stats.get('files_found', files_found)
+            files_new = progress_stats.get('files_new', files_new)
+            files_processed = progress_stats.get('files_processed', files_processed)
+            files_compressed = progress_stats.get('files_compressed', files_compressed)
+            files_renamed = progress_stats.get('files_renamed', files_renamed)
+            files_skipped = progress_stats.get('files_skipped', files_skipped)
+        
+        # Verifica si hubo procesamiento nuevo
+        has_processing = self.has_new_processing()
+        
+        # Si no hay archivos procesados, es solo un escaneo
+        if files_processed == 0 and not has_processing:
+            message = self._build_scan_only_message(files_found, files_new, progress)
+            return self.send_long_message(message)
+        
+        # Hubo procesamiento
+        message = self._build_processing_message(status, files_found, files_new, 
+                                               files_processed, files_compressed, 
+                                               files_renamed, files_skipped, progress)
+        
+        # Agrega resúmenes de errores
+        message = self._add_error_summaries(message)
         
         return self.send_long_message(message)
     
