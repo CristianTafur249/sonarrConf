@@ -6,6 +6,7 @@ MediaJelly Cron Runner Python - Orquestador principal optimizado
 import os
 import sys
 import time
+import json
 import fcntl
 import signal
 import subprocess
@@ -31,7 +32,7 @@ class MediaJellyCronRunner:
         
         # Scripts Python
         self.scanner_script = self.scripts_dir / "mediajelly_scanner.py"
-        self.processor_script = self.scripts_dir / "mediajelly_python.py"
+        self.processor_script = self.scripts_dir / "mediajelly_processor.py"
         self.notifier_script = self.scripts_dir / "mediajelly_notifier.py"
         
         # Crea directorios
@@ -84,11 +85,34 @@ class MediaJellyCronRunner:
     def acquire_lock(self) -> bool:
         """Adquiere un lock exclusivo para evitar ejecuciones simultáneas"""
         try:
+            # Si el archivo de lock existe, verificar si el proceso está activo
+            if self.lockfile.exists():
+                try:
+                    with open(self.lockfile, 'r') as f:
+                        pid = f.read().strip()
+                        if pid and pid.isdigit():
+                            pid = int(pid)
+                            # Verificar si el proceso existe
+                            try:
+                                os.kill(pid, 0)  # No mata el proceso, solo verifica si existe
+                                self.logger.error(f"Ya hay una instancia ejecutándose (PID: {pid})")
+                                return False
+                            except OSError:
+                                # El proceso no existe, el lock está huérfano
+                                self.logger.info(f"Lock huérfano detectado (PID {pid} no existe), limpiando...")
+                                self.lockfile.unlink()
+                except Exception as e:
+                    self.logger.warning(f"Error al verificar lock existente: {e}, recreando lock...")
+                    self.lockfile.unlink(missing_ok=True)
+            
+            # Crear el archivo de lock con el PID actual
             self.lock_fd = open(self.lockfile, 'w')
             fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lock_fd.write(str(os.getpid()))
+            self.lock_fd.flush()
             return True
-        except (IOError, OSError):
-            self.logger.error("Ya hay una instancia ejecutándose")
+        except (IOError, OSError) as e:
+            self.logger.error(f"Error al adquirir lock: {e}")
             return False
     
     def release_lock(self):
@@ -207,6 +231,10 @@ class MediaJellyCronRunner:
             
             if result.returncode == 0:
                 self.logger.info("Notificación enviada correctamente")
+                
+                # Marca como notificado en progress.json
+                self._mark_as_notified()
+                
                 return True
             else:
                 self.logger.error("Error al enviar notificación")
@@ -215,6 +243,23 @@ class MediaJellyCronRunner:
         except Exception as e:
             self.logger.error(f"Error enviando notificación: {e}")
             return False
+    
+    def _mark_as_notified(self):
+        """Marca el estado actual como notificado en progress.json"""
+        try:
+            progress_file = self.tmp_dir / "progress.json"
+            if progress_file.exists():
+                with open(progress_file, 'r') as f:
+                    progress_data = json.load(f)
+                
+                progress_data['notified'] = True
+                
+                with open(progress_file, 'w') as f:
+                    json.dump(progress_data, f, indent=2)
+                
+                self.logger.info("Estado marcado como notificado (notified=True)")
+        except Exception as e:
+            self.logger.warning(f"Error marcando como notificado: {e}")
     
     def send_error_notification(self, error_message: str) -> bool:
         """Enviar notificación de error"""

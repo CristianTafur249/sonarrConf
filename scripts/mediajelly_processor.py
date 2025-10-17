@@ -14,24 +14,25 @@ import resource
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 import signal
+import atexit
 import glob
 
 # Configuración de límites de recursos
 MAX_MEMORY_GB = 4  # Limita memoria por proceso ffmpeg
 MAX_CPU_PERCENT = 30  # Restringe porcentaje máximo de CPU total
 MAX_CONCURRENT_COMPRESSIONS = 2  # Permite 2 compresiones simultáneas
-FFMPEG_TIMEOUT = 7200  # Establece 2 horas por archivo
+FFMPEG_TIMEOUT = 9000  # Establece 2.5 horas por archivo
 
 # Constantes para archivos y formatos
 COMPRESSED_FILE_SUFFIX = '.compressed.mp4'
 STREAM_LANGUAGE_QUERY = "stream=index:stream_tags=language"
 CSV_FORMAT_PARAM = "csv=p=0"
 FIRST_AUDIO_STREAM = "0:a:0"
-PROGRESS_UPDATE_INTERVAL = 10  # Actualizar progreso cada 10 archivos
+PROGRESS_UPDATE_INTERVAL = 1  # Actualizar progreso cada 1 archivo
 PROGRESS_FILE_NAME = "progress.json"
 VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
 LOG_RETENTION_DAYS = 30  # Días para mantener logs antiguos
@@ -48,6 +49,8 @@ class ProcessingStats:
     files_compressed: int = 0
     files_renamed: int = 0
     files_skipped: int = 0
+    total_original_size: int = 0
+    total_compressed_size: int = 0
     errors: Optional[List[str]] = None
     no_spanish: Optional[List[str]] = None
     
@@ -183,13 +186,18 @@ class MediaJellyProcessor:
     
     def _save_progress_state(self, current_file: int, total_files: int, current_file_name: str, status: str = 'processing') -> None:
         """Guarda el estado actual del progreso"""
+        # Calcula porcentaje basado en archivos encontrados totales, no en total_files del parámetro
+        total_found = self.stats.files_found if self.stats.files_found > 0 else total_files
+        percentage = round((current_file / total_found) * 100, 1) if total_found > 0 else 0
+        
         progress_data = {
             'current_file': current_file,
-            'total_files': total_files,
+            'total_files': total_found,  # Usa files_found como total_files consistente
             'current_file_name': current_file_name,
-            'percentage': round((current_file / total_files) * 100, 1) if total_files > 0 else 0,
+            'percentage': percentage,
             'last_updated': datetime.now().isoformat(),
             'status': status,  # scanning, processing, completed, error
+            'notified': False,  # Indica si ya se envió notificación para esta ejecución
             'stats': asdict(self.stats),
             'processed_files': self.processed_files
         }
@@ -222,6 +230,7 @@ class MediaJellyProcessor:
             'percentage': 0,
             'last_updated': None,
             'status': 'idle',
+            'notified': False,
             'stats': asdict(self.stats),
             'processed_files': {}
         }
@@ -365,8 +374,19 @@ class MediaJellyProcessor:
         """Escanea archivos multimedia con pathlib optimizado"""
         self.logger.info("Iniciando escaneo de archivos multimedia...")
         
-        # Actualiza estado de progreso como escaneando
-        self._save_progress_state(0, 1, "Escaneando archivos multimedia...", status='scanning')
+        # Verifica si hay progreso anterior incompleto
+        existing_progress = self.get_progress_info()
+        has_incomplete_progress = (
+            existing_progress.get('status') in ['processing', 'scanning', 'interrupted'] and 
+            existing_progress.get('percentage', 0) < 90
+        )
+        
+        if has_incomplete_progress:
+            self.logger.info(f"Detectado progreso anterior incompleto ({existing_progress.get('percentage', 0):.1f}%), preservando estado")
+            # No actualizar estado de progreso para no sobrescribir el anterior
+        else:
+            # Actualiza estado de progreso como escaneando
+            self._save_progress_state(0, 1, "Escaneando archivos multimedia...", status='scanning')
         
         # Limpia archivos .compressed.mp4 incompletos
         self._clean_incomplete_compressed_files()
@@ -389,11 +409,22 @@ class MediaJellyProcessor:
         self.stats.files_found = len(filtered_files)
         self.logger.info(f"Escaneo completado: {len(filtered_files)} archivos pendientes para procesar")
         
-        # Actualiza estado como escaneo completado
-        if len(filtered_files) > 0:
-            self._save_progress_state(0, len(filtered_files), f"{len(filtered_files)} archivos encontrados", status='scanned')
+        # Actualiza files_found en el progreso, incluso si hay progreso anterior
+        if has_incomplete_progress:
+            # Actualiza solo files_found en el progreso existente sin cambiar el estado
+            existing_progress['stats']['files_found'] = len(filtered_files)
+            progress_file = self.tmp_dir / PROGRESS_FILE_NAME
+            try:
+                with open(progress_file, 'w') as f:
+                    json.dump(existing_progress, f, indent=2)
+            except Exception as e:
+                self.logger.warning(f"Error actualizando files_found en progreso: {e}")
         else:
-            self._save_progress_state(0, 0, "Escaneo completado", status='scanned')
+            # Comportamiento normal para ejecuciones nuevas
+            if len(filtered_files) > 0:
+                self._save_progress_state(0, len(filtered_files), f"{len(filtered_files)} archivos encontrados", status='scanned')
+            else:
+                self._save_progress_state(0, 0, "Escaneo completado", status='scanned')
         
         return filtered_files
     
@@ -704,7 +735,7 @@ class MediaJellyProcessor:
 
     def _handle_successful_compression(self, temp_output: Path, file_path: Path, elapsed_time: float, used_gpu: bool) -> Dict:
         """Maneja el caso de compresión exitosa"""
-        result = {'compressed': False, 'renamed': False, 'success': True, 'error': None}
+        result = {'compressed': False, 'renamed': False, 'success': True, 'error': None, 'no_spanish': False, 'skipped': False}
         
         # Validación
         is_valid, validation_msg = self._validate_compressed_file(temp_output, file_path)
@@ -729,6 +760,8 @@ class MediaJellyProcessor:
             temp_output.rename(final_name)
             file_path.unlink()
             result['renamed'] = True
+            result['original_size'] = original_size
+            result['compressed_size'] = compressed_size
         else:
             reduction_percent = ((original_size - compressed_size) / original_size) * 100
             method_str = "GPU" if used_gpu else "CPU"
@@ -736,6 +769,8 @@ class MediaJellyProcessor:
             file_path.unlink()
             temp_output.rename(file_path.with_suffix('.mp4'))
             result['compressed'] = True
+            result['original_size'] = original_size
+            result['compressed_size'] = compressed_size
         
         # Marca como completado
         with open(self.completed_file, 'a') as f:
@@ -745,7 +780,7 @@ class MediaJellyProcessor:
 
     def _handle_failed_compression(self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path) -> Dict:
         """Maneja el caso de compresión fallida"""
-        result = {'compressed': False, 'renamed': False, 'success': False, 'error': None}
+        result = {'compressed': False, 'renamed': False, 'success': False, 'error': None, 'no_spanish': False, 'skipped': False}
         
         error_msg = f"Falló compresión (código {process.returncode}): {file_path}"
         if process.returncode == 124:
@@ -949,26 +984,62 @@ class MediaJellyProcessor:
         
         return True, total_files
 
-    def _load_previous_progress(self, progress_info: dict) -> None:
+    def _load_previous_progress(self, progress_info: dict) -> int:
         """Carga estadísticas y archivos procesados de progreso anterior"""
-        # Conservación de estadísticas previas si el progreso anterior no era completo (< 90%)
-        if progress_info.get('percentage', 0) < 90 and 'stats' in progress_info:
-            prev_stats = progress_info['stats']
-            self.logger.info(f"Cargando estadísticas previas (progreso anterior: {progress_info.get('percentage', 0):.1f}%)")
-            self.stats.files_found = prev_stats.get('files_found', 0)
-            self.stats.files_new = prev_stats.get('files_new', 0) 
-            self.stats.files_processed = prev_stats.get('files_processed', 0)
-            self.stats.files_compressed = prev_stats.get('files_compressed', 0)
-            self.stats.files_renamed = prev_stats.get('files_renamed', 0)
-            self.stats.files_skipped = prev_stats.get('files_skipped', 0)
-            if 'errors' in prev_stats:
-                self.stats.errors = prev_stats['errors']
-            if 'no_spanish' in prev_stats:
-                self.stats.no_spanish = prev_stats['no_spanish']
-        
+        current_file = 0
+
+        # Carga estadísticas previas
+        current_file = self._load_previous_stats(progress_info, current_file)
+
         # Carga archivos procesados previamente
-        if 'processed_files' in progress_info:
+        self._load_previous_processed_files(progress_info)
+
+        return current_file
+
+    def _load_previous_stats(self, progress_info: dict, current_file: int) -> int:
+        """Carga estadísticas previas del progreso"""
+        if 'stats' not in progress_info:
+            return current_file
+
+        prev_stats = progress_info['stats']
+        self.logger.info(f"Cargando estadísticas previas (progreso anterior: {progress_info.get('percentage', 0):.1f}%)")
+
+        self.stats.files_found = prev_stats.get('files_found', 0)
+        self.stats.files_new = prev_stats.get('files_new', 0)
+        self.stats.files_processed = prev_stats.get('files_processed', 0)
+        self.stats.files_compressed = prev_stats.get('files_compressed', 0)
+        self.stats.files_renamed = prev_stats.get('files_renamed', 0)
+        self.stats.files_skipped = prev_stats.get('files_skipped', 0)
+        self.stats.total_original_size = prev_stats.get('total_original_size', 0)
+        self.stats.total_compressed_size = prev_stats.get('total_compressed_size', 0)
+
+        if 'errors' in prev_stats:
+            self.stats.errors = prev_stats['errors']
+        if 'no_spanish' in prev_stats:
+            self.stats.no_spanish = prev_stats['no_spanish']
+
+        return progress_info.get('current_file', 0)
+
+    def _load_previous_processed_files(self, progress_info: dict) -> None:
+        """Carga archivos procesados previamente"""
+        if 'processed_files' in progress_info and progress_info['processed_files']:
             self.processed_files = progress_info['processed_files']
+        elif len(progress_info.get('processed_files', {})) == 0 and progress_info.get('stats', {}).get('files_processed', 0) > 0:
+            # Si processed_files vacío pero hay archivos procesados, reconstruir de completed.txt
+            self._rebuild_processed_files_from_completed()
+
+    def _rebuild_processed_files_from_completed(self) -> None:
+        """Reconstruye processed_files desde completed.txt"""
+        completed_files = set()
+        if self.completed_file.exists():
+            with open(self.completed_file, 'r') as f:
+                for line in f:
+                    file_path = line.strip()
+                    if file_path:
+                        completed_files.add(file_path)
+
+        self.processed_files = {path: {'status': 'success', 'timestamp': datetime.now().isoformat()} for path in completed_files}
+        self.logger.info(f"Reconstruyendo processed_files de completed.txt: {len(self.processed_files)} archivos")
 
     def _filter_already_processed_files(self, files: List[Path]) -> List[Path]:
         """Filtra archivos ya procesados exitosamente"""
@@ -979,62 +1050,25 @@ class MediaJellyProcessor:
             self.logger.info(f"Archivos ya procesados exitosamente omitidos: {files_filtered}")
         return files
 
-    def _submit_concurrent_jobs(self, files: List[Path]) -> tuple[dict, list[str]]:
-        """Envía trabajos concurrentes y retorna futures y lista de archivos en progreso"""
-        with ProcessPoolExecutor(max_workers=MAX_CONCURRENT_COMPRESSIONS) as executor:
-            future_to_file = {executor.submit(self.compress_single_file, file_path): file_path 
-                            for file_path in files}
-            files_in_progress = [f.name for f in files]
-            return future_to_file, files_in_progress
-
-    def _process_concurrent_results(self, future_to_file: dict, files_in_progress: list[str], total_files: int) -> tuple[list[str], list[str]]:
-        """Procesa resultados de trabajos concurrentes"""
+    def _process_files_with_executor(self, files: List[Path], total_files: int, current_file: int) -> tuple[int, list[str], list[str]]:
+        """Procesa archivos con executor y actualiza progreso después de cada compresión"""
         current_errors = []
         current_no_spanish = []
-        processed_count = 0
-        
-        for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
-            processed_count += 1
-            
-            # Remueve el archivo de la lista de procesamiento
-            if file_path.name in files_in_progress:
-                files_in_progress.remove(file_path.name)
-            
-            # Construye mensaje de archivos en procesamiento
-            current_file_name = self._build_progress_message(files_in_progress)
-            
-            # Actualiza progreso
-            self._save_progress_state(processed_count, total_files, current_file_name, status='processing')
-            
-            # Log progreso
-            if processed_count % PROGRESS_UPDATE_INTERVAL == 0 or processed_count == total_files:
-                percentage = (processed_count / total_files) * 100
-                self.logger.info(f"Progreso: {processed_count}/{total_files} ({percentage:.1f}%) - Archivo procesado: {file_path.name}")
-            
-            try:
-                result = future.result()
-                self._process_result(result, file_path, current_errors, current_no_spanish)
-                self.processed_files[str(file_path)] = {'status': 'success', 'timestamp': datetime.now().isoformat()}
-                    
-            except Exception as e:
-                error_msg = f"Error procesando {file_path}: {str(e)}"
-                self.logger.error(error_msg)
-                current_errors.append(file_path.name)
-                self.processed_files[str(file_path)] = {'status': 'failed', 'timestamp': datetime.now().isoformat(), 'error': str(e)}
-        
-        return current_errors, current_no_spanish
+        processed_count = current_file
 
-    def _build_progress_message(self, files_in_progress: list[str]) -> str:
-        """Construye mensaje de progreso basado en archivos en procesamiento"""
-        if files_in_progress:
-            display_files = files_in_progress[:3]
-            if len(files_in_progress) > 3:
-                return f"{', '.join(display_files)} y {len(files_in_progress) - 3} más"
-            else:
-                return ', '.join(display_files)
-        else:
-            return PROCESSING_COMPLETED_MESSAGE
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_COMPRESSIONS) as executor:
+            future_to_file = {executor.submit(self.compress_single_file, file_path): file_path
+                            for file_path in files}
+            files_in_progress = [f.name for f in files]
+
+            # Procesa resultados conforme van completando
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                self._process_single_future_result(future, file_path, current_errors, current_no_spanish)
+                processed_count += 1
+                self._update_progress_after_processing(file_path, processed_count, total_files, files_in_progress)
+
+        return processed_count, current_errors, current_no_spanish
 
     def process_files_concurrent(self, files: List[Path]) -> ProcessingStats:
         """Procesa archivos con concurrencia limitada y seguimiento de progreso"""
@@ -1043,14 +1077,11 @@ class MediaJellyProcessor:
         if not initialized:
             return self.stats
         
-        # Limpia archivos procesados previamente (si existen)
-        self._clean_processed_files_if_necessary()
-        
         # Carga progreso anterior si existe
         progress_info = self.get_progress_info()
         
         # Carga estadísticas y archivos procesados de progreso anterior
-        self._load_previous_progress(progress_info)
+        current_file = self._load_previous_progress(progress_info)
         
         # Filtra archivos ya procesados exitosamente
         files = self._filter_already_processed_files(files)
@@ -1064,17 +1095,14 @@ class MediaJellyProcessor:
             
         self.logger.info(f"Procesando {total_files} archivos pendientes con {MAX_CONCURRENT_COMPRESSIONS} workers")
         
-        # Envía trabajos concurrentes
-        future_to_file, files_in_progress = self._submit_concurrent_jobs(files)
-        
-        # Procesa resultados de trabajos concurrentes
-        current_errors, current_no_spanish = self._process_concurrent_results(future_to_file, files_in_progress, total_files)
+        # Procesa archivos con executor (actualiza progreso después de cada compresión)
+        current_file, current_errors, current_no_spanish = self._process_files_with_executor(files, total_files, current_file)
         
         # Guarda errores y archivos sin español de esta ejecución
         self._save_temporary_results(current_errors, current_no_spanish)
         
         # Actualiza progreso como completado
-        self._save_progress_state(total_files, total_files, PROCESSING_COMPLETED_MESSAGE, status='completed')
+        self._save_progress_state(current_file, current_file, PROCESSING_COMPLETED_MESSAGE, status='completed')
         
         # Log de resumen
         self.logger.info(f"RESUMEN: Procesados: {self.stats.files_processed}, "
@@ -1083,11 +1111,105 @@ class MediaJellyProcessor:
                         f"Omitidos: {self.stats.files_skipped}")
         
         return self.stats
+
+    def _process_single_future_result(self, future, file_path: Path, current_errors: list, current_no_spanish: list) -> None:
+        """Procesa el resultado de un futuro individual"""
+        try:
+            result = future.result()
+            self._update_stats_from_result(result, file_path, current_errors, current_no_spanish)
+
+        except Exception as e:
+            error_msg = f"Error procesando {file_path}: {str(e)}"
+            self.logger.error(error_msg)
+            current_errors.append(file_path.name)
+            self.processed_files[str(file_path)] = {'status': 'failed', 'timestamp': datetime.now().isoformat(), 'error': str(e)}
+
+    def _update_size_stats(self, result: dict) -> None:
+        """Actualiza estadísticas de tamaño"""
+        if 'original_size' in result and 'compressed_size' in result:
+            self.stats.total_original_size += result['original_size']
+            self.stats.total_compressed_size += result['compressed_size']
+
+    def _update_stats_from_result(self, result: dict, file_path: Path, current_errors: list, current_no_spanish: list) -> None:
+        """Actualiza estadísticas desde el resultado de procesamiento"""
+        # Incrementa contador de archivos procesados
+        self.stats.files_processed += 1
+        
+        # Actualiza contadores específicos según el resultado
+        if result.get('compressed', False):
+            self.stats.files_compressed += 1
+        if result.get('renamed', False):
+            self.stats.files_renamed += 1
+        if result.get('skipped', False):
+            self.stats.files_skipped += 1
+        
+        # Maneja errores
+        if result.get('error'):
+            current_errors.append(file_path.name)
+            self.processed_files[str(file_path)] = {
+                'status': 'failed', 
+                'timestamp': datetime.now().isoformat(), 
+                'error': result['error']
+            }
+        else:
+            self.processed_files[str(file_path)] = {
+                'status': 'success', 
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        # Maneja archivos sin español
+        if result.get('no_spanish', False):
+            current_no_spanish.append(file_path.name)
+        
+        # Actualiza estadísticas de tamaño
+        self._update_size_stats(result)
+
+    def _update_progress_after_processing(self, file_path: Path, processed_count: int, total_files: int, files_in_progress: list) -> None:
+        """Actualiza progreso después del procesamiento de un archivo"""
+        # Remueve el archivo de la lista de procesamiento
+        if file_path.name in files_in_progress:
+            files_in_progress.remove(file_path.name)
+
+        # Construye mensaje de archivos en procesamiento
+        current_file_name = self._build_progress_message(files_in_progress)
+
+        # Actualiza progreso inmediatamente después de cada compresión
+        self._save_progress_state(processed_count, total_files, current_file_name, status='processing')
+
+        # Log progreso
+        percentage = (processed_count / total_files) * 100
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Progreso: {processed_count}/{total_files} ({percentage:.1f}%) - Archivo procesado: {file_path.name}", flush=True)
+
+    def _build_progress_message(self, files_in_progress: list) -> str:
+        """Construye mensaje de archivos actualmente en procesamiento"""
+        if not files_in_progress:
+            return "Procesamiento completado"
+        
+        if len(files_in_progress) == 1:
+            return f"Procesando: {files_in_progress[0]}"
+        
+        # Muestra hasta 3 archivos
+        files_to_show = files_in_progress[:3]
+        message = f"Procesando {len(files_in_progress)} archivos: {', '.join(files_to_show)}"
+        
+        if len(files_in_progress) > 3:
+            message += f" y {len(files_in_progress) - 3} más"
+        
+        return message
+
     
     def run(self) -> ProcessingStats:
         """Ejecuta procesamiento completo"""
         try:
             self.logger.info("=== Iniciando MediaJelly Python ===")
+            
+            # Al iniciar el procesamiento, marca notified=False
+            progress_info = self.get_progress_info()
+            progress_info['notified'] = False
+            progress_file = self.tmp_dir / PROGRESS_FILE_NAME
+            with open(progress_file, 'w') as f:
+                json.dump(progress_info, f, indent=2)
+            self.logger.info("Estado de notificación reseteado (notified=False)")
             
             # Limpia archivos pendientes procesados antes de escanear
             self.cleanup_processed_files()
@@ -1114,6 +1236,9 @@ class MediaJellyProcessor:
             
         except Exception as e:
             self.logger.error(f"Error fatal en MediaJelly: {e}")
+        finally:
+            # Siempre libera el bloqueo
+            pass
             
         return self.stats
     
@@ -1245,9 +1370,30 @@ def main():
     """Función principal"""
     processor = MediaJellyProcessor()
     
+    # Registrar guardado de progreso al salir
+    atexit.register(lambda: processor._save_progress_state(
+        processor.stats.files_processed, 
+        processor.stats.files_found, 
+        "Terminado por atexit", 
+        status='interrupted'
+    ))
+    
     # Manejo de señales para terminación limpia
     def signal_handler(signum, frame):
-        processor.logger.info(f"Recibida señal {signum}, terminando...")
+        processor.logger.info(f"Recibida señal {signum}, guardando progreso y terminando...")
+        # Obtiene el progreso actual antes de guardar
+        current_progress = processor.get_progress_info()
+        current_file = current_progress.get('current_file', processor.stats.files_processed)
+        total_files = current_progress.get('total_files', processor.stats.files_found)
+        current_file_name = current_progress.get('current_file_name', f"Terminado por señal {signum}")
+        
+        # Guarda el progreso actual antes de terminar
+        processor._save_progress_state(
+            current_file, 
+            total_files, 
+            current_file_name, 
+            status='interrupted'
+        )
         sys.exit(0)
     
     signal.signal(signal.SIGTERM, signal_handler)

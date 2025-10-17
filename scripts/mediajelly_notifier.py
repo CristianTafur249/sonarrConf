@@ -295,6 +295,19 @@ class TelegramNotifier:
             message += f"{EmojiGenerator.compression()} Comprimidos: {files_compressed}\n"
             message += f"{EmojiGenerator.memo()} Renombrados: {files_renamed}\n"
             message += f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
+            
+            # Calcular promedio de espacio ahorrado
+            progress_stats = progress.get('stats', {})
+            total_original = progress_stats.get('total_original_size', 0)
+            total_compressed = progress_stats.get('total_compressed_size', 0)
+            compressed_files = progress_stats.get('files_compressed', 0)
+            
+            if compressed_files > 0 and total_original > total_compressed:
+                space_saved = total_original - total_compressed
+                avg_space_saved = space_saved / compressed_files
+                # Convertir a MB
+                avg_space_saved_mb = avg_space_saved / (1024 * 1024)
+                message += f"{EmojiGenerator.chart()} Promedio ahorrado: {avg_space_saved_mb:.1f} MB por archivo\n"
         
         if progress.get('status') == 'processing' and progress.get('percentage', 0) < 100:
             message += f"\n{EmojiGenerator.stats()} Progreso: {progress.get('percentage', 0):.1f}%\n"
@@ -354,6 +367,36 @@ class TelegramNotifier:
         
         return self.send_long_message(message)
     
+    def notify_start_processing(self, files_found: int, files_new: int) -> bool:
+        """Notificar inicio de procesamiento"""
+        # Obtiene información del progreso actual
+        progress = self._get_progress_info()
+        progress_stats = progress.get('stats', {})
+        
+        # Usa estadísticas del progress.json si están disponibles
+        if progress_stats:
+            files_found = progress_stats.get('files_found', files_found)
+            files_new = progress_stats.get('files_new', files_new)
+            files_processed = progress_stats.get('files_processed', 0)
+            files_compressed = progress_stats.get('files_compressed', 0)
+            files_renamed = progress_stats.get('files_renamed', 0)
+            files_skipped = progress_stats.get('files_skipped', 0)
+        
+        message = f"{EmojiGenerator.gear()} MediaJelly - Estado Anterior del Procesamiento\n\n"
+        message += f"{EmojiGenerator.info()} Estado actual:\n"
+        message += f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n"
+        message += f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n"
+        
+        if progress_stats:
+            message += f"{EmojiGenerator.gear()} Archivos procesados: {files_processed}\n"
+            message += f"{EmojiGenerator.compression()} Comprimidos: {files_compressed}\n"
+            message += f"{EmojiGenerator.memo()} Renombrados: {files_renamed}\n"
+            message += f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
+        
+        message += f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        return self.send_long_message(message)
+    
     def notify_no_pending_files(self, total_files: int, completed_files: int) -> bool:
         """Notificar cuando no hay archivos pendientes"""
         message = f"{EmojiGenerator.info()} MediaJelly - Escaneo Completado\n\n"
@@ -410,53 +453,100 @@ class TelegramNotifier:
 def main():
     """Función principal"""
     if len(sys.argv) < 2:
-        print("Uso: mediajelly_notifier.py {scan_result|no_pending|critical_error|test|reset_state} [argumentos...]")
+        print("Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state} [argumentos...]")
         sys.exit(1)
-    
+
     notifier = TelegramNotifier()
     command = sys.argv[1]
-    
-    if command == "scan_result" and len(sys.argv) >= 9:
-        status = sys.argv[2]
-        files_found = int(sys.argv[3])
-        files_new = int(sys.argv[4])
-        files_processed = int(sys.argv[5])
-        files_compressed = int(sys.argv[6])
-        files_renamed = int(sys.argv[7])
-        files_skipped = int(sys.argv[8])
-        
-        success = notifier.notify_scan_result(
-            status, files_found, files_new, files_processed,
-            files_compressed, files_renamed, files_skipped
-        )
-        
-    elif command == "no_pending" and len(sys.argv) >= 4:
-        total_files = int(sys.argv[2])
-        completed_files = int(sys.argv[3])
-        success = notifier.notify_no_pending_files(total_files, completed_files)
-        
-    elif command == "critical_error" and len(sys.argv) >= 3:
-        error_message = sys.argv[2]
-        log_file = sys.argv[3] if len(sys.argv) > 3 else None
-        success = notifier.notify_critical_error(error_message, log_file)
-        
-    elif command == "test":
-        success = notifier.send_test_message()
-        
-    elif command == "reset_state":
-        success = notifier.reset_state()
-        
-    elif command == "completed_cleanup" and len(sys.argv) >= 5:
-        files_checked = int(sys.argv[2])
-        files_removed = int(sys.argv[3])
-        files_kept = int(sys.argv[4])
-        success = notifier.notify_completed_cleanup(files_checked, files_removed, files_kept)
-        
+
+    # Diccionario de comandos con sus validaciones y ejecuciones
+    command_handlers = {
+        "start_processing": _handle_start_processing,
+        "scan_result": _handle_scan_result,
+        "no_pending": _handle_no_pending,
+        "critical_error": _handle_critical_error,
+        "test": _handle_test,
+        "reset_state": _handle_reset_state,
+        "completed_cleanup": _handle_completed_cleanup
+    }
+
+    if command in command_handlers:
+        success = command_handlers[command](notifier, sys.argv)
     else:
-        print("Comando no válido o argumentos insuficientes")
+        print("Comando no válido")
         sys.exit(1)
-    
+
     sys.exit(0 if success else 1)
+
+
+def _handle_start_processing(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando start_processing"""
+    if len(args) < 4:
+        print("Error: start_processing requiere 2 argumentos (files_found, files_new)")
+        return False
+    files_found = int(args[2])
+    files_new = int(args[3])
+    return notifier.notify_start_processing(files_found, files_new)
+
+
+def _handle_scan_result(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando scan_result"""
+    if len(args) < 9:
+        print("Error: scan_result requiere 7 argumentos")
+        return False
+    status = args[2]
+    files_found = int(args[3])
+    files_new = int(args[4])
+    files_processed = int(args[5])
+    files_compressed = int(args[6])
+    files_renamed = int(args[7])
+    files_skipped = int(args[8])
+
+    return notifier.notify_scan_result(
+        status, files_found, files_new, files_processed,
+        files_compressed, files_renamed, files_skipped
+    )
+
+
+def _handle_no_pending(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando no_pending"""
+    if len(args) < 4:
+        print("Error: no_pending requiere 2 argumentos (total_files, completed_files)")
+        return False
+    total_files = int(args[2])
+    completed_files = int(args[3])
+    return notifier.notify_no_pending_files(total_files, completed_files)
+
+
+def _handle_critical_error(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando critical_error"""
+    if len(args) < 3:
+        print("Error: critical_error requiere al menos 1 argumento (error_message)")
+        return False
+    error_message = args[2]
+    log_file = args[3] if len(args) > 3 else None
+    return notifier.notify_critical_error(error_message, log_file)
+
+
+def _handle_test(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando test"""
+    return notifier.send_test_message()
+
+
+def _handle_reset_state(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando reset_state"""
+    return notifier.reset_state()
+
+
+def _handle_completed_cleanup(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando completed_cleanup"""
+    if len(args) < 5:
+        print("Error: completed_cleanup requiere 3 argumentos")
+        return False
+    files_checked = int(args[2])
+    files_removed = int(args[3])
+    files_kept = int(args[4])
+    return notifier.notify_completed_cleanup(files_checked, files_removed, files_kept)
 
 if __name__ == "__main__":
     main()

@@ -6,6 +6,9 @@ MediaJelly Scanner Python - Escaneo optimizado de archivos multimedia
 import os
 import sys
 import time
+import json
+import fcntl
+import subprocess
 import asyncio
 from pathlib import Path
 from typing import Set, List
@@ -48,6 +51,39 @@ class MediaScanner:
             ]
         )
         self.logger = logging.getLogger(__name__)
+    
+    def is_processor_locked(self) -> bool:
+        """Verifica si el procesador está bloqueado por otra instancia"""
+        processor_lock_file = self.scripts_dir / "tmp" / "mediajelly_processor.lock"
+        
+        if not processor_lock_file.exists():
+            return False
+        
+        try:
+            with open(processor_lock_file, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    return False
+                
+                lines = content.split('\n')
+                if not lines or not lines[0].isdigit():
+                    return False
+                
+                pid = int(lines[0])
+                
+                # Verificar si el proceso existe
+                try:
+                    os.kill(pid, 0)  # No mata, solo verifica existencia
+                    self.logger.info(f"Procesador bloqueado por proceso activo (PID: {pid})")
+                    return True
+                except OSError:
+                    # Proceso no existe, lock huérfano
+                    self.logger.info(f"Lock huérfano del procesador detectado (PID {pid} no existe), ignorando")
+                    return False
+                    
+        except Exception as e:
+            self.logger.warning(f"Error verificando lock del procesador: {e}")
+            return False
     
     def load_completed_files(self) -> Set[str]:
         """Cargar archivos ya completados (rutas completas)"""
@@ -265,6 +301,9 @@ class MediaScanner:
         """Ejecutar escaneo completo"""
         start_time = time.time()
         
+        # Verifica si necesita enviar notificación de inicio
+        self._check_and_send_start_notification()
+        
         # Limpieza de duplicados del archivo pending antes de comenzar
         duplicates_removed = self.clean_pending_duplicates()
         if duplicates_removed > 0:
@@ -288,6 +327,49 @@ class MediaScanner:
         self.logger.info(f"=== Escaneo completado en {elapsed_time:.2f}s ===")
         
         return total_found, new_detected
+    
+    def _check_and_send_start_notification(self):
+        """Verifica si se debe enviar notificación de inicio"""
+        progress_file = self.scripts_dir / "tmp" / "progress.json"
+        
+        try:
+            if progress_file.exists():
+                with open(progress_file, 'r') as f:
+                    progress = json.load(f)
+                    
+                # Si no ha sido notificado, envía notificación
+                if not progress.get('notified', False):
+                    # Verifica si el procesador está bloqueado antes de enviar notificación
+                    if self.is_processor_locked():
+                        self.logger.info("Procesador bloqueado, omitiendo notificación de inicio")
+                        return
+                    
+                    self.logger.info("Enviando notificación de inicio...")
+                    files_found = progress.get('stats', {}).get('files_found', 0)
+                    files_new = progress.get('stats', {}).get('files_new', 0)
+                    
+                    # Llama al notifier para enviar la notificación
+                    cmd = [
+                        sys.executable,
+                        str(self.scripts_dir / "mediajelly_notifier.py"),
+                        "start_processing",
+                        str(files_found),
+                        str(files_new)
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                    if result.returncode == 0:
+                        self.logger.info("Notificación de inicio enviada correctamente")
+                        # Marca como notificado
+                        progress['notified'] = True
+                        with open(progress_file, 'w') as f:
+                            json.dump(progress, f, indent=2)
+                    else:
+                        self.logger.warning("Error enviando notificación de inicio")
+                else:
+                    self.logger.info("Ya se envió notificación de inicio previamente")
+        except Exception as e:
+            self.logger.warning(f"Error verificando notificación: {e}")
 
 def main():
     """Función principal"""
