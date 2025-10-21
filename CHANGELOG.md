@@ -23,6 +23,9 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Método `process_pending_subtitles()` para procesamiento nocturno secuencial
   - Notificación dedicada `send_night_subtitle_notification()` para resultados nocturnos
   - Detección automática de horario con `is_night_time()`
+  - **Corrección de notificaciones duplicadas**: detecta y evita notificaciones repetidas cuando no hay cambios
+  - **Nueva función `_reset_notification_state()`**: resetea `notified=false` cuando hay archivos nuevos
+  - **Gestión de estados consistente**: `status` cambia a 'processing' al inicio y 'completed' al final
 
 ### Rendimiento
 
