@@ -542,49 +542,64 @@ class MediaJellyCronRunner:
             # Verifica si es una notificación duplicada de completado sin procesamiento
             is_duplicate = False
             if notification_type == "success" and self._is_duplicate_success_notification():
-                self.logger.info("Notificación duplicada de completado sin procesamiento, actualizando timestamp...")
+                self.logger.info("Notificación duplicada de completado sin procesamiento, solo actualizando timestamp...")
                 is_duplicate = True
             
-            self.logger.info("Enviando notificación...")
-            
-            cmd = [
-                sys.executable, str(self.notifier_script),
-                "scan_result", notification_type,
-                str(self.stats['files_found']),
-                str(self.stats['files_new']),
-                str(self.stats['files_processed']),
-                str(self.stats['files_compressed']),
-                str(self.stats['files_renamed']),
-                str(self.stats['files_skipped']),
-                str(self.stats['subtitles_translated']),
-                str(self.stats['subtitles_errors'])
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            if result.returncode == 0:
-                self.logger.info("Notificación enviada correctamente")
+            if not is_duplicate:
+                self.logger.info("Enviando notificación...")
                 
-                # Marca como notificado en progress.json
-                self._mark_as_notified()
+                cmd = [
+                    sys.executable, str(self.notifier_script),
+                    "scan_result", notification_type,
+                    str(self.stats['files_found']),
+                    str(self.stats['files_new']),
+                    str(self.stats['files_processed']),
+                    str(self.stats['files_compressed']),
+                    str(self.stats['files_renamed']),
+                    str(self.stats['files_skipped']),
+                    str(self.stats['subtitles_translated']),
+                    str(self.stats['subtitles_errors'])
+                ]
                 
-                return True
-            else:
-                self.logger.error("Error al enviar notificación")
-                # Aún marca como notificado para evitar reenvíos
-                if not is_duplicate:
-                    self._mark_as_notified()
-                return False
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                
+                if result.returncode == 0:
+                    self.logger.info("Notificación enviada correctamente")
+                else:
+                    self.logger.error("Error al enviar notificación")
+                    return False
+            
+            # Marca como notificado en progress.json (siempre, incluso para duplicadas)
+            self._mark_as_notified()
+            return True
                 
         except Exception as e:
             self.logger.error(f"Error enviando notificación: {e}")
             return False
     
+    def _reset_notification_state(self):
+        """Resetea el estado de notificación cuando hay archivos nuevos para procesar"""
+        try:
+            progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
+            if progress_file.exists():
+                with open(progress_file, 'r') as f:
+                    progress_data = json.load(f)
+                
+                progress_data['notified'] = False
+                progress_data['status'] = 'processing'
+                
+                with open(progress_file, 'w') as f:
+                    json.dump(progress_data, f, indent=2)
+                
+                self.logger.info("Estado de notificación reseteado (notified=False) - hay archivos nuevos para procesar")
+        except Exception as e:
+            self.logger.warning(f"Error reseteando estado de notificación: {e}")
+
     def _mark_as_notified(self):
         """Marca el estado actual como notificado en progress.json"""
         try:
@@ -594,6 +609,7 @@ class MediaJellyCronRunner:
                     progress_data = json.load(f)
                 
                 progress_data['notified'] = True
+                progress_data['status'] = 'completed'
                 # Guarda la información de la última notificación
                 progress_data['last_notification'] = {
                     'type': 'success',
@@ -899,7 +915,15 @@ class MediaJellyCronRunner:
                     self.send_error_notification("Falló el escaneo automático")
                     return False
                 
-                # 2. Procesar archivos uno por uno (sin subtítulos, se agregan a pendientes)
+                # 2. Verificar si hay archivos pendientes y resetear estado si es necesario
+                first_pending = self.get_next_pending_file()
+                if first_pending:
+                    self._reset_notification_state()
+                    self.logger.info(f"Se encontraron archivos pendientes, comenzando procesamiento...")
+                else:
+                    self.logger.info("No se encontraron archivos nuevos para procesar")
+                
+                # 3. Procesar archivos uno por uno (sin subtítulos, se agregan a pendientes)
                 files_processed = 0
                 files_with_errors = 0
                 
@@ -923,6 +947,10 @@ class MediaJellyCronRunner:
                     notification_type = "success"
                     if files_with_errors > 0:
                         self.logger.info(f"Procesamiento completado con {files_with_errors} errores")
+                elif files_with_errors == 0:
+                    # No hay archivos para procesar, pero no hay errores -> éxito sin procesamiento
+                    notification_type = "success"
+                    self.logger.info("No se encontraron archivos nuevos para procesar")
                 else:
                     notification_type = "error"
                     self.logger.warning("No se procesó ningún archivo")
