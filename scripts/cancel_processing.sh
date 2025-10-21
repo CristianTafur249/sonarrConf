@@ -11,6 +11,7 @@ SCRIPTS=(
     "mediajelly_python.py"
     "mediajelly_scanner.py"
     "mediajelly_cron_runner.py"
+    "mediajelly_subtitle_translator.py"
     "mediajelly_emoji.py"
     "mediajelly_notifier.py"
     "clean_duplicates.py"
@@ -24,7 +25,9 @@ list_running_processes() {
     local count=0
     declare -a running_pids
     declare -a running_scripts
+    declare -a running_containers
 
+    # Buscar procesos en el sistema host
     for script in "${SCRIPTS[@]}"; do
         # Buscar procesos que contengan el nombre del script
         pids=$(pgrep -f "$script" 2>/dev/null)
@@ -33,15 +36,48 @@ list_running_processes() {
                 # Verificar que el proceso existe y es nuestro
                 if ps -p $pid > /dev/null 2>&1; then
                     cmd=$(ps -p $pid -o cmd= | head -1)
-                    echo "$((count+1)). $script (PID: $pid)"
+                    echo "$((count+1)). $script (PID: $pid) [HOST]"
                     echo "   Comando: $cmd"
                     running_scripts[$count]="$script"
                     running_pids[$count]="$pid"
+                    running_containers[$count]="host"
                     ((count++))
                 fi
             done
         fi
     done
+
+    # Buscar procesos en contenedores Docker
+    if command -v docker-compose &> /dev/null; then
+        # Verificar si el contenedor mediajelly-cron está corriendo
+        if docker-compose ps mediajelly-cron | grep -q "Up"; then
+            echo ""
+            echo "Procesos en contenedor Docker (mediajelly-cron):"
+            echo "-----------------------------------------------"
+
+            # Obtener lista de procesos del contenedor
+            container_processes=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep)
+
+            if [ ! -z "$container_processes" ]; then
+                echo "$container_processes" | while read -r line; do
+                    pid=$(echo "$line" | awk '{print $2}')
+                    cmd=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+                    script_name=$(echo "$cmd" | grep -oE "mediajelly_[^ ]*\.py" | head -1)
+
+                    if [ ! -z "$script_name" ]; then
+                        echo "$((count+1)). $script_name (PID: $pid) [DOCKER]"
+                        echo "   Comando: $cmd"
+                        running_scripts[$count]="$script_name"
+                        running_pids[$count]="$pid"
+                        running_containers[$count]="docker"
+                        ((count++))
+                    fi
+                done
+            else
+                echo "No hay procesos Python de MediaJelly en el contenedor."
+            fi
+        fi
+    fi
 
     if [ $count -eq 0 ]; then
         echo "No hay procesos de MediaJelly ejecutándose."
@@ -57,6 +93,7 @@ list_running_processes() {
     # Devolver arrays
     RUNNING_SCRIPTS=("${running_scripts[@]}")
     RUNNING_PIDS=("${running_pids[@]}")
+    RUNNING_CONTAINERS=("${running_containers[@]}")
     return 0
 }
 
@@ -64,44 +101,101 @@ list_running_processes() {
 cancel_process() {
     local pid=$1
     local script=$2
+    local container=$3
 
     echo "Cancelando $script (PID: $pid)..."
 
-    # Intentar terminación graceful
-    kill $pid 2>/dev/null
-    sleep 2
+    if [ "$container" = "docker" ]; then
+        # Cancelar proceso en contenedor Docker
+        docker-compose exec -T mediajelly-cron kill $pid 2>/dev/null
+        sleep 2
 
-    # Verificar si aún está corriendo
-    if ps -p $pid > /dev/null 2>&1; then
-        echo "Proceso no respondió, forzando terminación..."
-        kill -9 $pid 2>/dev/null
-    fi
+        # Verificar si aún está corriendo
+        if docker-compose exec -T mediajelly-cron ps -p $pid > /dev/null 2>&1; then
+            echo "Proceso no respondió, forzando terminación..."
+            docker-compose exec -T mediajelly-cron kill -9 $pid 2>/dev/null
+        fi
 
-    # Verificar que se detuvo
-    if ! ps -p $pid > /dev/null 2>&1; then
-        echo "✓ $script detenido exitosamente."
+        # Verificar que se detuvo
+        if ! docker-compose exec -T mediajelly-cron ps -p $pid > /dev/null 2>&1; then
+            echo "✓ $script detenido exitosamente en contenedor Docker."
+        else
+            echo "✗ Error: No se pudo detener $script en contenedor Docker."
+        fi
     else
-        echo "✗ Error: No se pudo detener $script."
+        # Cancelar proceso en host
+        # Intentar terminación graceful
+        kill $pid 2>/dev/null
+        sleep 2
+
+        # Verificar si aún está corriendo
+        if ps -p $pid > /dev/null 2>&1; then
+            echo "Proceso no respondió, forzando terminación..."
+            kill -9 $pid 2>/dev/null
+        fi
+
+        # Verificar que se detuvo
+        if ! ps -p $pid > /dev/null 2>&1; then
+            echo "✓ $script detenido exitosamente."
+        else
+            echo "✗ Error: No se pudo detener $script."
+        fi
     fi
 }
 
 # Función para cancelar todos los procesos
 cancel_all_processes() {
     echo "Cancelando TODOS los procesos..."
+
+    # Cancelar procesos en host
     for script in "${SCRIPTS[@]}"; do
-        echo "Deteniendo $script..."
+        echo "Deteniendo $script en host..."
         pkill -f "$script" 2>/dev/null
     done
 
+    # Cancelar procesos en contenedor Docker
+    if command -v docker-compose &> /dev/null && docker-compose ps mediajelly-cron | grep -q "Up"; then
+        echo "Deteniendo procesos en contenedor Docker..."
+        # Obtener PIDs de procesos Python en el contenedor
+        docker_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep | awk '{print $2}')
+        if [ ! -z "$docker_pids" ]; then
+            for pid in $docker_pids; do
+                docker-compose exec -T mediajelly-cron kill $pid 2>/dev/null
+            done
+        fi
+    fi
+
     sleep 2
 
-    # Verificar si quedan procesos
-    local remaining=$(pgrep -f "mediajelly_.*\.py\|clean_duplicates\.py\|normalize_paths\.py" 2>/dev/null)
-    if [ -z "$remaining" ]; then
+    # Verificar procesos restantes en host
+    local remaining_host=$(pgrep -f "mediajelly_.*\.py\|clean_duplicates\.py\|normalize_paths\.py" 2>/dev/null)
+
+    # Verificar procesos restantes en Docker
+    local remaining_docker=""
+    if command -v docker-compose &> /dev/null && docker-compose ps mediajelly-cron | grep -q "Up"; then
+        remaining_docker=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep)
+    fi
+
+    if [ -z "$remaining_host" ] && [ -z "$remaining_docker" ]; then
         echo "✓ Todos los procesos han sido detenidos."
     else
         echo "Procesos restantes detectados, forzando terminación..."
-        pkill -9 -f "mediajelly_.*\.py\|clean_duplicates\.py\|normalize_paths\.py" 2>/dev/null
+
+        # Forzar terminación en host
+        if [ ! -z "$remaining_host" ]; then
+            pkill -9 -f "mediajelly_.*\.py\|clean_duplicates\.py\|normalize_paths\.py" 2>/dev/null
+        fi
+
+        # Forzar terminación en Docker
+        if [ ! -z "$remaining_docker" ]; then
+            docker_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep | awk '{print $2}')
+            if [ ! -z "$docker_pids" ]; then
+                for pid in $docker_pids; do
+                    docker-compose exec -T mediajelly-cron kill -9 $pid 2>/dev/null
+                done
+            fi
+        fi
+
         echo "✓ Terminación forzada completada."
     fi
 }
@@ -110,6 +204,7 @@ cancel_all_processes() {
 main() {
     declare -a RUNNING_SCRIPTS
     declare -a RUNNING_PIDS
+    declare -a RUNNING_CONTAINERS
 
     if ! list_running_processes; then
         exit 0
@@ -130,7 +225,7 @@ main() {
             [1-9]|[1-9][0-9])
                 index=$((choice-1))
                 if [ $index -ge 0 ] && [ $index -lt ${#RUNNING_SCRIPTS[@]} ]; then
-                    cancel_process "${RUNNING_PIDS[$index]}" "${RUNNING_SCRIPTS[$index]}"
+                    cancel_process "${RUNNING_PIDS[$index]}" "${RUNNING_SCRIPTS[$index]}" "${RUNNING_CONTAINERS[$index]}"
                     echo ""
                     # Actualizar lista
                     if ! list_running_processes; then

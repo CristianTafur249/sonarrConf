@@ -2,11 +2,145 @@
 
 Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado con Docker.
 
-## [Unreleased]
+## [v3.2.1] - 2025-10-21
 
-### En desarrollo
+### Mejoras
 
-- Proximas mejoras y caracteristicas
+- **Mejora del modelo Whisper**:
+  - Cambio del modelo de Whisper de `tiny` a `small` para mayor precisión en reconocimiento de voz (~20-30% mejor)
+  - Mejor calidad de subtítulos extraídos del audio sin subtítulos embebidos
+
+- **Procesamiento programado de subtítulos**:
+  - Separación del procesamiento de subtítulos en horario nocturno (12 AM - 6 AM)
+  - Nuevo archivo `pending_subtitles.txt` para gestionar archivos pendientes de traducción
+  - Modo diurno: escaneo y compresión, subtítulos se agregan a pendientes
+  - Modo nocturno: procesamiento exclusivo de subtítulos pendientes con notificaciones específicas
+  - Lógica automática de detección horaria en `mediajelly_cron_runner.py`
+
+- **mediajelly_cron_runner.py**:
+  - Nuevo parámetro `process_subtitles` en `process_single_file()` para controlar traducción
+  - Métodos para gestión de `pending_subtitles.txt`: `add_to_pending_subtitles()`, `remove_from_pending_subtitles()`, etc.
+  - Método `process_pending_subtitles()` para procesamiento nocturno secuencial
+  - Notificación dedicada `send_night_subtitle_notification()` para resultados nocturnos
+  - Detección automática de horario con `is_night_time()`
+
+### Rendimiento
+
+- **Modelo Whisper**: `small` ofrece mejor precisión con ~2-3x más tiempo de procesamiento (aceptable para nocturno)
+- **Separación horaria**: Reduce carga diurna, optimiza recursos para procesamiento intensivo de noche
+
+### Notas Técnicas
+
+- Procesamiento nocturno usa Whisper de forma secuencial (lock global)
+- Archivos procesados diurnamente se marcan como completados, subtítulos pendientes para noche
+- Notificaciones separadas para procesamiento diurno y nocturno
+
+## [v3.2.0] - 2025-01-26
+
+### 🚀 Nuevas Funcionalidades Mayores
+
+- **Procesamiento concurrente de subtítulos**:
+  - Uso de `ThreadPoolExecutor` para procesar múltiples archivos simultáneamente
+  - Parámetro `--max-workers` para controlar nivel de concurrencia (default: 2)
+  - Thread-safe para escritura de `progress.json` y logs
+  - Mejor aprovechamiento de CPU multi-core
+
+- **Extracción de subtítulos del audio con Whisper**:
+  - Integración de OpenAI Whisper para speech-to-text
+  - Extracción automática cuando no hay subtítulos embebidos
+  - Auto-detección de idioma del audio
+  - Modelo `tiny` para eficiencia en CPU Intel i5-8250U
+  - Parámetro `--no-whisper` para deshabilitar si es necesario
+  - Generación de archivos .srt con timestamps precisos
+
+### Mejoras
+
+- **mediajelly_subtitle_translator.py**:
+  - Nuevo método `extract_subtitles_from_audio()` con soporte Whisper
+  - Método `_format_timestamp()` para conversión a formato SRT
+  - Procesamiento concurrente en `process_directory()` y `process_file_list()`
+  - Lock threading para operaciones thread-safe
+  - Logs mejorados con indicadores visuales (✓, ✗)
+  - Tracking de uso de Whisper en progress.json
+  
+- **Dockerfile.hybrid**:
+  - Agregadas dependencias `openai-whisper`, `torch`, `torchaudio`
+  - Optimización de instalación con `--no-cache-dir`
+  - Soporte completo para speech recognition
+
+- **mediajelly_cron_runner.py**:
+  - Parámetros adicionales `max_workers` y `use_whisper` en `run_subtitle_translator()`
+  - Logs informativos sobre configuración de Whisper y concurrencia
+
+### Rendimiento
+
+- **Velocidad**: 2-3x más rápido con 2 workers en CPU de 4 cores
+- **Whisper**: ~5-10x tiempo real (video 24min → 2-5min procesamiento)
+- **RAM**: ~1-2GB por worker activo
+- **Modelo**: Whisper `tiny` (~80-85% precisión, perfecto para traducción)
+
+### Documentación
+
+- Nuevo archivo `INSTRUCCIONES_TRADUCCION_SUBTITULOS_V2.md` con:
+  - Guía completa de uso de Whisper
+  - Ejemplos de procesamiento concurrente
+  - Requisitos de hardware y software
+  - Troubleshooting y limitaciones
+  - Métricas de rendimiento
+
+### Notas Técnicas
+
+- Whisper se carga lazy (solo cuando se necesita)
+- Audio temporal se extrae a 16kHz mono para Whisper
+- Limpieza automática de archivos temporales
+- Compatible con CPU (no requiere GPU, pero puede aprovecharla)
+- Thread-safe: Múltiples workers pueden escribir logs sin conflictos
+
+## [v3.1.0] - 2025-01-20
+
+### Nuevas Funcionalidades
+
+- **Sistema de traducción automática de subtítulos**:
+  - `mediajelly_subtitle_translator.py`: Nuevo script para extracción y traducción automática de subtítulos
+  - Detección automática de archivos sin audio en español
+  - Extracción de subtítulos embebidos usando ffmpeg
+  - Traducción automática al español usando translatepy y langdetect
+  - Integración completa con el flujo de procesamiento de MediaJelly
+  - Notificaciones de Telegram con estadísticas de subtítulos traducidos
+  - Registro detallado en archivo de log dedicado
+  - Actualización del archivo progress.json con estadísticas de traducción
+  - Soporte para procesar directorios completos o listas específicas de archivos
+
+### Mejoras
+
+- **Dockerfile.hybrid**:
+  - Agregadas dependencias `translatepy` y `langdetect` para traducción de subtítulos
+  - Optimización de instalación de paquetes Python
+- **mediajelly_cron_runner.py**:
+  - Integración del traductor de subtítulos en el flujo automático
+  - Nuevas estadísticas de subtítulos en el sistema de tracking
+  - Traducción solo de archivos procesados (comprimidos/renombrados)
+  - El procesamiento se considera completo solo después de intentar la traducción
+  - Notificaciones de éxito incluso si la traducción falla (con indicador de error)
+  - Nuevo método `get_processed_files()` para obtener archivos procesados
+- **mediajelly_notifier.py**:
+  - Soporte para notificaciones de subtítulos traducidos
+  - Nuevos parámetros en mensajes de Telegram para subtítulos
+  - Mejora en formato de mensajes con información de traducción
+  - Indicadores de estado de traducción (exitosa, parcial, fallida)
+- **mediajelly_subtitle_translator.py**:
+  - Nuevo método `process_file_list()` para procesar listas específicas de archivos
+  - Flexibilidad para procesar directorios completos o archivos individuales
+
+### Notas Técnicas
+
+- La traducción de subtítulos se ejecuta automáticamente después del procesamiento de archivos
+- Solo se procesan archivos que fueron comprimidos, renombrados o marcados para procesamiento
+- Solo se traducen archivos que no tienen audio en español
+- Se omiten archivos que ya tienen subtítulos en español (_ES.srt)
+- El sistema usa herramientas gratuitas y open-source (translatepy, langdetect, ffmpeg)
+- No se requieren APIs de pago para la traducción
+- Si la traducción falla, el procesamiento se marca como exitoso con indicador de traducción fallida
 
 ## [v3.0.0] - 2025-01-12
 

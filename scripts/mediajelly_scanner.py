@@ -187,7 +187,8 @@ class MediaScanner:
         return existing_pending_paths, existing_pending_normalized
     
     def _filter_new_files(self, all_found_files: list[Path], existing_pending_normalized: set[str]) -> list[str]:
-        """Filtra archivos que ya están en pendientes."""
+        """Filtra archivos que ya están en pendientes y asegura que sean solo formatos de video."""
+        VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.webm'}
         new_files_to_add = []
         for file_path in all_found_files:
             try:
@@ -195,7 +196,9 @@ class MediaScanner:
             except (OSError, RuntimeError):
                 normalized_path = str(file_path)
             
-            if normalized_path not in existing_pending_normalized:
+            # Solo agregar si es formato de video y no está en pendientes
+            if (file_path.suffix.lower() in VIDEO_EXTENSIONS and 
+                normalized_path not in existing_pending_normalized):
                 new_files_to_add.append(str(file_path))
                 existing_pending_normalized.add(normalized_path)
         return new_files_to_add

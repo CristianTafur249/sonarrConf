@@ -281,7 +281,8 @@ class TelegramNotifier:
     
     def _build_processing_message(self, status: str, files_found: int, files_new: int, 
                                 files_processed: int, files_compressed: int, 
-                                files_renamed: int, files_skipped: int, progress: dict) -> str:
+                                files_renamed: int, files_skipped: int, progress: dict,
+                                subtitles_translated: int = 0, subtitles_errors: int = 0) -> str:
         """Construye mensaje para procesamiento completado"""
         emoji = EmojiGenerator.success() if status == "success" else EmojiGenerator.error()
         title = "MediaJelly - Procesamiento Completado" if status == "success" else "MediaJelly - Error en Procesamiento"
@@ -309,6 +310,20 @@ class TelegramNotifier:
                 avg_space_saved_mb = avg_space_saved / (1024 * 1024)
                 message += f"{EmojiGenerator.chart()} Promedio ahorrado: {avg_space_saved_mb:.1f} MB por archivo\n"
         
+        # Agregar información de subtítulos traducidos
+        if subtitles_translated > 0 or subtitles_errors > 0:
+            message += f"\n{EmojiGenerator.earth()} Subtítulos traducidos: {subtitles_translated}\n"
+            if subtitles_errors > 0:
+                message += f"{EmojiGenerator.warning()} Errores en traducción: {subtitles_errors}\n"
+            
+            # Indicar estado de traducción
+            if subtitles_translated > 0 and subtitles_errors == 0:
+                message += f"{EmojiGenerator.success()} Traducción completada sin errores\n"
+            elif subtitles_translated > 0 and subtitles_errors > 0:
+                message += f"{EmojiGenerator.warning()} Traducción parcial (algunos errores)\n"
+            elif subtitles_errors > 0:
+                message += f"{EmojiGenerator.error()} Traducción falló\n"
+        
         if progress.get('status') == 'processing' and progress.get('percentage', 0) < 100:
             message += f"\n{EmojiGenerator.stats()} Progreso: {progress.get('percentage', 0):.1f}%\n"
             if progress.get('current_file_name'):
@@ -333,7 +348,8 @@ class TelegramNotifier:
     
     def notify_scan_result(self, status: str, files_found: int, files_new: int, 
                           files_processed: int, files_compressed: int, 
-                          files_renamed: int, files_skipped: int) -> bool:
+                          files_renamed: int, files_skipped: int,
+                          subtitles_translated: int = 0, subtitles_errors: int = 0) -> bool:
         """Notificar resultado del escaneo"""
         
         # Obtiene información del progreso
@@ -360,7 +376,8 @@ class TelegramNotifier:
         # Hubo procesamiento
         message = self._build_processing_message(status, files_found, files_new, 
                                                files_processed, files_compressed, 
-                                               files_renamed, files_skipped, progress)
+                                               files_renamed, files_skipped, progress,
+                                               subtitles_translated, subtitles_errors)
         
         # Agrega resúmenes de errores
         message = self._add_error_summaries(message)
@@ -394,6 +411,23 @@ class TelegramNotifier:
             message += f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
         
         message += f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        return self.send_long_message(message)
+    
+    def notify_night_subtitles(self, subtitles_processed: int, subtitles_errors: int) -> bool:
+        """Notificar resultado del procesamiento nocturno de subtítulos"""
+        message = f"{EmojiGenerator.moon()} MediaJelly - Procesamiento Nocturno de Subtítulos\n\n"
+        
+        if subtitles_processed > 0:
+            message += f"{EmojiGenerator.check()} Subtítulos procesados: {subtitles_processed}\n"
+        else:
+            message += f"{EmojiGenerator.info()} No se procesaron subtítulos nuevos\n"
+        
+        if subtitles_errors > 0:
+            message += f"{EmojiGenerator.warning()} Errores: {subtitles_errors}\n"
+        
+        message += f"\n{EmojiGenerator.time()} Hora: {datetime.now().strftime('%H:%M')} ({datetime.now().strftime('%Y-%m-%d')})"
+        message += f"\n{EmojiGenerator.robot()} Procesamiento automático nocturno completado"
         
         return self.send_long_message(message)
     
@@ -453,7 +487,7 @@ class TelegramNotifier:
 def main():
     """Función principal"""
     if len(sys.argv) < 2:
-        print("Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state} [argumentos...]")
+        print("Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state|completed_cleanup|night_subtitles} [argumentos...]")
         sys.exit(1)
 
     notifier = TelegramNotifier()
@@ -467,7 +501,8 @@ def main():
         "critical_error": _handle_critical_error,
         "test": _handle_test,
         "reset_state": _handle_reset_state,
-        "completed_cleanup": _handle_completed_cleanup
+        "completed_cleanup": _handle_completed_cleanup,
+        "night_subtitles": _handle_night_subtitles
     }
 
     if command in command_handlers:
@@ -547,6 +582,17 @@ def _handle_completed_cleanup(notifier: TelegramNotifier, args: list) -> bool:
     files_removed = int(args[3])
     files_kept = int(args[4])
     return notifier.notify_completed_cleanup(files_checked, files_removed, files_kept)
+
+
+def _handle_night_subtitles(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando night_subtitles"""
+    if len(args) < 4:
+        print("Error: night_subtitles requiere 2 argumentos")
+        return False
+    subtitles_processed = int(args[2])
+    subtitles_errors = int(args[3])
+    return notifier.notify_night_subtitles(subtitles_processed, subtitles_errors)
+
 
 if __name__ == "__main__":
     main()
