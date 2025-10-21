@@ -540,9 +540,10 @@ class MediaJellyCronRunner:
         """Envía notificación vía Telegram según el tipo especificado"""
         try:
             # Verifica si es una notificación duplicada de completado sin procesamiento
+            is_duplicate = False
             if notification_type == "success" and self._is_duplicate_success_notification():
-                self.logger.info("Notificación duplicada de completado sin procesamiento, omitiendo envío")
-                return True  # Retorna True para no afectar el flujo
+                self.logger.info("Notificación duplicada de completado sin procesamiento, actualizando timestamp...")
+                is_duplicate = True
             
             self.logger.info("Enviando notificación...")
             
@@ -575,6 +576,9 @@ class MediaJellyCronRunner:
                 return True
             else:
                 self.logger.error("Error al enviar notificación")
+                # Aún marca como notificado para evitar reenvíos
+                if not is_duplicate:
+                    self._mark_as_notified()
                 return False
                 
         except Exception as e:
@@ -606,8 +610,8 @@ class MediaJellyCronRunner:
         except Exception as e:
             self.logger.warning(f"Error marcando como notificado: {e}")
     
-    def _mark_as_notified_no_pending(self, processed_count: int):
-        """Marca el estado como notificado para no_pending en progress.json"""
+    def _mark_as_notified_night(self, subtitles_processed: int, subtitles_errors: int):
+        """Marca el estado como notificado para night_subtitles en progress.json"""
         try:
             progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
             if progress_file.exists():
@@ -615,19 +619,20 @@ class MediaJellyCronRunner:
                     progress_data = json.load(f)
                 
                 progress_data['notified'] = True
-                # Guarda la información de la última notificación no_pending
+                # Guarda la información de la última notificación night_subtitles
                 progress_data['last_notification'] = {
-                    'type': 'no_pending',
-                    'completed_count': processed_count,
+                    'type': 'night_subtitles',
+                    'subtitles_processed': subtitles_processed,
+                    'subtitles_errors': subtitles_errors,
                     'timestamp': datetime.now().isoformat()
                 }
                 
                 with open(progress_file, 'w') as f:
                     json.dump(progress_data, f, indent=2)
                 
-                self.logger.info("Estado marcado como notificado no_pending (notified=True)")
+                self.logger.info("Estado marcado como notificado night_subtitles (notified=True)")
         except Exception as e:
-            self.logger.warning(f"Error marcando como notificado no_pending: {e}")
+            self.logger.warning(f"Error marcando como notificado night_subtitles: {e}")
     
     def send_night_subtitle_notification(self, subtitles_processed: int, subtitles_errors: int) -> bool:
         """Envía notificación del procesamiento nocturno de subtítulos"""
@@ -650,6 +655,7 @@ class MediaJellyCronRunner:
             
             if result.returncode == 0:
                 self.logger.info("Notificación de procesamiento nocturno enviada correctamente")
+                self._mark_as_notified_night(subtitles_processed, subtitles_errors)
                 return True
             else:
                 self.logger.error("Error al enviar notificación de procesamiento nocturno")
@@ -874,8 +880,11 @@ class MediaJellyCronRunner:
                 # Procesar subtítulos pendientes
                 subtitles_processed, subtitles_errors = self.process_pending_subtitles()
                 
-                # Notificar procesamiento nocturno
-                self.send_night_subtitle_notification(subtitles_processed, subtitles_errors)
+                # Notificar procesamiento nocturno solo si se procesaron subtítulos
+                if subtitles_processed > 0 or subtitles_errors > 0:
+                    self.send_night_subtitle_notification(subtitles_processed, subtitles_errors)
+                else:
+                    self.logger.info("No hay subtítulos pendientes para procesar, omitiendo notificación nocturna")
                 
                 # Verifica y ejecuta limpieza si es necesario
                 self.check_and_cleanup_if_needed()

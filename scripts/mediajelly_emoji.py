@@ -148,3 +148,23 @@ class EmojiGenerator:
     @staticmethod
     def next_track():
         return "⏭️"
+
+    @staticmethod
+    def moon():
+        """Emoji para modo nocturno/procesamiento nocturno"""
+        return "🌙"
+
+    @staticmethod
+    def earth():
+        """Emoji para traducciones/idiomas"""
+        return "🌍"
+
+    @staticmethod
+    def check():
+        """Emoji para check/verificación"""
+        return EmojiGenerator.check_mark()
+
+    @staticmethod
+    def robot():
+        """Emoji para procesamiento automático"""
+        return "🤖"
