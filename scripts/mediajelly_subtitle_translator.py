@@ -303,10 +303,10 @@ class SubtitleTranslator:
             with whisper_lock:
                 self.logger.info("🔒 Adquiriendo lock global de Whisper...")
 
-                # Cargar modelo si no está cargado (usar small para mejor precisión)
+                # Cargar modelo si no está cargado (usar tiny para mejor rendimiento)
                 if self.whisper_model is None:
-                    self.logger.info("Cargando modelo Whisper (small)...")
-                    self.whisper_model = whisper.load_model("small")
+                    self.logger.info("Cargando modelo Whisper (tiny)...")
+                    self.whisper_model = whisper.load_model("tiny")
 
                 # Crear nombres de archivos temporales únicos
                 temp_prefix = f"{video_file.stem}_{video_file.stat().st_mtime_ns}"

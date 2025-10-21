@@ -7,7 +7,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 ### Mejoras
 
 - **Mejora del modelo Whisper**:
-  - Cambio del modelo de Whisper de `tiny` a `small` para mayor precisión en reconocimiento de voz (~20-30% mejor)
+  - Cambio del modelo de Whisper de `small` a `tiny` para mejor rendimiento en procesamiento masivo (~3-5x más rápido)
   - Mejor calidad de subtítulos extraídos del audio sin subtítulos embebidos
 
 - **Procesamiento programado de subtítulos**:
@@ -29,7 +29,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ### Rendimiento
 
-- **Modelo Whisper**: `small` ofrece mejor precisión con ~2-3x más tiempo de procesamiento (aceptable para nocturno)
+- **Modelo Whisper**: `tiny` ofrece mejor rendimiento con ~3-5x menos tiempo de procesamiento (ideal para series completas)
 - **Separación horaria**: Reduce carga diurna, optimiza recursos para procesamiento intensivo de noche
 
 ### Notas Técnicas
@@ -80,7 +80,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 - **Velocidad**: 2-3x más rápido con 2 workers en CPU de 4 cores
 - **Whisper**: ~5-10x tiempo real (video 24min → 2-5min procesamiento)
 - **RAM**: ~1-2GB por worker activo
-- **Modelo**: Whisper `tiny` (~80-85% precisión, perfecto para traducción)
+- **Modelo**: Whisper `tiny` (~80-85% precisión, perfecto para traducción masiva de series)
 
 ### Documentación
 
