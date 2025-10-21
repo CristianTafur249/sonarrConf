@@ -27,6 +27,11 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - **Nueva función `_reset_notification_state()`**: resetea `notified=false` cuando hay archivos nuevos
   - **Gestión de estados consistente**: `status` cambia a 'processing' al inicio y 'completed' al final
 
+- **mediajelly_subtitle_translator.py**:
+  - **Limpieza automática de extensiones de idioma**: archivos `.en.srt`, `.eng.srt`, etc. se convierten a `.es.srt` al traducir
+  - Eliminación de extensiones duplicadas (evita `.en.es.srt`, genera directamente `.es.srt`)
+  - Soporte para múltiples idiomas: `.fre`, `.ger`, `.ita`, `.por`, `.rus`, `.jpn`, `.kor`, `.chi`
+
 ### Rendimiento
 
 - **Modelo Whisper**: `tiny` ofrece mejor rendimiento con ~3-5x menos tiempo de procesamiento (ideal para series completas)

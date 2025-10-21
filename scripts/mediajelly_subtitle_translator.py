@@ -568,7 +568,15 @@ class SubtitleTranslator:
             
             # Solo guardar si se hicieron traducciones
             if translations_made > 0:
-                output_file = srt_file.parent / f"{srt_file.stem}.es.srt"
+                # Limpiar extensiones de idioma del nombre base antes de agregar .es
+                base_name = srt_file.stem
+                # Quitar extensiones de idioma comunes (.en, .eng, .es, .spa, etc.)
+                for lang_ext in ['.en', '.eng', '.es', '.spa', '.fre', '.ger', '.ita', '.por', '.rus', '.jpn', '.kor', '.chi']:
+                    if base_name.endswith(lang_ext):
+                        base_name = base_name[:-len(lang_ext)]
+                        break
+                
+                output_file = srt_file.parent / f"{base_name}.es.srt"
                 
                 with open(output_file, 'w', encoding='utf-8') as f:
                     f.writelines(translated_lines)
