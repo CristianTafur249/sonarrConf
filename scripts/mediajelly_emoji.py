@@ -165,6 +165,33 @@ class EmojiGenerator:
         return EmojiGenerator.check_mark()
 
     @staticmethod
-    def robot():
-        """Emoji para procesamiento automático"""
-        return "🤖"
+    def lock():
+        return "🔒"
+
+    @staticmethod
+    def unlock():
+        return "🔓"
+
+    @staticmethod
+    def signal():
+        return "📡"
+
+    @staticmethod
+    def audio():
+        """Emoji para audio"""
+        return "🔊"
+
+    @staticmethod
+    def extract():
+        """Emoji para extracción"""
+        return "📤"
+
+    @staticmethod
+    def translate():
+        """Emoji para traducción"""
+        return EmojiGenerator.earth()
+
+    @staticmethod
+    def refresh():
+        """Emoji para actualización/refresco"""
+        return "🔄"

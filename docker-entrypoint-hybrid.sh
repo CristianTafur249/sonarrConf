@@ -21,8 +21,13 @@ get_magnifying_glass() { echo "🔍"; }
 echo "$(get_rocket) Iniciando MediaJelly Hybrid Service..."
 echo "$(get_calendar) $(date '+%Y-%m-%d %H:%M:%S')"
 
-# Verificar que los directorios existen
+# Verificar que los directorios existen con permisos correctos
+echo "$(get_gear) Configurando directorios y permisos..."
 mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp
+chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp
+
+# Limpiar archivos de lock antiguos que puedan causar problemas
+rm -f /mediajelly/scripts/tmp/*.lock
 
 # Detectar modo de operación
 MODE=${MEDIAJELLY_MODE:-python}

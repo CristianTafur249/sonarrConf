@@ -2,25 +2,57 @@
 
 Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado con Docker.
 
-## [v3.2.1] - 2025-10-21
+## [v3.2.3] - 2025-01-27
+
+### Características
+
+- **Doble pasada automática de traducción**:
+  - Eliminación del sistema de verificación condicional de palabras en inglés
+  - Implementación de doble pasada automática: el traductor procesa todo el contenido dos veces consecutivas
+  - Simplificación del código eliminando listas hardcodeadas y funciones de verificación complejas
+  - Mejor calidad de traducción garantizada mediante procesamiento redundante automático
+
+- **Correcciones de linting**:
+  - Arreglados errores de sintaxis y variables no utilizadas
+  - Mejor legibilidad del código y reducción de complejidad cognitiva
+
+## [v3.2.2] - 2025-10-21
 
 ### Mejoras
 
-- **Mejora del modelo Whisper**:
-  - Cambio del modelo de Whisper de `small` a `tiny` para mejor rendimiento en procesamiento masivo (~3-5x más rápido)
-  - Mejor calidad de subtítulos extraídos del audio sin subtítulos embebidos
+- **Soporte multiidioma para subtítulos embebidos**:
+  - Ahora acepta subtítulos embebidos en cualquier idioma soportado (ES, EN, FR, DE, IT, PT, RU, JA, KO, ZH)
+  - Detección automática de idioma de subtítulos embebidos antes de extraerlos
+  - Mejor parsing de subtítulos con formato HTML para traducciones precisas
+  - Reconstrucción correcta del formato HTML después de la traducción
 
-- **Procesamiento programado de subtítulos**:
-  - Separación del procesamiento de subtítulos en horario nocturno (12 AM - 6 AM)
-  - Nuevo archivo `pending_subtitles.txt` para gestionar archivos pendientes de traducción
-  - Modo diurno: escaneo y compresión, subtítulos se agregan a pendientes
-  - Modo nocturno: procesamiento exclusivo de subtítulos pendientes con notificaciones específicas
-  - Lógica automática de detección horaria en `mediajelly_cron_runner.py`
+- **Mejoras en calidad de traducción**:
+  - Extracción de texto puro de etiquetas HTML antes de traducir
+  - Reconstrucción del formato visual después de la traducción
+  - Eliminación de traducciones mixtas (francés + español) en subtítulos embebidos
+  - Mejor manejo de subtítulos con formato complejo
 
-- **mediajelly_cron_runner.py**:
-  - Nuevo parámetro `process_subtitles` en `process_single_file()` para controlar traducción
-  - Métodos para gestión de `pending_subtitles.txt`: `add_to_pending_subtitles()`, `remove_from_pending_subtitles()`, etc.
-  - Método `process_pending_subtitles()` para procesamiento nocturno secuencial
+- **Control horario mejorado**:
+  - **Detención automática a las 6:00 AM**: El procesamiento nocturno de subtítulos se detiene automáticamente cuando llega la hora límite (6:00 AM)
+  - Verificación de hora en tiempo real durante el procesamiento
+  - Optimización de recursos evitando procesamiento durante horas pico
+
+- **Re-traducción de subtítulos existentes**:
+  - Nueva opción `--retranslate` para forzar la re-traducción de archivos .es.srt ya existentes
+  - Corrección de traducciones parciales en subtítulos embebidos complejos
+  - Traducción completa de expresiones compuestas como "[Gasps, groans]" → "[Jadeos, gemidos]"
+
+- **Optimizaciones de rendimiento**:
+  - Procesamiento más rápido para subtítulos embebidos (6 minutos vs 7 minutos)
+  - Reducción de líneas procesadas innecesarias
+  - Mejor detección de subtítulos útiles vs subtítulos que requieren Whisper
+  - **Simplificación de salida**: Solo se guarda el archivo final en español (.es.srt), eliminando archivos intermedios de debugging
+
+### Correcciones
+
+- **Permisos de archivos**: Corregido error de permisos en `pending-compression.txt` que impedía escribir archivos de pendientes
+- **Método faltante**: Agregado método `send_error_notification()` en `MediaJellyCronRunner` para notificaciones de error
+- **Manejo de errores**: Mejorado el manejo de excepciones en el proceso de escaneo
   - Notificación dedicada `send_night_subtitle_notification()` para resultados nocturnos
   - Detección automática de horario con `is_night_time()`
   - **Corrección de notificaciones duplicadas**: detecta y evita notificaciones repetidas cuando no hay cambios
@@ -34,7 +66,11 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ### Rendimiento
 
-- **Modelo Whisper**: `tiny` ofrece mejor rendimiento con ~3-5x menos tiempo de procesamiento (ideal para series completas)
+- **Mejora del modelo Whisper**:
+  - Cambio del modelo de Whisper de `small` a `tiny` para mejor rendimiento en procesamiento masivo (~3-5x más rápido)
+  - **Revertido a `small`** para mejor precisión en pruebas de calidad
+  - ~~Nueva funcionalidad de debugging: guarda archivos `.en.srt` (Whisper) y `.es.srt` (traducidos) para comparación~~
+  - Mejor calidad de subtítulos extraídos del audio sin subtítulos embebidos
 - **Separación horaria**: Reduce carga diurna, optimiza recursos para procesamiento intensivo de noche
 
 ### Notas Técnicas
@@ -61,7 +97,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Parámetro `--no-whisper` para deshabilitar si es necesario
   - Generación de archivos .srt con timestamps precisos
 
-### Mejoras
+### Mejoras en Procesamiento Concurrente
 
 - **mediajelly_subtitle_translator.py**:
   - Nuevo método `extract_subtitles_from_audio()` con soporte Whisper
@@ -80,7 +116,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Parámetros adicionales `max_workers` y `use_whisper` en `run_subtitle_translator()`
   - Logs informativos sobre configuración de Whisper y concurrencia
 
-### Rendimiento
+### Rendimiento en v3.2.0
 
 - **Velocidad**: 2-3x más rápido con 2 workers en CPU de 4 cores
 - **Whisper**: ~5-10x tiempo real (video 24min → 2-5min procesamiento)
@@ -96,7 +132,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Troubleshooting y limitaciones
   - Métricas de rendimiento
 
-### Notas Técnicas
+### Notas Técnicas en v3.2.0
 
 - Whisper se carga lazy (solo cuando se necesita)
 - Audio temporal se extrae a 16kHz mono para Whisper
@@ -106,7 +142,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ## [v3.1.0] - 2025-01-20
 
-### Nuevas Funcionalidades
+### Nuevas Funcionalidades en v3.1.0
 
 - **Sistema de traducción automática de subtítulos**:
   - `mediajelly_subtitle_translator.py`: Nuevo script para extracción y traducción automática de subtítulos
@@ -119,7 +155,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Actualización del archivo progress.json con estadísticas de traducción
   - Soporte para procesar directorios completos o listas específicas de archivos
 
-### Mejoras
+### Mejoras en Traducción de Subtítulos
 
 - **Dockerfile.hybrid**:
   - Agregadas dependencias `translatepy` y `langdetect` para traducción de subtítulos
@@ -140,7 +176,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Nuevo método `process_file_list()` para procesar listas específicas de archivos
   - Flexibilidad para procesar directorios completos o archivos individuales
 
-### Notas Técnicas
+### Notas Técnicas en v3.1.0
 
 - La traducción de subtítulos se ejecuta automáticamente después del procesamiento de archivos
 - Solo se procesan archivos que fueron comprimidos, renombrados o marcados para procesamiento
@@ -170,7 +206,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 - **.dockerignore**: Optimizacion de construccion de imagenes Docker
 - **Archivo .env**: Variables de entorno para configuracion
 
-### Mejoras
+### Mejoras en Migración a Python
 
 - **docker-compose.yaml**: Actualizado con configuracion de Transmission
 - **.gitignore**: Patrones de exclusion mas especificos y completos

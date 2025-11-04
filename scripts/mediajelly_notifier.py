@@ -28,6 +28,7 @@ class TelegramNotifier:
         self.scripts_dir = self.base_dir / "scripts"
         self.config_file = self.base_dir / "config" / "telegram.conf"
         self.state_file = self.scripts_dir / "tmp" / "last_notification_state"
+        self.queue_file = self.scripts_dir / "tmp" / "notification_queue.json"
         
         # Crea directorio tmp
         (self.scripts_dir / "tmp").mkdir(parents=True, exist_ok=True)
@@ -60,8 +61,66 @@ class TelegramNotifier:
                 
         return config
     
-    def send_telegram_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
-        """Enviar mensaje a Telegram"""
+    def _load_queue(self) -> List[Dict]:
+        """Cargar cola de mensajes pendientes"""
+        if not self.queue_file.exists():
+            return []
+        try:
+            with open(self.queue_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Error cargando cola de notificaciones: {e}")
+            return []
+    
+    def _save_queue(self, queue: List[Dict]):
+        """Guardar cola de mensajes pendientes"""
+        try:
+            with open(self.queue_file, 'w') as f:
+                json.dump(queue, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Error guardando cola de notificaciones: {e}")
+    
+    def _add_to_queue(self, message: str, parse_mode: Optional[str] = None):
+        """Agregar mensaje a la cola"""
+        queue = self._load_queue()
+        queue.append({
+            'message': message,
+            'parse_mode': parse_mode,
+            'timestamp': datetime.now().isoformat(),
+            'attempts': 0
+        })
+        self._save_queue(queue)
+        self.logger.info(f"Mensaje agregado a la cola (total: {len(queue)})")
+    
+    def _process_queue(self):
+        """Procesar cola de mensajes pendientes"""
+        queue = self._load_queue()
+        if not queue:
+            return
+        
+        processed = []
+        for item in queue:
+            if self._send_message_immediate(item['message'], item['parse_mode']):
+                processed.append(item)
+                self.logger.info("Mensaje pendiente enviado exitosamente")
+            else:
+                item['attempts'] += 1
+                # Si ha fallado más de 5 veces, descartar
+                if item['attempts'] >= 5:
+                    self.logger.warning(f"Mensaje descartado después de {item['attempts']} intentos")
+                    processed.append(item)
+                else:
+                    self.logger.warning(f"Mensaje pendiente falló (intento {item['attempts']})")
+        
+        # Remover mensajes procesados
+        remaining = [item for item in queue if item not in processed]
+        self._save_queue(remaining)
+        
+        if remaining:
+            self.logger.info(f"Quedan {len(remaining)} mensajes en cola")
+    
+    def _send_message_immediate(self, message: str, parse_mode: Optional[str] = None) -> bool:
+        """Enviar mensaje inmediatamente sin cola"""
         if 'TELEGRAM_BOT_TOKEN' not in self.config or 'TELEGRAM_CHAT_ID' not in self.config:
             self.logger.error("Credenciales de Telegram no configuradas")
             return False
@@ -90,6 +149,19 @@ class TelegramNotifier:
         except requests.RequestException as e:
             self.logger.error(f"Error enviando mensaje a Telegram: {e}")
             return False
+    
+    def send_telegram_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
+        """Enviar mensaje a Telegram con cola de respaldo"""
+        # Primero procesar mensajes pendientes
+        self._process_queue()
+        
+        # Intentar enviar el mensaje actual
+        if self._send_message_immediate(message, parse_mode):
+            return True
+        
+        # Si falla, agregar a la cola
+        self._add_to_queue(message, parse_mode)
+        return False
     
     def send_long_message(self, message: str) -> bool:
         """Enviar mensaje largo dividiéndolo en partes si es necesario"""
@@ -132,9 +204,49 @@ class TelegramNotifier:
         try:
             if progress_file.exists():
                 with open(progress_file, 'r') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    
+                    # Si existe la sección processing, devolver esa información
+                    if 'processing' in data:
+                        processing_data = data['processing'].copy()
+                        # Asegura que tenga el campo status
+                        if 'status' not in processing_data:
+                            processing_data['status'] = 'unknown'
+                        return processing_data
+                    else:
+                        # Fallback para compatibilidad con estructura antigua
+                        if 'status' not in data:
+                            data['status'] = 'unknown'
+                        return data
         except Exception as e:
             self.logger.warning(f"Error leyendo progress.json: {e}")
+        
+        return {
+            'current_file': 0,
+            'total_files': 0,
+            'current_file_name': 'N/A',
+            'percentage': 0,
+            'status': 'unknown',
+            'stats': {}
+        }
+    
+    def _get_subtitle_progress_info(self) -> Dict:
+        """Obtener información del progreso de subtítulos desde progress.json"""
+        progress_file = self.scripts_dir / "tmp" / "progress.json"
+        try:
+            if progress_file.exists():
+                with open(progress_file, 'r') as f:
+                    data = json.load(f)
+                    
+                    # Si existe la sección subtitle_translation, devolver esa información
+                    if 'subtitle_translation' in data:
+                        subtitle_data = data['subtitle_translation'].copy()
+                        # Asegura que tenga el campo status
+                        if 'status' not in subtitle_data:
+                            subtitle_data['status'] = 'unknown'
+                        return subtitle_data
+        except Exception as e:
+            self.logger.warning(f"Error leyendo progress.json para subtítulos: {e}")
         
         return {
             'current_file': 0,
@@ -284,53 +396,83 @@ class TelegramNotifier:
                                 files_renamed: int, files_skipped: int, progress: dict,
                                 subtitles_translated: int = 0, subtitles_errors: int = 0) -> str:
         """Construye mensaje para procesamiento completado"""
+        message = self._build_message_header(status)
+        message += self._build_file_info_section(files_found, files_new)
+        message += self._build_processing_stats_section(files_processed, files_compressed, 
+                                                       files_renamed, files_skipped, progress)
+        message += self._build_subtitle_info_section(subtitles_translated, subtitles_errors)
+        message += self._build_progress_info_section(progress)
+        message += self._build_timestamp_section()
+        return message
+    
+    def _build_message_header(self, status: str) -> str:
+        """Construye el encabezado del mensaje"""
         emoji = EmojiGenerator.success() if status == "success" else EmojiGenerator.error()
         title = "MediaJelly - Procesamiento Completado" if status == "success" else "MediaJelly - Error en Procesamiento"
+        return f"{emoji} {title}\n\n"
+    
+    def _build_file_info_section(self, files_found: int, files_new: int) -> str:
+        """Construye la sección de información básica de archivos"""
+        return f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n" \
+               f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n"
+    
+    def _build_processing_stats_section(self, files_processed: int, files_compressed: int, 
+                                      files_renamed: int, files_skipped: int, progress: dict) -> str:
+        """Construye la sección de estadísticas de procesamiento"""
+        if not (files_processed > 0 or files_compressed > 0 or files_renamed > 0 or files_skipped > 0):
+            return ""
         
-        message = f"{emoji} {title}\n\n"
-        message += f"{EmojiGenerator.folder()} Archivos encontrados: {files_found}\n"
-        message += f"{EmojiGenerator.new()} Archivos nuevos: {files_new}\n"
+        message = f"{EmojiGenerator.gear()} Archivos procesados: {files_processed}\n" \
+                 f"{EmojiGenerator.compression()} Comprimidos: {files_compressed}\n" \
+                 f"{EmojiGenerator.memo()} Renombrados: {files_renamed}\n" \
+                 f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
         
-        if files_processed > 0 or files_compressed > 0 or files_renamed > 0 or files_skipped > 0:
-            message += f"{EmojiGenerator.gear()} Archivos procesados: {files_processed}\n"
-            message += f"{EmojiGenerator.compression()} Comprimidos: {files_compressed}\n"
-            message += f"{EmojiGenerator.memo()} Renombrados: {files_renamed}\n"
-            message += f"{EmojiGenerator.next_track()} Omitidos: {files_skipped}\n"
-            
-            # Calcular promedio de espacio ahorrado
-            progress_stats = progress.get('stats', {})
-            total_original = progress_stats.get('total_original_size', 0)
-            total_compressed = progress_stats.get('total_compressed_size', 0)
-            compressed_files = progress_stats.get('files_compressed', 0)
-            
-            if compressed_files > 0 and total_original > total_compressed:
-                space_saved = total_original - total_compressed
-                avg_space_saved = space_saved / compressed_files
-                # Convertir a MB
-                avg_space_saved_mb = avg_space_saved / (1024 * 1024)
-                message += f"{EmojiGenerator.chart()} Promedio ahorrado: {avg_space_saved_mb:.1f} MB por archivo\n"
+        # Calcular promedio de espacio ahorrado
+        progress_stats = progress.get('stats', {})
+        total_original = progress_stats.get('total_original_size', 0)
+        total_compressed = progress_stats.get('total_compressed_size', 0)
+        compressed_files = progress_stats.get('files_compressed', 0)
         
-        # Agregar información de subtítulos traducidos
-        if subtitles_translated > 0 or subtitles_errors > 0:
-            message += f"\n{EmojiGenerator.earth()} Subtítulos traducidos: {subtitles_translated}\n"
-            if subtitles_errors > 0:
-                message += f"{EmojiGenerator.warning()} Errores en traducción: {subtitles_errors}\n"
-            
-            # Indicar estado de traducción
-            if subtitles_translated > 0 and subtitles_errors == 0:
-                message += f"{EmojiGenerator.success()} Traducción completada sin errores\n"
-            elif subtitles_translated > 0 and subtitles_errors > 0:
-                message += f"{EmojiGenerator.warning()} Traducción parcial (algunos errores)\n"
-            elif subtitles_errors > 0:
-                message += f"{EmojiGenerator.error()} Traducción falló\n"
+        if compressed_files > 0 and total_original > total_compressed:
+            space_saved = total_original - total_compressed
+            avg_space_saved = space_saved / compressed_files
+            avg_space_saved_mb = avg_space_saved / (1024 * 1024)
+            message += f"{EmojiGenerator.chart()} Promedio ahorrado: {avg_space_saved_mb:.1f} MB por archivo\n"
         
-        if progress.get('status') == 'processing' and progress.get('percentage', 0) < 100:
-            message += f"\n{EmojiGenerator.stats()} Progreso: {progress.get('percentage', 0):.1f}%\n"
-            if progress.get('current_file_name'):
-                message += f"{EmojiGenerator.gear()} Procesando: {progress.get('current_file_name')}\n"
-        
-        message += f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         return message
+    
+    def _build_subtitle_info_section(self, subtitles_translated: int, subtitles_errors: int) -> str:
+        """Construye la sección de información de subtítulos"""
+        if subtitles_translated == 0 and subtitles_errors == 0:
+            return ""
+        
+        message = f"\n{EmojiGenerator.earth()} Subtítulos traducidos: {subtitles_translated}\n"
+        if subtitles_errors > 0:
+            message += f"{EmojiGenerator.warning()} Errores en traducción: {subtitles_errors}\n"
+        
+        # Indicar estado de traducción
+        if subtitles_translated > 0 and subtitles_errors == 0:
+            message += f"{EmojiGenerator.success()} Traducción completada sin errores\n"
+        elif subtitles_translated > 0 and subtitles_errors > 0:
+            message += f"{EmojiGenerator.warning()} Traducción parcial (algunos errores)\n"
+        elif subtitles_errors > 0:
+            message += f"{EmojiGenerator.error()} Traducción falló\n"
+        
+        return message
+    
+    def _build_progress_info_section(self, progress: dict) -> str:
+        """Construye la sección de información de progreso"""
+        if progress.get('status') != 'processing' or progress.get('percentage', 0) >= 100:
+            return ""
+        
+        message = f"\n{EmojiGenerator.stats()} Progreso: {progress.get('percentage', 0):.1f}%\n"
+        if progress.get('current_file_name'):
+            message += f"{EmojiGenerator.gear()} Procesando: {progress.get('current_file_name')}\n"
+        return message
+    
+    def _build_timestamp_section(self) -> str:
+        """Construye la sección de timestamp"""
+        return f"\n{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     
     def _add_error_summaries(self, message: str) -> str:
         """Agrega resúmenes de errores y archivos sin español al mensaje"""
@@ -414,22 +556,68 @@ class TelegramNotifier:
         
         return self.send_long_message(message)
     
-    def notify_night_subtitles(self, subtitles_processed: int, subtitles_errors: int) -> bool:
+    def notify_night_subtitles(self, translated: int, skipped: int, errors: int) -> bool:
         """Notificar resultado del procesamiento nocturno de subtítulos"""
+        total_processed = translated + skipped
+        
         message = f"{EmojiGenerator.moon()} MediaJelly - Procesamiento Nocturno de Subtítulos\n\n"
         
-        if subtitles_processed > 0:
-            message += f"{EmojiGenerator.check()} Subtítulos procesados: {subtitles_processed}\n"
+        if total_processed > 0:
+            message += f"{EmojiGenerator.folder()} Archivos procesados: {total_processed}\n"
+            if translated > 0:
+                message += f"{EmojiGenerator.translate()} Traducidos: {translated}\n"
+            if skipped > 0:
+                message += f"{EmojiGenerator.next_track()} Omitidos: {skipped}\n"
         else:
             message += f"{EmojiGenerator.info()} No se procesaron subtítulos nuevos\n"
         
-        if subtitles_errors > 0:
-            message += f"{EmojiGenerator.warning()} Errores: {subtitles_errors}\n"
+        if errors > 0:
+            message += f"{EmojiGenerator.warning()} Errores: {errors}\n"
         
         message += f"\n{EmojiGenerator.time()} Hora: {datetime.now().strftime('%H:%M')} ({datetime.now().strftime('%Y-%m-%d')})"
-        message += f"\n{EmojiGenerator.robot()} Procesamiento automático nocturno completado"
+        message += f"\n{EmojiGenerator.gear()} Procesamiento automático nocturno completado"
         
         return self.send_long_message(message)
+    
+    def notify_subtitle_translation(self, stats: dict) -> bool:
+        """Notificar resultado de traducción de subtítulos"""
+        message = f"{EmojiGenerator.memo()} MediaJelly - Traducción de Subtítulos\n\n"
+        
+        message += f"{EmojiGenerator.folder()} Archivos analizados: {stats['total_files']}\n"
+        
+        if stats['with_spanish_audio'] > 0:
+            message += f"{EmojiGenerator.audio()} Con audio español: {stats['with_spanish_audio']}\n"
+        
+        if stats['with_spanish_subs'] > 0:
+            message += f"{EmojiGenerator.check()} Ya tenían subtítulos español: {stats['with_spanish_subs']}\n"
+        
+        if stats['extracted'] > 0:
+            message += f"{EmojiGenerator.extract()} Subtítulos extraídos: {stats['extracted']}\n"
+        
+        if stats['translated'] > 0:
+            message += f"{EmojiGenerator.translate()} Subtítulos traducidos: {stats['translated']}\n"
+        
+        if stats['errors'] > 0:
+            message += f"{EmojiGenerator.warning()} Errores: {stats['errors']}\n"
+        
+        # Información adicional sobre subtítulos existentes procesados
+        if 'subtitle_check' in stats:
+            sub_check = stats['subtitle_check']
+            if sub_check['translated_subtitles'] > 0:
+                message += f"{EmojiGenerator.refresh()} Subtítulos existentes traducidos: {sub_check['translated_subtitles']}\n"
+        
+        message += f"\n{EmojiGenerator.time()} Completado: {datetime.now().strftime('%H:%M')} ({datetime.now().strftime('%Y-%m-%d')})"
+        
+        # Enviar notificación si se procesaron archivos o hubo actividad de traducción
+        has_processed_files = stats.get('total_files', 0) > 0
+        has_translation_activity = (stats.get('extracted', 0) > 0 or stats.get('translated', 0) > 0 or 
+                                   (stats.get('subtitle_check', {}).get('translated_subtitles', 0) > 0))
+        
+        if has_processed_files or has_translation_activity:
+            return self.send_long_message(message)
+        else:
+            self.logger.info("No se enviaron notificaciones de subtítulos - no hay archivos procesados ni actividad")
+            return True
     
     def notify_no_pending_files(self, total_files: int, completed_files: int) -> bool:
         """Notificar cuando no hay archivos pendientes"""
@@ -450,7 +638,7 @@ class TelegramNotifier:
         message += f"{EmojiGenerator.time()} Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         
         if log_file and Path(log_file).exists():
-            message += "\n\n📄 Últimas líneas del log:\n"
+            message += f"\n\n{EmojiGenerator.scroll()} Últimas líneas del log:\n"
             with open(log_file, 'r') as f:
                 lines = f.readlines()
                 last_lines = lines[-3:] if len(lines) >= 3 else lines
@@ -467,12 +655,11 @@ class TelegramNotifier:
         
         return self.send_long_message(message)
     
-    def reset_state(self) -> bool:
-        """Resetear estado de notificaciones"""
-        if self.state_file.exists():
-            self.state_file.unlink()
-        self.logger.info("Estado de notificaciones reseteado")
-        return True
+    def process_pending_notifications(self) -> bool:
+        """Procesar notificaciones pendientes manualmente"""
+        self._process_queue()
+        queue = self._load_queue()
+        return len(queue) == 0
     
     def notify_completed_cleanup(self, files_checked: int, files_removed: int, files_kept: int) -> bool:
         """Notificar limpieza del archivo completed.txt"""
@@ -487,7 +674,7 @@ class TelegramNotifier:
 def main():
     """Función principal"""
     if len(sys.argv) < 2:
-        print("Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state|completed_cleanup|night_subtitles} [argumentos...]")
+        print("Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state|completed_cleanup|night_subtitles|subtitle_translation|process_queue} [argumentos...]")
         sys.exit(1)
 
     notifier = TelegramNotifier()
@@ -502,7 +689,9 @@ def main():
         "test": _handle_test,
         "reset_state": _handle_reset_state,
         "completed_cleanup": _handle_completed_cleanup,
-        "night_subtitles": _handle_night_subtitles
+        "night_subtitles": _handle_night_subtitles,
+        "subtitle_translation": _handle_subtitle_translation,
+        "process_queue": _handle_process_queue
     }
 
     if command in command_handlers:
@@ -586,12 +775,47 @@ def _handle_completed_cleanup(notifier: TelegramNotifier, args: list) -> bool:
 
 def _handle_night_subtitles(notifier: TelegramNotifier, args: list) -> bool:
     """Maneja el comando night_subtitles"""
-    if len(args) < 4:
-        print("Error: night_subtitles requiere 2 argumentos")
+    if len(args) < 5:
+        print("Error: night_subtitles requiere 3 argumentos: <translated> <skipped> <errors>")
         return False
-    subtitles_processed = int(args[2])
-    subtitles_errors = int(args[3])
-    return notifier.notify_night_subtitles(subtitles_processed, subtitles_errors)
+    try:
+        translated = int(args[2])
+        skipped = int(args[3])
+        errors = int(args[4])
+    except ValueError:
+        print("Error: Los argumentos deben ser números enteros")
+        return False
+    
+    return notifier.notify_night_subtitles(translated, skipped, errors)
+
+
+def _handle_subtitle_translation(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando subtitle_translation"""
+    if len(args) < 8:
+        print("Error: subtitle_translation requiere 6 argumentos: total_files extracted translated with_spanish_audio with_spanish_subs errors")
+        return False
+    
+    # Los argumentos son: total_files, extracted, translated, with_spanish_audio, with_spanish_subs, errors
+    try:
+        stats = {
+            'total_files': int(args[2]),  # args[2] porque args[0]=script, args[1]=command
+            'extracted': int(args[3]),
+            'translated': int(args[4]),
+            'with_spanish_audio': int(args[5]),
+            'with_spanish_subs': int(args[6]),
+            'errors': int(args[7])
+        }
+        return notifier.notify_subtitle_translation(stats)
+    except (ValueError, IndexError) as e:
+        print(f"Error procesando argumentos: {e}")
+        return False
+        print(f"Error parsing subtitle_translation arguments: {e}")
+        return False
+
+
+def _handle_process_queue(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando process_queue"""
+    return notifier.process_pending_notifications()
 
 
 if __name__ == "__main__":

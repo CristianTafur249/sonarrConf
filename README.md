@@ -51,23 +51,27 @@ mediaJelly/
 ## ⚡ Instalación rápida
 
 ### 1. Clona el repositorio
+
 ```bash
 git clone https://github.com/CristianTafur249/mediaJelly.git
 cd mediaJelly
 ```
 
 ### 2. Configura las notificaciones Telegram (opcional)
+
 ```bash
 cp config/telegram.conf.example config/telegram.conf
 # Edita el archivo con tus credenciales de Telegram
 ```
 
 ### 3. Inicia los servicios
+
 ```bash
 docker compose up -d
 ```
 
 ### 4. Configura el cron job (opcional)
+
 ```bash
 # Añade esta línea a tu crontab (crontab -e)
 0 */6 * * * /home/tu_usuario/mediaJelly/scripts/cron-runner.sh
@@ -78,6 +82,7 @@ docker compose up -d
 1. Crea un bot con [@BotFather](https://t.me/BotFather) en Telegram
 2. Obtén tu `chat_id` enviando `/start` a [@userinfobot](https://t.me/userinfobot)
 3. Edita `config/telegram.conf`:
+
 ```bash
 TELEGRAM_BOT_TOKEN="tu_bot_token_aqui"
 TELEGRAM_CHAT_ID="tu_chat_id_aqui"
@@ -88,6 +93,7 @@ NOTIFY_ON_ERROR=true
 ## 📋 Uso manual
 
 ### Escanear y procesar contenido
+
 ```bash
 # Escanear toda la biblioteca de medios
 ./scripts/scan-to-pending.sh /path/to/media
@@ -100,11 +106,13 @@ NOTIFY_ON_ERROR=true
 ```
 
 ### Probar notificaciones
+
 ```bash
 ./scripts/telegram-notify.sh test
 ```
 
 ### Limpiar archivos corruptos
+
 ```bash
 ./scripts/cleanup-partial-compressed.sh /path/to/media
 ```
@@ -127,6 +135,7 @@ El sistema adapta la compresión según el tamaño del archivo:
 ## 🔒 Archivos no versionados
 
 Los siguientes archivos se excluyen del control de versiones:
+
 - `config/telegram.conf` - Credenciales de Telegram
 - `media/*` - Contenido multimedia
 - `scripts/logs/*` - Logs del sistema
@@ -134,17 +143,36 @@ Los siguientes archivos se excluyen del control de versiones:
 
 ## 🐛 Solución de problemas
 
-### Error de permisos
+### Error de permisos en archivos de lock
+
+Si encuentras errores como `Permission denied: '/mediajelly/scripts/tmp/cron_python.lock'`:
+
+```bash
+# Ejecutar el script de corrección de permisos
+sudo ./scripts/fix_permissions.sh
+```
+
+Este script:
+
+- Ajusta los permisos de directorios críticos (`tmp/` y `logs/`)
+- Elimina archivos de lock antiguos que puedan causar problemas
+- Asegura que los scripts Python sean ejecutables
+
+### Error de permisos general
+
 ```bash
 chmod +x scripts/*.sh
+chmod +x scripts/*.py
 ```
 
 ### Problema con archivos parcialmente comprimidos
+
 ```bash
 ./scripts/cleanup-partial-compressed.sh /path/to/media
 ```
 
 ### Verificar estado de servicios
+
 ```bash
 docker compose logs -f servicio_nombre
 ```
