@@ -9,11 +9,13 @@ Un servidor multimedia completamente automatizado con Docker, que incluye descar
 ## 🚀 Características principales
 
 - **🎯 Totalmente automatizado**: Descarga, organiza y comprime contenido automáticamente
-- **📱 Notificaciones Telegram**: Recibe reportes de éxito y errores
-- **🗜️ Compresión inteligente**: Optimización basada en el tamaño del archivo
+- **�️ Detección inteligente de idiomas**: Análisis automático de audio con Whisper AI para subtítulos precisos
+- **🧹 Limpieza automática de subtítulos**: Eliminación de duplicados y archivos de baja calidad
+- **📱 Notificaciones Telegram**: Recibe reportes de éxito y errores con emojis informativos
 - **⏰ Ejecución programada**: Cron jobs para procesamiento automático cada 12 horas
-- **🧹 Limpieza automática**: Gestión de logs y archivos temporales
+- **🗜️ Compresión inteligente**: Optimización basada en el tamaño del archivo con límites de recursos
 - **🔧 Recuperación de errores**: Manejo robusto de interrupciones y archivos corruptos
+- **🏗️ Infraestructura optimizada**: Docker Compose con healthchecks, límites de memoria y CPU
 
 ## 🐳 Servicios incluidos
 
@@ -30,22 +32,27 @@ Un servidor multimedia completamente automatizado con Docker, que incluye descar
 
 ## 📁 Estructura del proyecto
 
-```
+```text
 mediaJelly/
-├── docker-compose.yaml          # Configuración de servicios
+├── docker-compose.yaml          # Configuración de servicios con límites de recursos
 ├── media/                       # Contenido multimedia
 │   ├── Peliculas/              # Películas organizadas
-│   └── series/                 # Series organizadas
+│   ├── series/                 # Series organizadas
+│   └── anime/
 ├── config/                     # Configuraciones persistentes
 │   ├── telegram.conf          # Credenciales de Telegram (no versionado)
 │   └── */                     # Configs de cada servicio
-└── scripts/                   # Scripts de automatización
-    ├── cron-runner.sh         # Script principal para cron
-    ├── scan-to-pending.sh     # Escaneo de archivos nuevos
-    ├── process-compression.sh # Compresión inteligente
-    ├── telegram-notify.sh     # Notificaciones Telegram
-    ├── manage-logs.sh         # Gestión automática de logs
-    └── logs/                  # Logs del sistema
+└── scripts/                   # Scripts de automatización Python
+    ├── mediajelly_cron_runner.py    # Orquestador principal del sistema
+    ├── mediajelly_scanner.py        # Escaneo inteligente de archivos nuevos
+    ├── mediajelly_processor.py      # Compresión y procesamiento multimedia
+    ├── mediajelly_language_detector.py # Detección de idiomas con Whisper AI
+    ├── mediajelly_subtitle_translator.py # Traducción automática de subtítulos
+    ├── mediajelly_notifier.py       # Sistema de notificaciones Telegram
+    ├── clean_duplicate_subtitles.py # Limpieza de subtítulos duplicados
+    ├── cancel_processing.sh         # Cancelación de procesos en ejecución
+    ├── logs/                        # Logs del sistema
+    └── tmp/                         # Archivos temporales
 ```
 
 ## ⚡ Instalación rápida
@@ -141,7 +148,35 @@ Los siguientes archivos se excluyen del control de versiones:
 - `scripts/logs/*` - Logs del sistema
 - `scripts/tmp/*` - Archivos temporales
 
-## 🐛 Solución de problemas
+## � Scripts Python del Sistema
+
+### Core Scripts
+
+| Script | Función | Descripción |
+|--------|---------|-------------|
+| **mediajelly_cron_runner.py** | 🕐 Orquestador principal | Coordina escaneo, detección de idiomas, procesamiento y notificaciones |
+| **mediajelly_scanner.py** | 🔍 Escáner inteligente | Detecta archivos nuevos y pendientes de procesamiento |
+| **mediajelly_language_detector.py** | 🗣️ Detector de idiomas | Usa Whisper AI para analizar audio y detectar idiomas |
+| **mediajelly_processor.py** | 🗜️ Procesador multimedia | Compresión inteligente con algoritmos adaptativos |
+| **mediajelly_subtitle_translator.py** | 🌐 Traductor de subtítulos | Traducción automática con doble pasada para calidad |
+| **mediajelly_notifier.py** | 📱 Notificador Telegram | Sistema de notificaciones con emojis y estado persistente |
+
+### Utility Scripts
+
+| Script | Función | Descripción |
+|--------|---------|-------------|
+| **clean_duplicate_subtitles.py** | 🧹 Limpiador de subtítulos | Elimina duplicados y archivos de baja calidad (.hi.srt, .es-MX.srt) |
+| **cancel_processing.sh** | 🛑 Cancelador de procesos | Detiene procesos de compresión en ejecución |
+
+### Funcionalidades Clave
+
+- **🗣️ Detección Inteligente**: Análisis de audio con Whisper AI para subtítulos precisos
+- **🧹 Limpieza Automática**: Eliminación de subtítulos duplicados y de baja calidad
+- **📊 Estado Persistente**: Seguimiento de progreso y notificaciones para evitar duplicados
+- **🔄 Recuperación de Errores**: Reintentos automáticos y manejo robusto de fallos
+- **⚡ Optimización de Recursos**: Límites de memoria, CPU y healthchecks en Docker
+
+## �🐛 Solución de problemas
 
 ### Error de permisos en archivos de lock
 

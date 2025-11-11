@@ -16,6 +16,8 @@ SCRIPTS=(
     "mediajelly_notifier.py"
     "clean_duplicates.py"
     "normalize_paths.py"
+    "mediajelly_processor.py"
+    "mediajelly_language_detector.py"
 )
 
 # Función para listar procesos corriendo
@@ -63,6 +65,13 @@ list_running_processes() {
                     pid=$(echo "$line" | awk '{print $2}')
                     cmd=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
                     script_name=$(echo "$cmd" | grep -oE "mediajelly_[^ ]*\.py" | head -1)
+
+                    # Si no encontró script_name con el patrón anterior, intentar con mediajelly_processor.py
+                    if [ -z "$script_name" ]; then
+                        if echo "$cmd" | grep -q "mediajelly_processor\.py"; then
+                            script_name="mediajelly_processor.py"
+                        fi
+                    fi
 
                     if [ ! -z "$script_name" ]; then
                         echo "$((count+1)). $script_name (PID: $pid) [DOCKER]"
@@ -156,9 +165,22 @@ cancel_all_processes() {
     # Cancelar procesos en contenedor Docker
     if command -v docker-compose &> /dev/null && docker-compose ps mediajelly-cron | grep -q "Up"; then
         echo "Deteniendo procesos en contenedor Docker..."
-        # Obtener PIDs de procesos Python en el contenedor
+        
+        # Primero matar procesos padre (mediajelly_processor.py) para que terminen los hijos automáticamente
+        echo "Deteniendo procesos padre en contenedor Docker..."
+        parent_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python3.*mediajelly_processor\.py" | grep -v grep | awk '{print $2}')
+        if [ ! -z "$parent_pids" ]; then
+            for pid in $parent_pids; do
+                echo "Matando proceso padre mediajelly_processor.py (PID: $pid)"
+                docker-compose exec -T mediajelly-cron kill $pid 2>/dev/null
+            done
+            sleep 3  # Dar tiempo a que los procesos hijos terminen
+        fi
+        
+        # Luego matar cualquier proceso hijo restante
         docker_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep | awk '{print $2}')
         if [ ! -z "$docker_pids" ]; then
+            echo "Matando procesos hijos restantes..."
             for pid in $docker_pids; do
                 docker-compose exec -T mediajelly-cron kill $pid 2>/dev/null
             done
@@ -188,6 +210,15 @@ cancel_all_processes() {
 
         # Forzar terminación en Docker
         if [ ! -z "$remaining_docker" ]; then
+            echo "Forzando terminación de procesos padre..."
+            parent_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python3.*mediajelly_processor\.py" | grep -v grep | awk '{print $2}')
+            if [ ! -z "$parent_pids" ]; then
+                for pid in $parent_pids; do
+                    docker-compose exec -T mediajelly-cron kill -9 $pid 2>/dev/null
+                done
+            fi
+            
+            echo "Forzando terminación de procesos hijos restantes..."
             docker_pids=$(docker-compose exec -T mediajelly-cron ps aux 2>/dev/null | grep -E "python.*mediajelly.*\.py" | grep -v grep | awk '{print $2}')
             if [ ! -z "$docker_pids" ]; then
                 for pid in $docker_pids; do

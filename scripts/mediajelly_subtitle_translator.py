@@ -49,6 +49,14 @@ whisper_lock = threading.Lock()
 CONTAINER_PATH = "/mediajelly"
 SPANISH_SUBTITLE_SUFFIX = ".es.srt"
 
+# Constantes de estado de progreso
+STATUS_PROCESSING = "processing"
+STATUS_COMPLETED = "completed"
+
+# Constantes de rutas
+MEDIAJELLY_PATH = "/mediajelly"
+HOST_MEDIAJELLY_PATH = "/home/tafurc/mediaJelly"
+
 # Configuración de timeouts
 FFPROBE_TIMEOUT = 120  # segundos
 FFPROBE_QUICK_TIMEOUT = 30  # segundos para verificación rápida
@@ -133,7 +141,7 @@ class SubtitleQualityImprover:
 
             detected = langdetect_detect(clean_text)
             return detected if detected in ['en', 'es'] else "en"
-        except:
+        except Exception:
             return "en"
 
     def _improve_english_text(self, text: str) -> str:
@@ -248,10 +256,10 @@ class SubtitleTranslator:
     
     PROGRESS_FILE_NAME = "progress.json"
     
-    def __init__(self, max_workers: int = 3, use_whisper: bool = True, allow_retranslate: bool = False):
+    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False):
         # Configurar rutas
         self.is_container = Path(CONTAINER_PATH).exists()
-        self.base_dir = Path(CONTAINER_PATH if self.is_container else "/home/tafurc/mediaJelly")
+        self.base_dir = Path(CONTAINER_PATH if self.is_container else HOST_MEDIAJELLY_PATH)
         self.scripts_dir = self.base_dir / "scripts"
         self.logs_dir = self.scripts_dir / "logs"
         self.tmp_dir = self.scripts_dir / "tmp"
@@ -411,46 +419,119 @@ class SubtitleTranslator:
         return found_files
 
     def check_existing_spanish_subtitles(self, video_file: Path) -> bool:
-        """Verifica si ya existen subtítulos en español"""
+        """Verifica si ya existen subtítulos en español de calidad aceptable"""
+        video_stem = video_file.stem
+        
+        # Patrones de subtítulos en español priorizados
         spanish_patterns = [
-            f"{video_file.stem}*.es.srt",
-            f"{video_file.stem}*.spa.srt",
-            f"{video_file.stem}*spanish*.srt",
-            f"{video_file.stem}*español*.srt"
+            f"{video_stem}.es.srt",           # Español genérico (mejor)
+            f"{video_stem}.spa.srt",          # Español ISO
+            f"{video_stem}.es-ES.srt",        # Español España
+            f"{video_stem}.es-MX.srt",        # Español México
+            f"{video_stem}.es-AR.srt",        # Español Argentina
+            f"{video_stem}.spanish.srt",      # Nombre completo
+            f"{video_stem}.español.srt",      # Acentuado
         ]
-
-        spanish_files = self._find_srt_files(video_file, spanish_patterns)
-        return len(spanish_files) > 0
+        
+        # Buscar subtítulos en español válidos
+        for pattern in spanish_patterns:
+            subtitle_file = video_file.parent / pattern
+            
+            # Verificar que exista y sea válido
+            if subtitle_file.exists():
+                # Excluir archivos hearing impaired
+                if '.hi.' in subtitle_file.name:
+                    self.logger.debug(f"Ignorando subtítulo hearing impaired: {subtitle_file.name}")
+                    continue
+                
+                # Verificar tamaño mínimo
+                if subtitle_file.stat().st_size < 100:
+                    self.logger.debug(f"Ignorando subtítulo vacío: {subtitle_file.name}")
+                    continue
+                
+                # Subtítulo válido encontrado
+                self.logger.debug(f"Subtítulo español válido encontrado: {subtitle_file.name}")
+                return True
+        
+        return False
     
     def find_existing_srt_file(self, video_file: Path) -> Optional[Path]:
-        """Encuentra un archivo SRT existente (no español) para traducir"""
-        # Buscar archivos .srt que no sean .es.srt
-        srt_patterns = [
-            f"{video_file.stem}*.srt",
-            f"{video_file.stem}*.en.srt",
-            f"{video_file.stem}*.eng.srt",
-            f"{video_file.stem}*.sub.srt"
+        """Encuentra un archivo SRT existente (no español) para traducir, priorizando por calidad"""
+        video_stem = video_file.stem
+        
+        # Patrones de subtítulos priorizados por calidad
+        # (excluyendo español y hearing impaired)
+        srt_priority_patterns = [
+            f"{video_stem}.en.srt",           # Inglés explícito (mejor calidad)
+            f"{video_stem}.eng.srt",          # Inglés ISO
+            f"{video_stem}.srt",              # Genérico (probablemente inglés)
+            f"{video_stem}.sub.srt",          # Subtítulos genéricos
         ]
-
-        srt_files = self._find_srt_files(video_file, srt_patterns)
-
-        for srt_file in srt_files:
-            # Excluir archivos .es.srt ya que esos ya están en español (a menos que se permita re-traducción)
-            if not self.allow_retranslate and (srt_file.name.endswith(SPANISH_SUBTITLE_SUFFIX) or srt_file.name.endswith('.spa.srt')):
+        
+        # Buscar en orden de prioridad
+        for pattern in srt_priority_patterns:
+            srt_file = video_file.parent / pattern
+            
+            if not srt_file.exists():
                 continue
-            if srt_file.stat().st_size > 0:  # Solo archivos no vacíos
+            
+            # Excluir archivos hearing impaired (HI)
+            if '.hi.' in srt_file.name.lower():
+                self.logger.debug(f"Ignorando subtítulo HI: {srt_file.name}")
+                continue
+            
+            # Excluir archivos ya en español (a menos que se permita re-traducción)
+            if not self.allow_retranslate:
+                if any(marker in srt_file.name.lower() for marker in ['.es.', '.spa.', '.spanish.', '.español.']):
+                    self.logger.debug(f"Ignorando subtítulo ya en español: {srt_file.name}")
+                    continue
+            
+            # Verificar que no esté vacío
+            if srt_file.stat().st_size < 100:
+                self.logger.debug(f"Ignorando subtítulo vacío: {srt_file.name}")
+                continue
+            
+            # Validar que sea realmente un archivo SRT válido
+            if self._is_valid_srt_file(srt_file):
+                self.logger.info(f"Subtítulo encontrado para traducir: {srt_file.name}")
                 return srt_file
-
-        # Si no hay archivos SRT normales, pero hay un .es.srt, permitir re-traducirlo
-        es_srt = video_file.parent / f"{video_file.stem}{SPANISH_SUBTITLE_SUFFIX}"
-        if es_srt.exists() and es_srt.stat().st_size > 0:
-            # Renombrar temporalmente para permitir re-traducción
-            temp_srt = video_file.parent / f"{video_file.stem}.temp.srt"
-            es_srt.rename(temp_srt)
-            self.logger.info(f"Renombrando {es_srt.name} a {temp_srt.name} para re-traducción")
-            return temp_srt
+        
+        # Si no encontró nada y hay un .es.srt, permitir re-traducirlo solo si está habilitado
+        if self.allow_retranslate:
+            es_srt = video_file.parent / f"{video_stem}.es.srt"
+            if es_srt.exists() and es_srt.stat().st_size > 100:
+                # Renombrar temporalmente para permitir re-traducción
+                temp_srt = video_file.parent / f"{video_stem}.temp.srt"
+                try:
+                    es_srt.rename(temp_srt)
+                    self.logger.info(f"Renombrando {es_srt.name} a {temp_srt.name} para re-traducción")
+                    return temp_srt
+                except Exception as e:
+                    self.logger.error(f"Error renombrando {es_srt.name}: {e}")
 
         return None
+    
+    def _is_valid_srt_file(self, srt_file: Path) -> bool:
+        """Verifica si un archivo tiene formato SRT válido"""
+        try:
+            with open(srt_file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read(500)  # Leer primeros 500 caracteres
+                
+                # Verificar estructura básica de SRT:
+                # 1. Número de secuencia
+                # 2. Timestamp (00:00:00,000 --> 00:00:00,000)
+                # 3. Texto
+                
+                # Patrón simple para timestamp SRT
+                timestamp_pattern = r'\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}'
+                import re
+                if re.search(timestamp_pattern, content):
+                    return True
+                
+                return False
+        except Exception as e:
+            self.logger.debug(f"Error validando SRT {srt_file.name}: {e}")
+            return False
     
     def detect_srt_language(self, srt_file: Path) -> str:
         """Detecta el idioma principal de un archivo SRT"""
@@ -626,7 +707,7 @@ class SubtitleTranslator:
             temp_files = self._prepare_temp_files(video_file)
             audio_file, output_srt = temp_files
             
-            # Extraer audio del video
+            # Extraer audio del video (sin límite de duración)
             if not self._extract_audio_from_video(video_file, audio_file):
                 return None
             
@@ -656,27 +737,118 @@ class SubtitleTranslator:
         return audio_file, output_srt
     
     def _extract_audio_from_video(self, video_file: Path, audio_file: Path) -> bool:
-        """Extrae audio del video usando ffmpeg"""
+        """Extrae audio completo del video usando ffmpeg (con fallback para archivos corruptos)"""
         self.logger.info(f"Extrayendo audio temporal: {audio_file.name}")
 
+        # Intentar primero con opciones normales
+        if self._extract_audio_normal(video_file, audio_file):
+            return True
+        
+        # Si falla, intentar con opciones tolerantes a corrupción
+        self.logger.warning("Extracción normal falló, intentando con opciones tolerantes a corrupción...")
+        if self._extract_audio_corruption_tolerant(video_file, audio_file):
+            return True
+        
+        # Si aún falla, intentar método alternativo con codec copy y re-mux
+        self.logger.warning("Extracción tolerante falló, intentando método de re-mux...")
+        return self._extract_audio_remux(video_file, audio_file)
+    
+    def _extract_audio_normal(self, video_file: Path, audio_file: Path) -> bool:
+        """Extrae audio con opciones normales de FFmpeg"""
         cmd = [
             'ffmpeg', '-v', 'error', '-y',
             '-i', str(video_file),
             '-ar', '16000',  # Whisper requiere 16kHz
             '-ac', '1',       # Mono
             '-c:a', 'pcm_s16le',
-            '-t', '7200',     # Limitar a 2 horas máximo para evitar archivos enormes
             str(audio_file)
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)  # 1 hora timeout
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6 horas timeout
 
         if result.returncode != 0:
-            self.logger.error(f"Error extrayendo audio: ffmpeg código {result.returncode}")
+            self.logger.error(f"Error extrayendo audio (modo normal): ffmpeg código {result.returncode}")
             if result.stderr:
                 self.logger.error(f"FFmpeg stderr: {result.stderr[:500]}...")
             return False
 
+        return self._validate_extracted_audio(audio_file)
+    
+    def _extract_audio_corruption_tolerant(self, video_file: Path, audio_file: Path) -> bool:
+        """Extrae audio con opciones tolerantes a corrupción"""
+        cmd = [
+            'ffmpeg', '-v', 'error', '-y',
+            '-fflags', '+discardcorrupt+genpts+igndts',  # Ignorar corrupción y generar timestamps
+            '-err_detect', 'ignore_err',  # Ignorar errores de decodificación
+            '-i', str(video_file),
+            '-ar', '16000',  # Whisper requiere 16kHz
+            '-ac', '1',       # Mono
+            '-c:a', 'pcm_s16le',
+            str(audio_file)
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6 horas timeout
+
+        if result.returncode != 0:
+            self.logger.error(f"Error extrayendo audio (modo tolerante): ffmpeg código {result.returncode}")
+            if result.stderr:
+                self.logger.error(f"FFmpeg stderr: {result.stderr[:500]}...")
+            return False
+
+        return self._validate_extracted_audio(audio_file)
+    
+    def _extract_audio_remux(self, video_file: Path, audio_file: Path) -> bool:
+        """Extrae audio usando re-mux para evitar decodificación de streams corruptos"""
+        # Crear archivo temporal intermedio
+        temp_audio = audio_file.with_suffix('.temp.aac')
+        
+        try:
+            # Paso 1: Extraer audio sin re-encodear (codec copy)
+            cmd1 = [
+                'ffmpeg', '-v', 'error', '-y',
+                '-fflags', '+discardcorrupt',
+                '-i', str(video_file),
+                '-vn',  # Sin video
+                '-acodec', 'copy',  # Copiar codec sin re-encodear
+                '-map', '0:a:0',  # Solo primera pista de audio
+                str(temp_audio)
+            ]
+            
+            result1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=3600)
+            
+            if result1.returncode != 0 or not temp_audio.exists() or temp_audio.stat().st_size == 0:
+                self.logger.error(f"Error en re-mux paso 1: ffmpeg código {result1.returncode}")
+                return False
+            
+            # Paso 2: Convertir a WAV desde el archivo extraído
+            cmd2 = [
+                'ffmpeg', '-v', 'error', '-y',
+                '-fflags', '+discardcorrupt+igndts',
+                '-err_detect', 'ignore_err',
+                '-i', str(temp_audio),
+                '-ar', '16000',  # Whisper requiere 16kHz
+                '-ac', '1',       # Mono
+                '-c:a', 'pcm_s16le',
+                str(audio_file)
+            ]
+            
+            result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=3600)
+            
+            if result2.returncode != 0:
+                self.logger.error(f"Error en re-mux paso 2: ffmpeg código {result2.returncode}")
+                if result2.stderr:
+                    self.logger.error(f"FFmpeg stderr: {result2.stderr[:500]}...")
+                return False
+            
+            return self._validate_extracted_audio(audio_file)
+            
+        finally:
+            # Limpiar archivo temporal
+            if temp_audio.exists():
+                temp_audio.unlink()
+    
+    def _validate_extracted_audio(self, audio_file: Path) -> bool:
+        """Valida que el audio extraído sea usable"""
         if not audio_file.exists() or audio_file.stat().st_size == 0:
             self.logger.error("Archivo de audio temporal no se creó o está vacío")
             return False
@@ -1020,6 +1192,12 @@ class SubtitleTranslator:
                 self.logger.debug(f"Verificación rápida: omitiendo {video_file.name}")
                 return result
             
+            # 0.5. Verificar si el video está corrupto antes de intentar procesarlo
+            if self._is_video_corrupted(video_file):
+                result['error'] = "Video corrupto o inaccesible"
+                self.logger.error(f"{EmojiGenerator.error()} Video corrupto detectado: {video_file.name}")
+                return result
+            
             # 1. Verificar audio en español
             has_spanish, _ = self.check_audio_tracks(video_file)
             result['has_spanish_audio'] = has_spanish
@@ -1071,6 +1249,80 @@ class SubtitleTranslator:
             self.logger.error(f"Error procesando {video_file.name}: {e}")
         
         return result
+    
+    def _is_video_corrupted(self, video_file: Path) -> bool:
+        """
+        Detecta si un archivo de video está corrupto mediante análisis rápido con ffprobe.
+        Retorna True si el video está corrupto, False si está OK.
+        """
+        try:
+            # Análisis rápido con ffprobe (timeout corto)
+            cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration:stream=codec_name,codec_type',
+                '-of', 'json',
+                str(video_file)
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10  # Timeout rápido
+            )
+            
+            # Si ffprobe falla, el archivo está corrupto
+            if result.returncode != 0:
+                stderr = result.stderr.lower()
+                
+                # Detectar errores específicos de corrupción
+                corruption_indicators = [
+                    'invalid nal unit',
+                    'channel element',
+                    'is not allocated',
+                    'error splitting',
+                    'invalid data found',
+                    'prediction is not allowed',
+                    'reserved bit set',
+                    'exhausted before end',
+                ]
+                
+                if any(indicator in stderr for indicator in corruption_indicators):
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Indicadores de corrupción detectados en {video_file.name}")
+                    return True
+            
+            # Verificar que tenga streams válidos
+            try:
+                import json
+                data = json.loads(result.stdout)
+                
+                # Debe tener al menos un stream de video y audio
+                if 'streams' not in data or len(data.get('streams', [])) == 0:
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} No se detectaron streams en {video_file.name}")
+                    return True
+                
+                # Verificar que tenga duración válida
+                if 'format' in data:
+                    duration = data['format'].get('duration')
+                    if not duration or float(duration) < 1.0:
+                        self.logger.warning(f"{EmojiGenerator.warning_msg()} Duración inválida en {video_file.name}")
+                        return True
+                
+            except json.JSONDecodeError:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo parsear salida de ffprobe para {video_file.name}")
+                return True
+            
+            # Si llegó aquí, el video parece estar OK
+            return False
+            
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"{EmojiGenerator.warning_msg()} Timeout verificando {video_file.name}")
+            return True
+        except Exception as e:
+            self.logger.debug(f"Error verificando corrupción de {video_file.name}: {e}")
+            # En caso de error, asumir que no está corrupto para no bloquear
+            return False
     
     def cleanup_incomplete_files(self, video_files: list = None):
         """Elimina archivos temporales e incompletos de ejecuciones anteriores"""
@@ -1234,29 +1486,33 @@ class SubtitleTranslator:
         
         # Filtrar input_args para que solo contenga archivos válidos
         if input_args:
-            valid_file_paths = [str(f) for f in valid_files]
-            if 'corrected_paths' in input_args:
-                input_args['corrected_paths'] = [path for path in input_args['corrected_paths'] if path in valid_file_paths]
-            if 'file_paths' in input_args:
-                input_args['file_paths'] = [path for path in input_args['file_paths'] if path in valid_file_paths]
+            self._filter_input_args_for_valid_files(input_args, valid_files)
         
         # Determinar estrategia de procesamiento
         processing_config = self._determine_processing_strategy()
         
         # Actualizar progreso inicial con argumentos de entrada filtrados
-        self.update_progress_file(stats, 0, stats['total_files'], "", "processing", input_args=input_args)
+        self.update_progress_file(stats, 0, stats['total_files'], "", STATUS_PROCESSING, input_args=input_args)
         
         # Ejecutar procesamiento según la estrategia
         self._execute_processing(valid_files, stats, processing_config)
         
         # Actualizar progreso final
-        self.update_progress_file(stats, stats['processed'], stats['total_files'], "", "completed")
+        self.update_progress_file(stats, stats['processed'], stats['total_files'], "", STATUS_COMPLETED)
         
         # Si el procesamiento se completó al 100%, limpiar last_input_args
         if stats['processed'] == stats['total_files']:
             self._clear_input_args_from_progress()
 
         return stats
+    
+    def _filter_input_args_for_valid_files(self, input_args: dict, valid_files: List[Path]):
+        """Filtra input_args para que solo contenga archivos válidos"""
+        valid_file_paths = [str(f) for f in valid_files]
+        if 'corrected_paths' in input_args:
+            input_args['corrected_paths'] = [path for path in input_args['corrected_paths'] if path in valid_file_paths]
+        if 'file_paths' in input_args:
+            input_args['file_paths'] = [path for path in input_args['file_paths'] if path in valid_file_paths]
     
     def _initialize_processing_stats(self, total_files: int) -> dict:
         """Inicializa las estadísticas de procesamiento"""
@@ -1297,8 +1553,9 @@ class SubtitleTranslator:
                 
                 valid_files.append(video_file)
         
-        # Limpiar archivos no encontrados de pending_subtitles.txt y last_input_args
+        # Los archivos huérfanos se mencionan en el log y se limpian de pendientes
         if missing_files:
+            self.logger.info(f"Encontrados {len(missing_files)} archivos huérfanos (no encontrados), eliminándolos de pendientes")
             self._cleanup_missing_files(missing_files)
         
         return valid_files
@@ -1362,54 +1619,18 @@ class SubtitleTranslator:
             if not last_input_args:
                 return
             
-            # Normalizar las rutas de archivos no encontrados al formato de last_input_args
-            # Convertir rutas absolutas del sistema actual al formato guardado en last_input_args
-            normalized_missing_files = []
-            for file_path in file_paths:
-                # Si la ruta ya está en formato /mediajelly, mantenerla
-                if file_path.startswith('/mediajelly'):
-                    normalized_missing_files.append(file_path)
-                # Si está en formato absoluto del host, convertirla
-                elif file_path.startswith('/home/tafurc/mediaJelly'):
-                    # Convertir /home/tafurc/mediaJelly/... a /mediajelly/...
-                    normalized_path = file_path.replace('/home/tafurc/mediaJelly', '/mediajelly', 1)
-                    normalized_missing_files.append(normalized_path)
-                else:
-                    # Mantener la ruta tal cual si no coincide con ninguno de los formatos conocidos
-                    normalized_missing_files.append(file_path)
+            # Normalizar rutas y remover archivos
+            normalized_missing_files = self._normalize_missing_file_paths(file_paths)
+            self._remove_files_from_corrected_paths(last_input_args, normalized_missing_files)
+            self._remove_files_from_file_paths(last_input_args, normalized_missing_files)
             
-            self.logger.debug(f"DEBUG: Normalizando {len(file_paths)} archivos no encontrados")
-            self.logger.debug(f"DEBUG: Primeros 3 archivos normalizados: {normalized_missing_files[:3]}")
-            
-            # Remover archivos de corrected_paths si existen
+            # Si corrected_paths está vacío después de la limpieza, limpiar completamente last_input_args
             corrected_paths = last_input_args.get('corrected_paths', [])
-            self.logger.debug(f"DEBUG: corrected_paths tiene {len(corrected_paths)} elementos")
-            if corrected_paths:
-                self.logger.debug(f"DEBUG: Primeros 3 de corrected_paths: {corrected_paths[:3]}")
-                original_count = len(corrected_paths)
-                corrected_paths = [path for path in corrected_paths if path not in normalized_missing_files]
-                
-                if len(corrected_paths) != original_count:
-                    last_input_args['corrected_paths'] = corrected_paths
-                    removed_count = original_count - len(corrected_paths)
-                    self.logger.info(f"Removidos {removed_count} archivos de last_input_args.corrected_paths")
-                else:
-                    self.logger.debug(f"DEBUG: No se encontraron coincidencias en corrected_paths ({len(corrected_paths)} rutas)")
+            original_paths = last_input_args.get('original_paths', [])
             
-            # Remover archivos de file_paths si existen
-            file_paths_in_args = last_input_args.get('file_paths', [])
-            self.logger.debug(f"DEBUG: file_paths tiene {len(file_paths_in_args)} elementos")
-            if file_paths_in_args:
-                self.logger.debug(f"DEBUG: Primeros 3 de file_paths: {file_paths_in_args[:3]}")
-                original_count = len(file_paths_in_args)
-                file_paths_in_args = [path for path in file_paths_in_args if path not in normalized_missing_files]
-                
-                if len(file_paths_in_args) != original_count:
-                    last_input_args['file_paths'] = file_paths_in_args
-                    removed_count = original_count - len(file_paths_in_args)
-                    self.logger.info(f"Removidos {removed_count} archivos de last_input_args.file_paths")
-                else:
-                    self.logger.debug(f"DEBUG: No se encontraron coincidencias en file_paths ({len(file_paths_in_args)} rutas)")
+            if not corrected_paths and not original_paths:
+                self.logger.info("Todos los archivos fueron removidos. Limpiando last_input_args completamente.")
+                progress_data['subtitle_translation']['last_input_args'] = None
             
             # Guardar cambios
             with open(progress_file, 'w') as f:
@@ -1418,12 +1639,79 @@ class SubtitleTranslator:
         except Exception as e:
             self.logger.error(f"Error removiendo archivos de last_input_args: {e}")
     
+    def _normalize_missing_file_paths(self, file_paths: List[str]) -> List[str]:
+        """Normaliza las rutas de archivos no encontrados al formato de last_input_args"""
+        normalized_missing_files = []
+        for file_path in file_paths:
+            # Si la ruta ya está en formato /mediajelly, mantenerla
+            if file_path.startswith(MEDIAJELLY_PATH):
+                normalized_missing_files.append(file_path)
+            # Si está en formato absoluto del host, convertirla
+            elif file_path.startswith(HOST_MEDIAJELLY_PATH):
+                # Convertir /home/tafurc/mediaJelly/... a /mediajelly/...
+                normalized_path = file_path.replace(HOST_MEDIAJELLY_PATH, MEDIAJELLY_PATH, 1)
+                normalized_missing_files.append(normalized_path)
+            else:
+                # Mantener la ruta tal cual si no coincide con ninguno de los formatos conocidos
+                normalized_missing_files.append(file_path)
+        
+        self.logger.debug(f"DEBUG: Normalizando {len(file_paths)} archivos no encontrados")
+        self.logger.debug(f"DEBUG: Primeros 3 archivos normalizados: {normalized_missing_files[:3]}")
+        return normalized_missing_files
+    
+    def _remove_files_from_corrected_paths(self, last_input_args: dict, normalized_missing_files: List[str]):
+        """Remover archivos de corrected_paths y original_paths si existen"""
+        # Remover de corrected_paths
+        corrected_paths = last_input_args.get('corrected_paths', [])
+        self.logger.debug(f"DEBUG: corrected_paths tiene {len(corrected_paths)} elementos")
+        if corrected_paths:
+            self.logger.debug(f"DEBUG: Primeros 3 de corrected_paths: {corrected_paths[:3]}")
+            original_count = len(corrected_paths)
+            corrected_paths = [path for path in corrected_paths if path not in normalized_missing_files]
+            
+            if len(corrected_paths) != original_count:
+                last_input_args['corrected_paths'] = corrected_paths
+                removed_count = original_count - len(corrected_paths)
+                self.logger.info(f"Removidos {removed_count} archivos de last_input_args.corrected_paths")
+            else:
+                self.logger.debug(f"DEBUG: No se encontraron coincidencias en corrected_paths ({len(corrected_paths)} rutas)")
+        
+        # Remover también de original_paths
+        original_paths = last_input_args.get('original_paths', [])
+        if original_paths:
+            original_count = len(original_paths)
+            original_paths = [path for path in original_paths if path not in normalized_missing_files]
+            
+            if len(original_paths) != original_count:
+                last_input_args['original_paths'] = original_paths
+                removed_count = original_count - len(original_paths)
+                self.logger.info(f"Removidos {removed_count} archivos de last_input_args.original_paths")
+    
+    def _remove_files_from_file_paths(self, last_input_args: dict, normalized_missing_files: List[str]):
+        """Remover archivos de file_paths si existen"""
+        file_paths_in_args = last_input_args.get('file_paths', [])
+        self.logger.debug(f"DEBUG: file_paths tiene {len(file_paths_in_args)} elementos")
+        if file_paths_in_args:
+            self.logger.debug(f"DEBUG: Primeros 3 de file_paths: {file_paths_in_args[:3]}")
+            original_count = len(file_paths_in_args)
+            file_paths_in_args = [path for path in file_paths_in_args if path not in normalized_missing_files]
+            
+            if len(file_paths_in_args) != original_count:
+                last_input_args['file_paths'] = file_paths_in_args
+                removed_count = original_count - len(file_paths_in_args)
+                self.logger.info(f"Removidos {removed_count} archivos de last_input_args.file_paths")
+            else:
+                self.logger.debug(f"DEBUG: No se encontraron coincidencias en file_paths ({len(file_paths_in_args)} rutas)")
+    
     def _determine_processing_strategy(self) -> dict:
         """Determina la estrategia de procesamiento (concurrente vs secuencial)"""
-        use_concurrent = not self.use_whisper  # Concurrente solo si NO usa Whisper
-        actual_workers = 1 if self.use_whisper else self.max_workers
+        # Permitir procesamiento concurrente limitado incluso con Whisper
+        # El lock global de Whisper maneja la sincronización
+        use_concurrent = True  # Siempre usar concurrente (con límite de workers)
+        actual_workers = 2 if self.use_whisper else self.max_workers  # Max 2 con Whisper
         
-        self.logger.info(f"Modo de procesamiento: {'secuencial (1 por 1)' if self.use_whisper else f'concurrent ({actual_workers} workers)'}")
+        mode_desc = f"concurrent ({actual_workers} workers, Whisper con lock)" if self.use_whisper else f"concurrent ({actual_workers} workers)"
+        self.logger.info(f"Modo de procesamiento: {mode_desc}")
         
         return {
             'use_concurrent': use_concurrent,
@@ -1433,16 +1721,24 @@ class SubtitleTranslator:
     def _execute_processing(self, valid_files: List[Path], stats: dict, config: dict):
         """Ejecuta el procesamiento según la estrategia determinada"""
         if config['use_concurrent'] and config['actual_workers'] > 1:
-            self._process_concurrent(valid_files, stats)
+            self._process_concurrent(valid_files, stats, config['actual_workers'])
         else:
             self._process_sequential(valid_files, stats)
     
-    def _process_concurrent(self, valid_files: List[Path], stats: dict):
+    def _process_concurrent(self, valid_files: List[Path], stats: dict, max_workers: int = 2):
         """Procesa archivos de forma concurrente"""
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self.process_video, vf): vf for vf in valid_files}
 
             for future in as_completed(futures):
+                # Verificar si el lock file sigue existiendo (para cancelación externa)
+                if not _check_lock_file_exists(self.lock_file):
+                    self.logger.warning("Lock file eliminado externamente. Cancelando procesamiento...")
+                    # Cancelar futures pendientes
+                    for f in futures:
+                        f.cancel()
+                    break
+                
                 result = future.result()
                 self._update_stats_with_result(stats, result)
                 
@@ -1457,9 +1753,14 @@ class SubtitleTranslator:
     def _process_sequential(self, valid_files: List[Path], stats: dict):
         """Procesa archivos de forma secuencial"""
         for video_file in valid_files:
+            # Verificar si el lock file sigue existiendo (para cancelación externa)
+            if not _check_lock_file_exists(self.lock_file):
+                self.logger.warning("Lock file eliminado externamente. Cancelando procesamiento...")
+                break
+            
             # Actualizar progreso antes de procesar cada archivo
             self.update_progress_file(stats, stats['processed'], stats['total_files'], 
-                                    str(video_file), "processing")
+                                    str(video_file), STATUS_PROCESSING)
             
             result = self.process_video(video_file)
             self._update_stats_with_result(stats, result)
@@ -1665,8 +1966,39 @@ class SubtitleTranslator:
             # Retornar estadísticas del progreso guardado
             return self._get_stats_from_progress()
 
-        # Procesar solo los archivos que necesitan procesamiento
-        return self.process_file_list(files_needing_processing, input_args)
+        # Procesar archivos directamente sin re-filtrado (ya están filtrados)
+        return self._process_file_list_direct(files_needing_processing, input_args)
+    
+    def _process_file_list_direct(self, file_paths: List[Path], input_args: dict = None) -> dict:
+        """Procesa una lista de archivos ya filtrada, sin validación adicional"""
+        # Inicializar estadísticas
+        stats = self._initialize_processing_stats(len(file_paths))
+        
+        # Limpiar archivos temporales e incompletos
+        self.cleanup_incomplete_files(file_paths)
+        
+        # Filtrar input_args para que solo contenga archivos válidos
+        if input_args:
+            self._filter_input_args_for_valid_files(input_args, file_paths)
+        
+        # Determinar estrategia de procesamiento
+        processing_config = self._determine_processing_strategy()
+        
+        # Actualizar progreso inicial con argumentos de entrada filtrados
+        self.update_progress_file(stats, 0, stats['total_files'], "", STATUS_PROCESSING, input_args=input_args)
+        
+        # Ejecutar procesamiento según la estrategia
+        self._execute_processing(file_paths, stats, processing_config)
+        
+        # Actualizar progreso final
+        self.update_progress_file(stats, stats['processed'], stats['total_files'], "", STATUS_COMPLETED)
+        
+        # Si el procesamiento se completó al 100%, limpiar last_input_args
+        if stats['processed'] == stats['total_files']:
+            self._clear_input_args_from_progress()
+
+        return stats
+
     
     def _get_processed_files_info(self) -> dict:
         """Obtiene información de archivos ya procesados desde el archivo de progreso"""
@@ -1726,7 +2058,7 @@ class SubtitleTranslator:
             self.logger.warning(f"Error limpiando argumentos de entrada: {e}")
     
     def update_progress_file(self, stats: dict, current_file: int = 0, total_files: int = 0, 
-                           current_file_name: str = "", status: str = "processing",
+                           current_file_name: str = "", status: str = STATUS_PROCESSING,
                            processed_file_path: str = None, file_status: str = None,
                            input_args: dict = None):
         """Actualiza el archivo de progreso con estadísticas de subtítulos (thread-safe)"""
@@ -1734,153 +2066,27 @@ class SubtitleTranslator:
         
         with self.progress_lock:
             try:
-                # Leer progreso existente
-                if progress_file.exists():
-                    with open(progress_file, 'r') as f:
-                        progress_data = json.load(f)
-                else:
-                    progress_data = {
-                        "processing": {
-                            "current_file": 0,
-                            "total_files": 0,
-                            "current_file_name": "",
-                            "percentage": 0.0,
-                            "last_updated": datetime.now().isoformat(),
-                            "status": "idle",
-                            "notified": False,
-                            "stats": {
-                                "files_found": 0,
-                                "files_new": 0,
-                                "files_processed": 0,
-                                "files_compressed": 0,
-                                "files_renamed": 0,
-                                "files_skipped": 0,
-                                "total_original_size": 0,
-                                "total_compressed_size": 0,
-                                "errors": [],
-                                "no_spanish": []
-                            },
-                            "processed_files": {}
-                        },
-                        "subtitle_translation": {
-                            "current_file": 0,
-                            "total_files": 0,
-                            "current_file_name": "",
-                            "percentage": 0.0,
-                            "last_updated": datetime.now().isoformat(),
-                            "last_run": datetime.now().isoformat(),
-                            "status": "idle",
-                            "notified": False,
-                            "stats": {
-                                "files_found": 0,
-                                "files_processed": 0,
-                                "files_extracted": 0,
-                                "files_translated": 0,
-                                "files_with_spanish_audio": 0,
-                                "files_with_spanish_subs": 0,
-                                "files_errors": 0,
-                                "total_original_size": 0,
-                                "total_processed_size": 0,
-                                "errors": [],
-                                "whisper_used": False
-                            },
-                            "processed_files": {},
-                            "last_input_args": None,  # Guardar últimos argumentos de entrada
-                            "last_notification": None  # Guardar última notificación enviada
-                        }
-                    }
+                # Leer o inicializar progreso
+                progress_data = self._load_or_initialize_progress_data(progress_file)
                 
-                # Asegurar que existe la sección subtitle_translation con estructura completa
-                if 'subtitle_translation' not in progress_data:
-                    progress_data['subtitle_translation'] = {
-                        "current_file": 0,
-                        "total_files": 0,
-                        "current_file_name": "",
-                        "percentage": 0.0,
-                        "last_updated": datetime.now().isoformat(),
-                        "last_run": datetime.now().isoformat(),
-                        "status": "idle",
-                        "notified": False,
-                        "stats": {
-                            "files_found": 0,
-                            "files_processed": 0,
-                            "files_extracted": 0,
-                            "files_translated": 0,
-                            "files_with_spanish_audio": 0,
-                            "files_with_spanish_subs": 0,
-                            "files_errors": 0,
-                            "total_original_size": 0,
-                            "total_processed_size": 0,
-                            "errors": [],
-                            "whisper_used": False
-                        },
-                        "processed_files": {},
-                        "last_input_args": None,
-                        "last_notification": None
-                    }
+                # Asegurar estructura completa
+                self._ensure_progress_structure(progress_data)
                 
-                # Asegurar que el campo last_notification existe
-                if 'last_notification' not in progress_data['subtitle_translation']:
-                    progress_data['subtitle_translation']['last_notification'] = None
+                # Actualizar datos básicos
+                self._update_basic_progress_data(progress_data, current_file, total_files, current_file_name, status)
                 
-                # Calcular porcentaje
-                percentage = (current_file / total_files * 100) if total_files > 0 else 0.0
+                # Actualizar estadísticas detalladas si es necesario
+                self._update_detailed_stats_if_needed(progress_data, stats, current_file, total_files)
                 
-                # Actualizar estadísticas de subtítulos con la estructura completa
-                progress_data['subtitle_translation'].update({
-                    'current_file': current_file,
-                    'total_files': total_files,
-                    'current_file_name': current_file_name,
-                    'percentage': percentage,
-                    'last_updated': datetime.now().isoformat(),
-                    'last_run': datetime.now().isoformat(),
-                    'status': status,
-                    'notified': False
-                })
-                
-                # SOLO actualizar stats detallados si el porcentaje es 100% (completado)
-                # o si es la primera vez (stats vacías)
-                current_stats = progress_data['subtitle_translation']['stats']
-                if percentage >= 100.0 or current_stats.get('files_found', 0) == 0:
-                    # Mover errores de files_errors (array de detalles) a errors array
-                    errors_list = []
-                    if 'files_errors' in stats and stats.get('files_errors'):
-                        if isinstance(stats['files_errors'], list):
-                            # files_errors es un array de objetos con detalles
-                            errors_list = stats['files_errors']
-                        elif isinstance(stats['files_errors'], int) and stats['files_errors'] > 0:
-                            # Si files_errors es un número, generar entradas genéricas
-                            for i in range(stats['files_errors']):
-                                errors_list.append({
-                                    'error': f'Error de procesamiento #{i+1}',
-                                    'timestamp': datetime.now().isoformat()
-                                })
-                    
-                    progress_data['subtitle_translation']['stats'].update({
-                        'files_found': stats.get('total_files', 0),
-                        'files_processed': stats.get('processed', 0),
-                        'files_extracted': stats.get('extracted', 0),
-                        'files_translated': stats.get('translated', 0),
-                        'files_with_spanish_audio': stats.get('with_spanish_audio', 0),
-                        'files_with_spanish_subs': stats.get('with_spanish_subs', 0),
-                        'files_errors': stats.get('errors', 0),
-                        'errors': errors_list,
-                        'whisper_used': self.use_whisper and self.whisper_available
-                    })
-                
-                # Actualizar processed_files con el archivo actual si se proporciona
+                # Actualizar archivo procesado si se proporciona
                 if processed_file_path and file_status:
-                    progress_data['subtitle_translation']['processed_files'][processed_file_path] = {
-                        'status': file_status,
-                        'processed_at': datetime.now().isoformat(),
-                        'has_subtitles': file_status in ['translated', 'had_spanish_subtitles', 'had_spanish_subs']
-                    }
+                    self._update_processed_file_status(progress_data, processed_file_path, file_status)
                 
                 # Guardar argumentos de entrada si se proporcionan
                 if input_args:
                     progress_data['subtitle_translation']['last_input_args'] = input_args
                 
-                # Guardar
+                # Guardar cambios
                 with open(progress_file, 'w') as f:
                     json.dump(progress_data, f, indent=2)
                 
@@ -1888,6 +2094,174 @@ class SubtitleTranslator:
                 
             except Exception as e:
                 self.logger.error(f"Error actualizando archivo de progreso: {e}")
+    
+    def _load_or_initialize_progress_data(self, progress_file: Path) -> dict:
+        """Lee progreso existente o inicializa estructura nueva"""
+        if progress_file.exists():
+            with open(progress_file, 'r') as f:
+                return json.load(f)
+        else:
+            return self._create_initial_progress_structure()
+    
+    def _create_initial_progress_structure(self) -> dict:
+        """Crea la estructura inicial del archivo de progreso"""
+        return {
+            "processing": {
+                "current_file": 0,
+                "total_files": 0,
+                "current_file_name": "",
+                "percentage": 0.0,
+                "last_updated": datetime.now().isoformat(),
+                "status": "idle",
+                "notified": False,
+                "stats": {
+                    "files_found": 0,
+                    "files_new": 0,
+                    "files_processed": 0,
+                    "files_compressed": 0,
+                    "files_renamed": 0,
+                    "files_skipped": 0,
+                    "total_original_size": 0,
+                    "total_compressed_size": 0,
+                    "errors": [],
+                    "no_spanish": []
+                },
+                "processed_files": {}
+            },
+            "subtitle_translation": {
+                "current_file": 0,
+                "total_files": 0,
+                "current_file_name": "",
+                "percentage": 0.0,
+                "last_updated": datetime.now().isoformat(),
+                "last_run": datetime.now().isoformat(),
+                "status": "idle",
+                "notified": False,
+                "stats": {
+                    "files_found": 0,
+                    "files_processed": 0,
+                    "files_extracted": 0,
+                    "files_translated": 0,
+                    "files_with_spanish_audio": 0,
+                    "files_with_spanish_subs": 0,
+                    "files_errors": 0,
+                    "total_original_size": 0,
+                    "total_processed_size": 0,
+                    "errors": [],
+                    "whisper_used": False
+                },
+                "processed_files": {},
+                "last_input_args": None,
+                "last_notification": None
+            }
+        }
+    
+    def _ensure_progress_structure(self, progress_data: dict):
+        """Asegura que la estructura del progreso esté completa"""
+        # Asegurar que existe la sección subtitle_translation con estructura completa
+        if 'subtitle_translation' not in progress_data:
+            progress_data['subtitle_translation'] = {
+                "current_file": 0,
+                "total_files": 0,
+                "current_file_name": "",
+                "percentage": 0.0,
+                "last_updated": datetime.now().isoformat(),
+                "last_run": datetime.now().isoformat(),
+                "status": "idle",
+                "notified": False,
+                "stats": {
+                    "files_found": 0,
+                    "files_processed": 0,
+                    "files_extracted": 0,
+                    "files_translated": 0,
+                    "files_with_spanish_audio": 0,
+                    "files_with_spanish_subs": 0,
+                    "files_errors": 0,
+                    "total_original_size": 0,
+                    "total_processed_size": 0,
+                    "errors": [],
+                    "whisper_used": False
+                },
+                "processed_files": {},
+                "last_input_args": None,
+                "last_notification": None
+            }
+        
+        # Asegurar que el campo last_notification existe
+        if 'last_notification' not in progress_data['subtitle_translation']:
+            progress_data['subtitle_translation']['last_notification'] = None
+    
+    def _update_basic_progress_data(self, progress_data: dict, current_file: int, total_files: int, 
+                                  current_file_name: str, status: str):
+        """Actualiza los datos básicos de progreso"""
+        # Calcular porcentaje
+        percentage = (current_file / total_files * 100) if total_files > 0 else 0.0
+        
+        # Actualizar estadísticas de subtítulos con la estructura completa
+        progress_data['subtitle_translation'].update({
+            'current_file': current_file,
+            'total_files': total_files,
+            'current_file_name': current_file_name,
+            'percentage': percentage,
+            'last_updated': datetime.now().isoformat(),
+            'last_run': datetime.now().isoformat(),
+            'status': status,
+            'notified': False
+        })
+    
+    def _update_detailed_stats_if_needed(self, progress_data: dict, stats: dict, current_file: int, total_files: int):
+        """Actualiza estadísticas detalladas solo si es necesario"""
+        percentage = (current_file / total_files * 100) if total_files > 0 else 0.0
+        
+        # SOLO actualizar stats detallados si el porcentaje es 100% (completado)
+        # o si es la primera vez (stats vacías)
+        current_stats = progress_data['subtitle_translation']['stats']
+        if self._should_update_detailed_stats(percentage, current_stats):
+            errors_list = self._process_error_stats(stats)
+            
+            self._update_stats_data(progress_data, stats, errors_list)
+    
+    def _should_update_detailed_stats(self, percentage: float, current_stats: dict) -> bool:
+        """Determina si se deben actualizar las estadísticas detalladas"""
+        return percentage >= 100.0 or current_stats.get('files_found', 0) == 0
+    
+    def _process_error_stats(self, stats: dict) -> list:
+        """Procesa las estadísticas de errores para el formato correcto"""
+        errors_list = []
+        if 'files_errors' in stats and stats.get('files_errors'):
+            if isinstance(stats['files_errors'], list):
+                # files_errors es un array de objetos con detalles
+                errors_list = stats['files_errors']
+            elif isinstance(stats['files_errors'], int) and stats['files_errors'] > 0:
+                # Si files_errors es un número, generar entradas genéricas
+                for i in range(stats['files_errors']):
+                    errors_list.append({
+                        'error': 'Error de procesamiento #' + str(i+1),
+                        'timestamp': datetime.now().isoformat()
+                    })
+        return errors_list
+    
+    def _update_stats_data(self, progress_data: dict, stats: dict, errors_list: list):
+        """Actualiza los datos de estadísticas en progress_data"""
+        progress_data['subtitle_translation']['stats'].update({
+            'files_found': stats.get('total_files', 0),
+            'files_processed': stats.get('processed', 0),
+            'files_extracted': stats.get('extracted', 0),
+            'files_translated': stats.get('translated', 0),
+            'files_with_spanish_audio': stats.get('with_spanish_audio', 0),
+            'files_with_spanish_subs': stats.get('with_spanish_subs', 0),
+            'files_errors': stats.get('errors', 0),
+            'errors': errors_list,
+            'whisper_used': self.use_whisper and self.whisper_available
+        })
+    
+    def _update_processed_file_status(self, progress_data: dict, processed_file_path: str, file_status: str):
+        """Actualiza el estado de un archivo procesado"""
+        progress_data['subtitle_translation']['processed_files'][processed_file_path] = {
+            'status': file_status,
+            'processed_at': datetime.now().isoformat(),
+            'has_subtitles': file_status in ['translated', 'had_spanish_subtitles', 'had_spanish_subs']
+        }
 
     def extract_subtitles(self, video_file: Path) -> Optional[Path]:
         """Extrae subtítulos del archivo de video (embebidos en cualquier idioma o desde audio)"""
@@ -2077,12 +2451,60 @@ class SubtitleTranslator:
                 
         return result
 
+def _validate_dependencies():
+    """Valida que las dependencias críticas estén disponibles"""
+    missing_deps = []
+    
+    # Verificar FFmpeg
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=10)
+        if result.returncode != 0:
+            missing_deps.append("FFmpeg")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        missing_deps.append("FFmpeg")
+    
+    # Verificar FFprobe
+    try:
+        result = subprocess.run(['ffprobe', '-version'], capture_output=True, timeout=10)
+        if result.returncode != 0:
+            missing_deps.append("FFprobe")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        missing_deps.append("FFprobe")
+    
+    # Verificar dependencias Python críticas
+    if not WHISPER_AVAILABLE:
+        print("Advertencia: Whisper no está disponible - se usará solo traducción de texto")
+    
+    if not LANGDETECT_AVAILABLE:
+        missing_deps.append("langdetect (pip install langdetect)")
+    
+    if not YANDEX_AVAILABLE:
+        print("Advertencia: Yandex Translate no está disponible - se usarán traductores alternativos")
+    
+    if missing_deps:
+        print(f"Error: Dependencias faltantes: {', '.join(missing_deps)}")
+        print("Instale las dependencias faltantes y vuelva a ejecutar")
+        sys.exit(1)
+
+def _is_night_time() -> bool:
+    """Verifica si es hora de procesar subtítulos (noche: 00:00-05:59)"""
+    from datetime import datetime
+    current_hour = datetime.now().hour
+    # Noche: de 00:00 a 05:59 (0-5)
+    return current_hour <= 5
+
 def main():
     """Función principal"""
     import argparse
     import fcntl
     import signal
     import sys
+    
+    # Validar dependencias críticas al inicio
+    _validate_dependencies()
+    
+    # NO verificar restricción de horario cuando se llama directamente
+    # La restricción solo aplica cuando es llamado desde mediajelly_cron_runner.py
     
     # Configurar entorno y paths
     env_config = _setup_environment()
@@ -2117,7 +2539,7 @@ def _setup_environment() -> dict:
     """Configura el entorno y paths necesarios"""
     # Detectar entorno para paths
     is_container = Path(CONTAINER_PATH).exists()
-    base_dir = Path(CONTAINER_PATH if is_container else "/home/tafurc/mediaJelly")
+    base_dir = Path(CONTAINER_PATH if is_container else HOST_MEDIAJELLY_PATH)
     scripts_dir = base_dir / "scripts"
     tmp_dir = scripts_dir / "tmp"
     
@@ -2179,6 +2601,10 @@ def _create_lock_file(lock_file: Path):
         print(f"{EmojiGenerator.cross_mark()} Error al crear lock: {e}")
         sys.exit(1)
 
+def _check_lock_file_exists(lock_file: Path) -> bool:
+    """Verifica si el archivo de lock sigue existiendo (para cancelación externa)"""
+    return lock_file.exists()
+
 def _parse_arguments_and_setup_translator() -> tuple:
     """Parsea argumentos de línea de comandos y configura el traductor"""
     import argparse
@@ -2196,7 +2622,7 @@ def _parse_arguments_and_setup_translator() -> tuple:
 
     # Ajustar max_workers automáticamente cuando se usa Whisper
     if not args.no_whisper:
-        args.max_workers = 1  # Whisper solo procesa 1 por 1
+        args.max_workers = 2 # Whisper solo procesa 2 por 2
         print(f"{EmojiGenerator.magnifying_glass()} Whisper habilitado: Procesamiento secuencial (1 archivo por vez)")
 
     # Crear traductor con parámetros
@@ -2395,9 +2821,27 @@ def _reset_subtitle_progress(translator, input_args: dict):
 
 def _execute_processing(args, translator) -> dict:
     """Ejecuta el procesamiento de archivos o directorio"""
-    # Si no se pasaron rutas, verificar si hay un proceso incompleto para reanudar
+    # Verificar si se deben reanudar procesos incompletos
+    resume_check = _handle_resume_logic(args, translator)
+    if isinstance(resume_check, dict):
+        return resume_check
+    
+    # Preparar argumentos de entrada
+    input_args = _prepare_input_args(args, translator)
+    
+    # Verificar si se debe reanudar proceso incompleto
+    if _should_resume_incomplete_process(translator, input_args):
+        return _resume_incomplete_process(translator)
+    else:
+        # Resetear progreso si las rutas son diferentes
+        _reset_subtitle_progress(translator, input_args)
+    
+    # Ejecutar el procesamiento principal
+    return _execute_main_processing(args, translator, input_args)
+
+def _handle_resume_logic(args, translator) -> dict | None:
+    """Maneja la lógica de reanudación de procesos incompletos"""
     if not args.paths:
-        # Verificar si hay un proceso incompleto
         if _should_resume_incomplete_process(translator):
             translator.logger.info("No se especificaron rutas. Intentando reanudar proceso incompleto...")
             resume_result = _resume_incomplete_process(translator)
@@ -2406,49 +2850,57 @@ def _execute_processing(args, translator) -> dict:
                 return resume_result
             return resume_result
         else:
-            # No hay proceso incompleto, mostrar error
+            # Intentar leer archivos pendientes de subtítulos para ejecución automática
+            pending_file = Path(CONTAINER_PATH) / "scripts" / "tmp" / "pending_subtitles.txt"
+            if pending_file.exists():
+                try:
+                    with open(pending_file, 'r', encoding='utf-8') as f:
+                        pending_paths = [line.strip() for line in f if line.strip()]
+                    
+                    if pending_paths:
+                        translator.logger.info(f"Encontrados {len(pending_paths)} archivos pendientes de subtítulos")
+                        translator.logger.info("Procesando archivos pendientes automáticamente...")
+                        
+                        # Simular que se pasaron estos paths como argumentos
+                        args.paths = pending_paths
+                        return None
+                    else:
+                        translator.logger.info("Archivo pending_subtitles.txt existe pero está vacío")
+                except Exception as e:
+                    translator.logger.error(f"Error leyendo archivo de subtítulos pendientes: {e}")
+            
             print("usage: mediajelly_subtitle_translator.py [-h] [--max-workers MAX_WORKERS] [--no-whisper] [--retranslate] paths [paths ...]")
             print("mediajelly_subtitle_translator.py: error: the following arguments are required: paths")
             print("Nota: Si hay un proceso incompleto, puedes ejecutar sin argumentos para reanudarlo")
             return {'error': 'No paths specified and no incomplete process to resume'}
+    return None
 
-    # Corregir rutas para el contenedor Docker
+def _prepare_input_args(args, translator) -> dict:
+    """Prepara los argumentos de entrada para el procesamiento"""
     corrected_paths = _correct_container_paths(args.paths, translator)
     
-    # Preparar argumentos de entrada para posible reanudación
-    # IMPORTANTE: Guardar solo rutas normalizadas de Docker para evitar inconsistencias
-    input_args = {
-        'original_paths': corrected_paths,  # Usar corrected_paths en lugar de args.paths
+    return {
+        'original_paths': corrected_paths,
         'corrected_paths': corrected_paths,
         'max_workers': args.max_workers,
         'use_whisper': not args.no_whisper,
         'allow_retranslate': args.retranslate
     }
-    
-    # Verificar si hay un proceso incompleto para reanudar (solo si las rutas coinciden)
-    should_resume = _should_resume_incomplete_process(translator, input_args)
-    
-    if should_resume:
-        return _resume_incomplete_process(translator)
-    else:
-        # Si no se reanuda (rutas diferentes), resetear estadísticas y archivos procesados
-        _reset_subtitle_progress(translator, input_args)
-    
-    # Si el primer argumento es un directorio, procesar todo el directorio
+
+def _execute_main_processing(args, translator, input_args: dict) -> dict:
+    """Ejecuta el procesamiento principal según el tipo de entrada"""
+    corrected_paths = input_args['corrected_paths']
     first_arg = Path(corrected_paths[0])
 
     if first_arg.is_dir():
         translator.logger.info(f"=== Iniciando traducción de subtítulos en directorio {first_arg} ===")
         translator.logger.info(f"Modo: {'secuencial (Whisper)' if translator.use_whisper else f'concurrente ({args.max_workers} workers)'}")
-        stats = translator.process_directory(first_arg, input_args)
+        return translator.process_directory(first_arg, input_args)
     else:
-        # Procesar lista de archivos
         file_paths = [Path(p) for p in corrected_paths]
         translator.logger.info(f"=== Iniciando traducción de subtítulos para {len(file_paths)} archivo(s) ===")
         translator.logger.info(f"Modo: {'secuencial (Whisper)' if translator.use_whisper else f'concurrente ({args.max_workers} workers)'}")
-        stats = translator.process_file_list(file_paths, input_args)
-    
-    return stats
+        return translator.process_file_list(file_paths, input_args)
 
 def _correct_container_paths(paths: list, translator) -> list:
     """Corrige las rutas para el entorno de contenedor Docker

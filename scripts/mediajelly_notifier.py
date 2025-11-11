@@ -7,7 +7,6 @@ import os
 import sys
 import json
 import time
-import requests
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict
@@ -121,6 +120,12 @@ class TelegramNotifier:
     
     def _send_message_immediate(self, message: str, parse_mode: Optional[str] = None) -> bool:
         """Enviar mensaje inmediatamente sin cola"""
+        try:
+            import requests  # type: ignore
+        except ImportError:
+            self.logger.error("requests library no disponible")
+            return False
+        
         if 'TELEGRAM_BOT_TOKEN' not in self.config or 'TELEGRAM_CHAT_ID' not in self.config:
             self.logger.error("Credenciales de Telegram no configuradas")
             return False
@@ -361,10 +366,13 @@ class TelegramNotifier:
                 pass
         
         # Guarda estado actual
-        with open(self.state_file, 'w') as f:
-            f.write(f"{current_pending}\n")
-            f.write(f"{current_completed}\n")
-            f.write(f"{current_last_log}\n")
+        try:
+            with open(self.state_file, 'w') as f:
+                f.write(f"{current_pending}\n")
+                f.write(f"{current_completed}\n")
+                f.write(f"{current_last_log}\n")
+        except PermissionError as e:
+            self.logger.warning(f"No se pudo guardar el estado de notificación: {e}")
         
         # Determina si hubo cambios
         has_changes = (
@@ -671,6 +679,16 @@ class TelegramNotifier:
         
         return self.send_long_message(message)
 
+    def notify_cleanup_result(self, removed_count: int, remaining_count: int, current_files_processed: int) -> bool:
+        """Notificar resultado de limpieza semanal de archivos completados"""
+        message = f"{EmojiGenerator.cleanup()} MediaJelly - Limpieza semanal de completados\n\n"
+        message += f"{EmojiGenerator.stats()} Total archivos procesados: {current_files_processed}\n"
+        message += f"{EmojiGenerator.wastebasket()} Entradas inexistentes eliminadas: {removed_count}\n"
+        message += f"{EmojiGenerator.success()} Entradas válidas restantes: {remaining_count}\n\n"
+        message += f"{EmojiGenerator.time()} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        return self.send_long_message(message)
+
 def main():
     """Función principal"""
     if len(sys.argv) < 2:
@@ -689,6 +707,7 @@ def main():
         "test": _handle_test,
         "reset_state": _handle_reset_state,
         "completed_cleanup": _handle_completed_cleanup,
+        "cleanup_result": _handle_cleanup_result,
         "night_subtitles": _handle_night_subtitles,
         "subtitle_translation": _handle_subtitle_translation,
         "process_queue": _handle_process_queue
@@ -771,6 +790,17 @@ def _handle_completed_cleanup(notifier: TelegramNotifier, args: list) -> bool:
     files_removed = int(args[3])
     files_kept = int(args[4])
     return notifier.notify_completed_cleanup(files_checked, files_removed, files_kept)
+
+
+def _handle_cleanup_result(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando cleanup_result para limpieza periódica de completados"""
+    if len(args) < 5:
+        print("Error: cleanup_result requiere 3 argumentos (removed_count, remaining_count, current_files_processed)")
+        return False
+    removed_count = int(args[2])
+    remaining_count = int(args[3])
+    current_files_processed = int(args[4])
+    return notifier.notify_cleanup_result(removed_count, remaining_count, current_files_processed)
 
 
 def _handle_night_subtitles(notifier: TelegramNotifier, args: list) -> bool:

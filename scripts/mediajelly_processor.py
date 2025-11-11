@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-MediaJelly Python - Sistema de procesamiento multimedia
-Versión optimizada del sistema bash con control de recursos y concurrencia
+MediaJelly Python - Sistema de procesamiento multimedia optimizado
 """
 
 import os
@@ -12,34 +11,42 @@ import logging
 import logging.handlers
 import resource
 import subprocess
+import tempfile
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed  # Volviendo a ProcessPool
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple, Union
 import signal
 import atexit
-import glob
 
-# Configuración de límites de recursos
-MAX_MEMORY_GB = 4  # Limita memoria por proceso ffmpeg
-MAX_CPU_PERCENT = 30  # Restringe porcentaje máximo de CPU total
-MAX_CONCURRENT_COMPRESSIONS = 2  # Permite 2 compresiones simultáneas
-FFMPEG_TIMEOUT = 9000  # Establece 2.5 horas por archivo
+# Importar whisper solo si está disponible
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
 
-# Constantes para archivos y formatos
+# Importar módulo de emojis
+from mediajelly_emoji import EmojiGenerator
+
+# Configuración optimizada de constantes
+MAX_MEMORY_GB = 4
+MAX_CONCURRENT_COMPRESSIONS = 1  # Con Whisper activo, 1 worker para evitar problemas de memoria 
+FFMPEG_TIMEOUT = 7200  # 2 horas por archivo
 COMPRESSED_FILE_SUFFIX = '.compressed.mp4'
 STREAM_LANGUAGE_QUERY = "stream=index:stream_tags=language"
 CSV_FORMAT_PARAM = "csv=p=0"
 FIRST_AUDIO_STREAM = "0:a:0"
-PROGRESS_UPDATE_INTERVAL = 1  # Actualizar progreso cada 1 archivo
 PROGRESS_FILE_NAME = "progress.json"
+FAILED_COMPRESSION_FILE = "failed-compression.txt"
 VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
-LOG_RETENTION_DAYS = 30  # Días para mantener logs antiguos
-SHORT_TIMEOUT = 10  # Timeout corto para operaciones rápidas (segundos)
-MEDIUM_TIMEOUT = 120  # Timeout medio para operaciones de análisis (segundos)
+LOG_RETENTION_DAYS = 7  # Reducido para ahorrar espacio
+SHORT_TIMEOUT = 10
+MEDIUM_TIMEOUT = 60  # Reducido para mayor eficiencia
 PROCESSING_COMPLETED_MESSAGE = "Procesamiento completado"
 EXCLUDED_FOLDERS = {'.delete', '.deleted', '.tmp', '.temp', '.trash', '.recycle'}
+MOVFLAGS_FASTSTART = "+faststart"
 
 @dataclass
 class ProcessingStats:
@@ -74,9 +81,10 @@ class MediaJellyProcessor:
         self.tmp_dir = self.scripts_dir / "tmp"
         
         # Archivos
-        self.pending_file = self.scripts_dir / "pending-compression.txt"
-        self.completed_file = self.scripts_dir / "completed.txt"
+        self.pending_file = self.tmp_dir / "pending-compression.txt"
+        self.completed_file = self.tmp_dir / "completed.txt"
         self.config_file = self.base_dir / "config" / "telegram.conf"
+        self.failed_file = self.tmp_dir / FAILED_COMPRESSION_FILE
         
         # Logs
         self.setup_logging()
@@ -95,6 +103,15 @@ class MediaJellyProcessor:
         # Mejorador de calidad
         self.quality_improver = VideoQualityImprover(self.logger)
         
+        # Caché de idiomas pre-detectados (llenado por mediajelly_language_detector.py)
+        self.language_cache_file = self.tmp_dir / "language_detection_cache.json"
+        self.language_cache = self._load_language_cache()
+        
+        # Modelo Whisper deshabilitado (se usa pre-análisis)
+        self.whisper_model = None
+        self.whisper_enabled = False
+        self.logger.info("🎙️ Detección de idioma: usando caché pre-analizado")
+    
     def setup_logging(self):
         """Configura logging estructurado con rotación automática"""
         # Limpia los handlers existentes
@@ -213,6 +230,15 @@ class MediaJellyProcessor:
             except Exception:
                 existing_progress = {}
         
+        # Resetear progreso si está corrupto (porcentaje > 100%)
+        if self._reset_progress_if_corrupted(existing_progress.get('processing', {})):
+            # Recargar progreso después del reset
+            try:
+                with open(progress_file, 'r') as f:
+                    existing_progress = json.load(f)
+            except Exception:
+                existing_progress = {}
+        
         # Calcular archivos ya procesados (de processed_files)
         num_processed_files = len(existing_progress.get('processing', {}).get('processed_files', {}))
         
@@ -220,7 +246,13 @@ class MediaJellyProcessor:
         files_new = total_files - num_processed_files if total_files > num_processed_files else 0
         
         # Calcula porcentaje basado en archivos procesados vs total escaneados
-        percentage = round((current_file / total_files) * 100, 1) if total_files > 0 else 0
+        raw_percentage = round((current_file / total_files) * 100, 1) if total_files > 0 else 0
+        percentage = min(100.0, raw_percentage)
+        
+        # Verificar si el progreso excede 100% y enviar notificación si no se ha enviado
+        if raw_percentage > 100 and not existing_progress.get('processing', {}).get('over_100_notified', False):
+            self._send_over_100_notification(raw_percentage, current_file, total_files, files_new)
+            existing_progress['processing']['over_100_notified'] = True
         
         # Asegurar que existe la sección processing con estructura completa
         if 'processing' not in existing_progress:
@@ -232,6 +264,7 @@ class MediaJellyProcessor:
                 "last_updated": datetime.now().isoformat(),
                 "status": "idle",
                 "notified": False,
+                "over_100_notified": False,
                 "stats": {
                     "files_found": 0,
                     "files_new": 0,
@@ -264,6 +297,7 @@ class MediaJellyProcessor:
             'last_updated': datetime.now().isoformat(),
             'status': status,  # scanning, processing, completed, error
             'notified': False,  # Indica si ya se envió notificación para esta ejecución
+            'over_100_notified': existing_progress['processing'].get('over_100_notified', False)
         })
         
         # Actualizar files_new y files_found en las estadísticas
@@ -379,156 +413,180 @@ class MediaJellyProcessor:
         return files_removed
 
     def _normalize_filename(self, file_path: Path) -> Optional[Path]:
-        """Normaliza el nombre del archivo:
-        - Elimina prefijos de grupos fansub como [Erai-raws], [SubsPlease], etc.
-        - Convierte múltiples patrones de temporada/episodio a formato estándar 'SxxEyy' (SOLO PARA SERIES)
-        - Mantiene el nombre de la serie y metadatos adicionales
-        
-        Retorna el nuevo Path si se renombró, None si no fue necesario
-        """
+        """Normaliza el nombre del archivo eliminando prefijos fansub y normalizando formato de temporada/episodio"""
         import re
-        
+
         # DETECTAR SI ES PELÍCULA: no aplicar normalización de temporada/episodio
         is_movie = any(part.lower() in ['peliculas', 'movies'] for part in file_path.parts)
-        
-        original_name = file_path.stem  # Nombre sin extensión
+
+        original_name = file_path.stem
         extension = file_path.suffix
         normalized_name = original_name
-        
-        # 1. Eliminar prefijos de grupos fansub entre corchetes/paréntesis al inicio
-        # Patrones: [Erai-raws], [SubsPlease], [HorribleSubs], (grupo), etc.
+
+        # 1. Eliminar prefijos de grupos fansub
+        normalized_name = self._remove_fansub_prefixes(normalized_name)
+
+        # 2. Normalizar formato de temporada/episodio - SOLO PARA SERIES
+        if not is_movie:
+            normalized_name = self._normalize_season_episode_format(normalized_name)
+
+        # 3. Limpiar espacios y guiones
+        normalized_name = self._clean_filename_formatting(normalized_name)
+
+        # Si el nombre cambió, renombrar el archivo
+        if normalized_name != original_name:
+            return self._rename_file_safely(file_path, normalized_name, extension)
+
+        return None
+
+    def _remove_fansub_prefixes(self, filename: str) -> str:
+        """Elimina prefijos de grupos fansub del nombre del archivo"""
+        import re
+
         fansub_patterns = [
             r'^\[([^\]]+)\]\s*',     # [Grupo]
             r'^\(([^\)]+)\)\s*',     # (Grupo)
             r'^\{([^\}]+)\}\s*',     # {Grupo}
         ]
-        
-        for fansub_pattern in fansub_patterns:
-            match = re.match(fansub_pattern, normalized_name)
+
+        for pattern in fansub_patterns:
+            match = re.match(pattern, filename)
             if match:
                 group_name = match.group(1)
-                rest_of_name = normalized_name[match.end():]
-                
-                # Solo eliminar si no es parte del nombre de la serie
+                rest_of_name = filename[match.end():]
                 if rest_of_name and not rest_of_name.lower().startswith(group_name.lower()):
-                    normalized_name = rest_of_name.strip()
-                    self.logger.info(f"Removiendo prefijo [{group_name}] de: {original_name}")
-                    break
-        
-        # 2. Normalizar formato de temporada/episodio - SOLO PARA SERIES (NO PELÍCULAS)
-        if not is_movie:
-            # Formatos soportados:
-            season_episode_patterns = [
-                # Formatos con "Season" explícito
-                (r'\bSeason\s+(\d+)\s*-\s*(\d+)\b', 'Season X - Y'),                    # Season 2 - 10
-                (r'\bSeason\s+(\d+)\s+Episode\s+(\d+)\b', 'Season X Episode Y'),        # Season 2 Episode 10
-                (r'\bSeason\s+(\d+)\s+Ep\.?\s+(\d+)\b', 'Season X Ep Y'),               # Season 2 Ep 10
-                (r'\bSeason\s+(\d+)\s*E(\d+)\b', 'Season X EY'),                        # Season 2 E10
-                (r'\bSeason\s*(\d+)\s+(\d+)\b', 'Season X Y'),                          # Season 2 10
-            
-            # Formatos con separadores variados
-            (r'\bS(\d+)\s*-\s*E?(\d+)\b', 'SX - EY'),                               # S2 - 10, S2 - E10
-            (r'\bS(\d+)\s*x\s*E?(\d+)\b', 'SX x EY'),                               # S2 x 10, S2 x E10
-            (r'\bS(\d+)\s*\.\s*E?(\d+)\b', 'SX.EY'),                                # S2.10, S2.E10
-            (r'\b(\d+)x(\d+)\b', 'XxY'),                                            # 2x10
-            
-            # Formatos compactos
-            (r'\bS(\d+)E(\d+)\b', 'SXEY'),                                          # S02E10 (ya normalizado, verificar dígitos)
-            (r'\b(\d{1,2})(\d{2})\b(?![p\]])', 'XYY'),                             # 210 (solo si no es seguido de 'p' como en 1080p)
-            
-            # Formatos con guion bajo
-            (r'\bS(\d+)_E?(\d+)\b', 'SX_EY'),                                       # S2_10, S2_E10
-            (r'\b(\d+)_(\d+)\b', 'X_Y'),                                            # 2_10
-            
-            # Formatos japoneses/anime
-            (r'\b第(\d+)話\b', 'Episodio X (japonés)'),                             # 第10話
-            (r'\bEpisode\s+(\d+)\b(?!.*Season)', 'Episode X'),                      # Episode 10 (sin Season)
-            (r'\bEp\.?\s+(\d+)\b(?!.*Season)', 'Ep X'),                             # Ep 10 (sin Season)
-            (r'\bE(\d+)\b(?!.*[Ss]eason)(?!.*S\d+)', 'EX solo'),                   # E10 (sin Season ni SX)
-            
-            # Formatos con palabras completas
-            (r'\bTemporada\s+(\d+)\s+Episodio\s+(\d+)\b', 'Temporada X Episodio Y'), # Temporada 2 Episodio 10 (español)
-            (r'\bTemporada\s+(\d+)\s+Cap\.?\s+(\d+)\b', 'Temporada X Cap Y'),       # Temporada 2 Cap 10
-            (r'\bT(\d+)\s*E(\d+)\b', 'TXEY'),                                       # T2E10 (español)
-            (r'\bT(\d+)\s*C(\d+)\b', 'TXCY'),                                       # T2C10 (Cap español)
-            ]
-            
-            normalized = False
-            for pattern_tuple in season_episode_patterns:
-                pattern = pattern_tuple[0]
-                format_desc = pattern_tuple[1]
-                
-                match = re.search(pattern, normalized_name, re.IGNORECASE)
-                if match:
-                    # Determinar si es formato con temporada o solo episodio
-                    groups = match.groups()
-                    
-                    if len(groups) == 2:
-                        # Formato con temporada y episodio
-                        season = groups[0].zfill(2)
-                        episode = groups[1].zfill(2)
-                    elif len(groups) == 1:
-                        # Solo episodio (asumir temporada 01)
-                        season = "01"
-                        episode = groups[0].zfill(2)
-                    else:
-                        continue
-                    
-                    # Construir nombre normalizado
-                    before_match = normalized_name[:match.start()].strip()
-                    after_match = normalized_name[match.end():].strip()
-                    
-                    # Insertar formato estándar sin guiones alrededor de SxE
-                    if before_match and after_match:
-                        normalized_name = f"{before_match} S{season}E{episode} {after_match}"
-                    elif before_match:
-                        normalized_name = f"{before_match} S{season}E{episode}"
-                    elif after_match:
-                        normalized_name = f"S{season}E{episode} {after_match}"
-                    else:
-                        normalized_name = f"S{season}E{episode}"
-                    
-                    self.logger.info(f"Normalizando '{format_desc}': '{original_name}' -> '{normalized_name}'")
-                    normalized = True
-                    break
+                    return rest_of_name.strip()
+
+        return filename
+
+    def _normalize_season_episode_format(self, filename: str) -> str:
+        """Normaliza el formato de temporada/episodio en nombres de series"""
+        import re
+
+        # Intentar diferentes patrones de normalización
+        normalized = self._try_normalize_sxe_pattern(filename)
+        if normalized != filename:
+            return normalized
+
+        normalized = self._try_normalize_season_dash_pattern(filename)
+        if normalized != filename:
+            return normalized
+
+        normalized = self._try_normalize_season_episode_pattern(filename)
+        if normalized != filename:
+            return normalized
+
+        normalized = self._try_normalize_xxy_pattern(filename)
+        if normalized != filename:
+            return normalized
+
+        normalized = self._try_normalize_episode_only_pattern(filename)
+        if normalized != filename:
+            return normalized
+
+        return filename
+
+    def _try_normalize_sxe_pattern(self, filename: str) -> str:
+        """Intenta normalizar patrón S02E10 (ya normalizado)"""
+        import re
+        pattern = r'\bS(\d+)E(\d+)\b'
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            return self._build_normalized_filename(filename, match, match.groups())
+        return filename
+
+    def _try_normalize_season_dash_pattern(self, filename: str) -> str:
+        """Intenta normalizar patrón Season 2 - 10"""
+        import re
+        pattern = r'\bSeason\s+(\d+)\s*-\s*(\d+)\b'
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            return self._build_normalized_filename(filename, match, match.groups())
+        return filename
+
+    def _try_normalize_season_episode_pattern(self, filename: str) -> str:
+        """Intenta normalizar patrón Season 2 Episode 10"""
+        import re
+        pattern = r'\bSeason\s+(\d+)\s+Episode\s+(\d+)\b'
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            return self._build_normalized_filename(filename, match, match.groups())
+        return filename
+
+    def _try_normalize_xxy_pattern(self, filename: str) -> str:
+        """Intenta normalizar patrón 2x10"""
+        import re
+        pattern = r'\b(\d+)x(\d+)\b'
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            return self._build_normalized_filename(filename, match, match.groups())
+        return filename
+
+    def _try_normalize_episode_only_pattern(self, filename: str) -> str:
+        """Intenta normalizar patrón E10 (sin Season)"""
+        import re
+        pattern = r'\bE(\d+)\b(?!.*season)(?!.*S\d+)'
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            season = "01"
+            episode = match.group(1).zfill(2)
+            return self._build_normalized_filename(filename, match, (season, episode))
+        return filename
+
+    def _build_normalized_filename(self, filename: str, match, groups) -> str:
+        """Construye el nombre de archivo normalizado"""
+        if len(groups) == 2:
+            season = groups[0].zfill(2)
+            episode = groups[1].zfill(2)
+        elif len(groups) == 1:
+            season = "01"
+            episode = groups[0].zfill(2)
         else:
-            # Para películas, no normalizar temporada/episodio
-            normalized = False
-        
-        # 2.5. Cambiar formato de presentación: quitar guiones alrededor de SxE
-        # Cambiar "Serie - S02E20 - Título" por "Serie S02E20 Título"
-        normalized_name = re.sub(r'\s*-\s*(S\d+E\d+)\s*-\s*', r' \1 ', normalized_name)
-        
-        # 3. Limpiar espacios múltiples, guiones redundantes y guiones vacíos
-        normalized_name = re.sub(r'\s+', ' ', normalized_name)           # Espacios múltiples a uno
-        normalized_name = re.sub(r'\s*-\s*-\s*', ' - ', normalized_name) # -- a -
-        normalized_name = re.sub(r'\s+-\s+\.', '', normalized_name)      # - . (guion con punto vacío)
-        normalized_name = re.sub(r'\s*-\s*$', '', normalized_name)       # - al final
-        normalized_name = re.sub(r'^\s*-\s*', '', normalized_name)       # - al inicio
-        normalized_name = normalized_name.strip()
-        
-        # Si el nombre cambió, renombrar el archivo
-        if normalized_name != original_name:
-            new_path = file_path.parent / f"{normalized_name}{extension}"
-            
-            # Verificar que el nuevo nombre no exista ya
-            if new_path.exists():
-                self.logger.warning(f"No se puede renombrar a '{new_path.name}': el archivo ya existe")
-                return None
-            
-            try:
-                file_path.rename(new_path)
-                self.logger.info(f"✓ Archivo renombrado: '{file_path.name}' -> '{new_path.name}'")
-                return new_path
-            except Exception as e:
-                self.logger.error(f"Error renombrando archivo: {e}")
-                return None
-        
-        return None
+            return filename
+
+        # Construir nombre normalizado
+        before_match = filename[:match.start()].strip()
+        after_match = filename[match.end():].strip()
+
+        if before_match and after_match:
+            return f"{before_match} S{season}E{episode} {after_match}"
+        elif before_match:
+            return f"{before_match} S{season}E{episode}"
+        else:
+            return f"S{season}E{episode} {after_match}" if after_match else f"S{season}E{episode}"
+
+    def _clean_filename_formatting(self, filename: str) -> str:
+        """Limpia espacios múltiples, guiones redundantes y formato del nombre"""
+        import re
+
+        # Limpiar espacios y guiones
+        filename = re.sub(r'\s*-\s*(S\d+E\d+)\s*-\s*', r' \1 ', filename)
+        filename = re.sub(r'\s+', ' ', filename)
+        filename = re.sub(r'\s*-\s*-\s*', ' - ', filename)
+        filename = re.sub(r'\s*-\s*$', '', filename)
+        filename = re.sub(r'^\s*-\s*', '', filename)
+        return filename.strip()
+
+    def _rename_file_safely(self, file_path: Path, new_name: str, extension: str) -> Optional[Path]:
+        """Renombra un archivo de forma segura verificando conflictos"""
+        new_path = file_path.parent / f"{new_name}{extension}"
+
+        if new_path.exists():
+            self.logger.warning(f"No se puede renombrar a '{new_path.name}': el archivo ya existe")
+            return None
+
+        try:
+            file_path.rename(new_path)
+            self.logger.info(f"✓ Archivo renombrado: '{file_path.name}' -> '{new_path.name}'")
+            return new_path
+        except Exception as e:
+            self.logger.error(f"Error renombrando archivo: {e}")
+            return None
 
     def _clean_incomplete_compressed_files(self) -> Tuple[int, int]:
-        """Limpia archivos .compressed.mp4 incompletos y retorna (files_cleaned, files_added_to_pending)
-        Se ejecuta siempre para mantener el sistema limpio
+        """Limpia archivos .compressed.mp4 incompletos/corruptos y retorna (files_cleaned, files_added_to_pending)
+        Se ejecuta siempre para mantener el sistema limpio.
+        Detecta archivos corruptos mediante: tamaño < 10MB o validación con ffprobe
         """
         # Excluir archivos en carpetas temporales o de eliminación
         compressed_files_found = [
@@ -539,18 +597,67 @@ class MediaJellyProcessor:
         if len(compressed_files_found) == 0:
             return 0, 0
 
-        self.logger.info(f"Busco archivos {COMPRESSED_FILE_SUFFIX} incompletos... Encontrados: {len(compressed_files_found)}")
+        self.logger.info(f"{EmojiGenerator.magnifying_glass()} Buscando archivos {COMPRESSED_FILE_SUFFIX} incompletos/corruptos... Encontrados: {len(compressed_files_found)}")
 
         files_cleaned = 0
         files_added_to_pending = 0
-        failed_files_path = self.scripts_dir / "failed-compression.txt"
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
 
         # Carga archivos que han fallado previamente
         failed_files = self._load_failed_files(failed_files_path)
 
         for compressed_file in compressed_files_found:
             try:
-                # Busca el archivo original correspondiente
+                # Verifica si el archivo está corrupto
+                is_corrupt = False
+                corrupt_reason = ""
+                
+                # Verificación 1: Tamaño muy pequeño (< 10MB es sospechoso para archivos de video)
+                file_size = compressed_file.stat().st_size
+                if file_size < 10 * 1024 * 1024:  # 10MB
+                    is_corrupt = True
+                    corrupt_reason = f"muy pequeño ({file_size / (1024*1024):.1f}MB)"
+                
+                # Verificación 2: Validación con ffprobe si no es obviamente pequeño
+                if not is_corrupt:
+                    try:
+                        probe_cmd = [
+                            "ffprobe", "-v", "error",
+                            "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1",
+                            str(compressed_file)
+                        ]
+                        probe_result = subprocess.run(
+                            probe_cmd,
+                            capture_output=True,
+                            timeout=10,
+                            encoding='utf-8',
+                            errors='replace'
+                        )
+                        
+                        # Si ffprobe falla o no retorna duración válida, está corrupto
+                        if probe_result.returncode != 0:
+                            is_corrupt = True
+                            corrupt_reason = "no válido para ffprobe"
+                        else:
+                            duration_str = probe_result.stdout.strip()
+                            if not duration_str or duration_str == "N/A":
+                                is_corrupt = True
+                                corrupt_reason = "sin duración válida"
+                    except subprocess.TimeoutExpired:
+                        is_corrupt = True
+                        corrupt_reason = "timeout en validación"
+                    except Exception as e:
+                        is_corrupt = True
+                        corrupt_reason = f"error de validación: {str(e)}"
+                
+                # Si el archivo NO está corrupto, saltarlo
+                if not is_corrupt:
+                    continue
+                
+                # ARCHIVO CORRUPTO DETECTADO - Buscar el original
+                self.logger.warning(f"{EmojiGenerator.wastebasket()}  Archivo corrupto detectado ({corrupt_reason}): {compressed_file.name}")
+                
                 base_name = compressed_file.name.replace(COMPRESSED_FILE_SUFFIX, '')
                 parent_dir = compressed_file.parent
 
@@ -573,31 +680,30 @@ class MediaJellyProcessor:
                         files_cleaned += 1
                         continue
 
-                    self.logger.info(f"Elimino archivo incompleto: {compressed_file}")
-                    self.logger.info(f"Archivo original correspondiente encontrado: {original_file.name}")
+                    self.logger.info(f"{EmojiGenerator.refresh()} Archivo original encontrado: {original_file.name}")
 
-                    # Elimina el archivo temporal
+                    # Elimina el archivo corrupto
                     compressed_file.unlink()
                     files_cleaned += 1
 
-                    # SIEMPRE agregar de vuelta a pendientes cuando eliminamos un archivo incompleto
+                    # SIEMPRE agregar de vuelta a pendientes cuando eliminamos un archivo corrupto
                     # Esto asegura que el archivo original se reprocese
                     if original_file_str not in failed_files:
                         self._add_to_pending(original_file)
                         files_added_to_pending += 1
-                        self.logger.info(f"Archivo original agregado de vuelta a pendientes: {original_file.name}")
+                        self.logger.info(f"{EmojiGenerator.success()} Archivo agregado de vuelta a pendientes: {original_file.name}")
 
                 else:
                     # No encuentra archivo original, elimina el temporal huérfano
-                    self.logger.warning(f"Archivo temporal huérfano eliminado: {compressed_file}")
+                    self.logger.warning(f"{EmojiGenerator.wastebasket()}  Archivo corrupto huérfano eliminado: {compressed_file.name}")
                     compressed_file.unlink()
                     files_cleaned += 1
 
             except Exception as e:
-                self.logger.error(f"Error procesando archivo temporal {compressed_file}: {e}")
+                self.logger.error(f"Error procesando archivo {compressed_file}: {e}")
 
         if files_cleaned > 0:
-            self.logger.info(f"Limpieza completada: {files_cleaned} archivos {COMPRESSED_FILE_SUFFIX} eliminados, {files_added_to_pending} agregados de vuelta a pendientes")
+            self.logger.info(f"{EmojiGenerator.cleanup()} Limpieza completada: {files_cleaned} archivos corruptos eliminados, {files_added_to_pending} agregados a pendientes")
 
         return files_cleaned, files_added_to_pending
     
@@ -625,53 +731,64 @@ class MediaJellyProcessor:
 
     def _get_pending_files(self) -> List[Path]:
         """Obtiene archivos pendientes de procesamiento y normaliza sus nombres"""
+        if not self.pending_file.exists():
+            return []
+
         pending_files = []
         files_renamed = []
-        invalid_files = []  # Para archivos que no son videos
-        total_files_in_pending = 0  # Contador de archivos totales en pending
-        
-        # Extensiones de video válidas para procesamiento
-        VALID_VIDEO_EXTENSIONS = {'.mkv', '.avi', '.ts', '.mp4', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
-        
-        if self.pending_file.exists():
-            with open(self.pending_file, 'r') as f:
-                for line in f:
-                    file_path = line.strip()
-                    if file_path and Path(file_path).exists():
-                        total_files_in_pending += 1  # Contar todos los archivos
-                        original_path = Path(file_path)
-                        
-                        # FILTRO: Solo procesar archivos de video
-                        if original_path.suffix.lower() not in VALID_VIDEO_EXTENSIONS:
-                            invalid_files.append(str(original_path))
-                            self.logger.warning(f"Archivo no es video, removiendo de pending: {original_path.name} (extensión: {original_path.suffix})")
-                            continue
-                        
-                        # Normalizar nombre del archivo
-                        new_path = self._normalize_filename(original_path)
-                        
-                        if new_path:
-                            # El archivo fue renombrado
-                            files_renamed.append((str(original_path), str(new_path)))
-                            pending_files.append(new_path)
-                        else:
-                            # No se renombró, usar el path original
-                            pending_files.append(original_path)
-            
-            # Guardar el total de archivos encontrados en pending (antes de filtrar)
-            # Esto asegura que files_found refleje la cantidad real de archivos escaneados
-            # self.stats.files_found = total_files_in_pending  # Removido: ahora se setea después de filtrar
-            
-            # Si hubo archivos inválidos, actualizar pending para removerlos
-            if invalid_files:
-                self._remove_invalid_files_from_pending(invalid_files)
-                self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending-compression.txt")
-            
-            # Si hubo renombramientos, actualizar el archivo pending
-            if files_renamed:
-                self._update_pending_after_rename(files_renamed)
-        
+        invalid_files = []
+
+        # Procesar cada línea del archivo pending
+        with open(self.pending_file, 'r') as f:
+            for line in f:
+                file_path = line.strip()
+                if not file_path:
+                    continue
+
+                processed_file = self._process_pending_file_line(file_path, invalid_files, files_renamed)
+                if processed_file:
+                    pending_files.append(processed_file)
+
+        # Limpiar archivos inválidos del pending
+        if invalid_files:
+            self._remove_invalid_files_from_pending(invalid_files)
+            self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending-compression.txt")
+
+        # Actualizar pending después de renombramientos
+        if files_renamed:
+            self._update_pending_after_rename(files_renamed)
+
         return pending_files
+
+    def _process_pending_file_line(self, file_path: str, invalid_files: List[str], files_renamed: List[Tuple[str, str]]) -> Optional[Path]:
+        """Procesa una línea individual del archivo pending"""
+        original_path = Path(file_path)
+
+        # Verificar que el archivo existe
+        if not original_path.exists():
+            return None
+
+        # Filtrar archivos que no son videos
+        if not self._is_video_file(original_path):
+            invalid_files.append(str(original_path))
+            self.logger.warning(f"Archivo no es video, removiendo de pending: {original_path.name} (extensión: {original_path.suffix})")
+            return None
+
+        # Normalizar nombre del archivo
+        new_path = self._normalize_filename(original_path)
+
+        if new_path and new_path != original_path:
+            # El archivo fue renombrado
+            files_renamed.append((str(original_path), str(new_path)))
+            return new_path
+        else:
+            # No se renombró, usar el path original
+            return original_path
+
+    def _is_video_file(self, file_path: Path) -> bool:
+        """Verifica si un archivo es un video válido para procesamiento"""
+        VALID_VIDEO_EXTENSIONS = {'.mkv', '.avi', '.ts', '.mp4', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
+        return file_path.suffix.lower() in VALID_VIDEO_EXTENSIONS
     
     def _remove_invalid_files_from_pending(self, invalid_files: List[str]) -> None:
         """Remueve archivos inválidos (no-video) del archivo pending-compression.txt"""
@@ -721,6 +838,29 @@ class MediaJellyProcessor:
         
         self.logger.info(f"Archivo pending actualizado con {len(renamed_files)} renombramientos")
 
+    def _update_pending_file(self, old_path: str, new_path: str) -> None:
+        """Actualiza un archivo individual en pending-compression.txt después de renombrarlo"""
+        if not self.pending_file.exists():
+            return
+        
+        # Leer todas las líneas
+        with open(self.pending_file, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        
+        # Actualizar la línea correspondiente
+        updated_lines = []
+        for line in lines:
+            if line == old_path:
+                updated_lines.append(new_path)
+                self.logger.debug(f"Actualizado en pending: {old_path} -> {new_path}")
+            else:
+                updated_lines.append(line)
+        
+        # Reescribir el archivo
+        with open(self.pending_file, 'w') as f:
+            for line in updated_lines:
+                f.write(f"{line}\n")
+
     def _clean_pending_duplicates(self) -> int:
         """Limpia duplicados del archivo pending-compression.txt"""
         if not self.pending_file.exists():
@@ -765,7 +905,7 @@ class MediaJellyProcessor:
         if file_path_str not in existing_files:
             with open(self.pending_file, 'a') as f:
                 f.write(f"{file_path_str}\n")
-            self.logger.info(f"Archivo agregado a pendientes: {file_path_str}")
+            self.logger.debug(f"Archivo agregado a pendientes: {file_path_str}")
         else:
             self.logger.debug(f"Archivo ya existe en pendientes: {file_path_str}")
 
@@ -889,67 +1029,414 @@ class MediaJellyProcessor:
             "processed_files": {}
         }
     
-    def detect_language_streams(self, file_path: Path) -> Tuple[bool, str, str]:
-        """Detecta streams de audio y subtítulos en español"""
+    def _load_whisper_model(self):
+        """Carga el modelo Whisper de forma lazy (solo cuando se necesita)"""
+        if not self.whisper_enabled:
+            return False
+        
+        if self.whisper_model is None:
+            try:
+                self.logger.info(f"{EmojiGenerator.refresh()} Cargando modelo Whisper (base)...")
+                # Usar modelo 'base' (ya descargado - 140MB)
+                # Se carga ANTES de iniciar compresiones para evitar conflictos de memoria
+                self.whisper_model = whisper.load_model("base")
+                self.logger.info(f"{EmojiGenerator.success()} Modelo Whisper cargado exitosamente")
+                return True
+            except Exception as e:
+                import traceback
+                self.logger.error(f"{EmojiGenerator.error()} Error cargando modelo Whisper: {e}")
+                self.logger.error(f"Traceback: {traceback.format_exc()}")
+                # Deshabilitar permanentemente para esta sesión si falla
+                self.whisper_enabled = False
+                self.whisper_model = None
+                return False
+        return True
+    
+    def _load_language_cache(self) -> dict:
+        """Carga el caché de idiomas pre-detectados por mediajelly_language_detector.py"""
+        if self.language_cache_file.exists():
+            try:
+                with open(self.language_cache_file, 'r', encoding='utf-8') as f:
+                    cache = json.load(f)
+                self.logger.info(f"{EmojiGenerator.folder()} Caché de idiomas cargado: {len(cache)} archivos")
+                return cache
+            except Exception as e:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} Error cargando caché de idiomas: {e}")
+        return {}
+    
+    def _detect_language_with_whisper(self, audio_file: Path, file_duration: float = 0) -> Optional[str]:
+        """
+        Detecta el idioma usando Whisper analizando el archivo de audio.
+        Retorna el código ISO 639-2 del idioma detectado.
+        """
         try:
-            # Detecta audio en español
-            audio_cmd = [
-                "ffprobe", "-v", "error", "-select_streams", "a",
-                "-show_entries", STREAM_LANGUAGE_QUERY,
-                "-of", CSV_FORMAT_PARAM, str(file_path)
+            if not self._load_whisper_model():
+                return None
+            
+            # Mapeo de códigos ISO 639-1 a ISO 639-2 (usado por ffmpeg)
+            lang_map = {
+                'es': 'spa',
+                'en': 'eng',
+                'ja': 'jpn',
+                'fr': 'fra',
+                'de': 'deu',
+                'it': 'ita',
+                'pt': 'por',
+                'ko': 'kor',
+                'zh': 'chi',
+                'ru': 'rus',
+                'ar': 'ara'
+            }
+            
+            # Cargar audio
+            audio = whisper.load_audio(str(audio_file))
+            audio = whisper.pad_or_trim(audio)
+            
+            # Convertir a mel spectrogram
+            mel = whisper.log_mel_spectrogram(audio).to(self.whisper_model.device)
+            
+            # Detectar idioma
+            _, probs = self.whisper_model.detect_language(mel)
+            
+            # Obtener probabilidades de idiomas relevantes
+            spanish_prob = probs.get('es', 0.0)
+            
+            # Obtener top 5 idiomas
+            sorted_langs = sorted(probs.items(), key=lambda x: x[1], reverse=True)[:5]
+            detected_lang = sorted_langs[0][0]
+            confidence = sorted_langs[0][1]
+            
+            # Log solo del resultado principal (no mostrar top-5 para evitar saturar logs)
+            lang_code = lang_map.get(detected_lang, detected_lang)
+            # self.logger.info(f"   Whisper detectó: {detected_lang} ({lang_code}): {confidence:.2%}")
+            
+            # Retornar idioma detectado y probabilidades para votación
+            return detected_lang, probs
+            
+        except Exception as e:
+            self.logger.error(f"Error en detección Whisper: {e}")
+            return None, {}
+    
+    def _detect_language_with_multiple_samples(self, file_path: Path, stream_index: int, total_duration: float) -> Optional[str]:
+        """
+        Detecta idioma extrayendo 10 muestras aleatorias de 60s y votando por el idioma más detectado.
+        Guarda archivos temporales en tmp/ y los limpia al finalizar.
+        """
+        import random
+        
+        # Mapeo de códigos ISO 639-1 a ISO 639-2
+        lang_map = {
+            'es': 'spa', 'en': 'eng', 'ja': 'jpn', 'fr': 'fra',
+            'de': 'deu', 'it': 'ita', 'pt': 'por', 'ko': 'kor',
+            'zh': 'chi', 'ru': 'rus', 'ar': 'ara'
+        }
+        
+        try:
+            # Verificar que el archivo tenga suficiente duración
+            if total_duration < 120:  # Menos de 2 minutos
+                self.logger.info(f"{EmojiGenerator.warning_msg()} Archivo corto ({total_duration:.0f}s), usando muestra única")
+                num_samples = 1
+                sample_duration = min(30, total_duration - 10)
+            else:
+                num_samples = min(10, int(total_duration / 60))  # Máximo 10 muestras
+                sample_duration = 60
+            
+            self.logger.info(f"{EmojiGenerator.audio()} Analizando idioma con {num_samples} muestras de {sample_duration}s")
+            
+            # Generar timestamps aleatorios (evitando primeros y últimos 30s)
+            safe_start = 30
+            safe_end = total_duration - 30 - sample_duration
+            
+            if safe_end <= safe_start:
+                timestamps = [30]
+            else:
+                timestamps = sorted(random.sample(range(int(safe_start), int(safe_end)), min(num_samples, int(safe_end - safe_start))))
+            
+            # Contador de votos por idioma
+            language_votes = {}
+            temp_files = []
+            
+            for i, start_time in enumerate(timestamps):
+                # Crear archivo temporal en tmp/
+                temp_audio_path = self.tmp_dir / f"whisper_sample_{file_path.stem}_stream{stream_index}_sample{i}.wav"
+                temp_files.append(temp_audio_path)
+                
+                try:
+                    # Extraer muestra de audio
+                    extract_cmd = [
+                        "ffmpeg", "-hide_banner", "-y",
+                        "-ss", str(start_time),
+                        "-i", str(file_path),
+                        "-map", f"0:a:{stream_index}",
+                        "-t", str(sample_duration),
+                        "-ac", "1",
+                        "-ar", "16000",
+                        "-f", "wav",
+                        str(temp_audio_path)
+                    ]
+                    
+                    result = subprocess.run(
+                        extract_cmd,
+                        capture_output=True,
+                        timeout=MEDIUM_TIMEOUT
+                    )
+                    
+                    if result.returncode != 0:
+                        self.logger.warning(f"{EmojiGenerator.warning_msg()} Error extrayendo muestra {i+1} en segundo {start_time}")
+                        continue
+                    
+                    # Detectar idioma con Whisper
+                    detection_result = self._detect_language_with_whisper(temp_audio_path, total_duration)
+                    
+                    if detection_result and len(detection_result) == 2:
+                        detected_lang, probs = detection_result
+                        
+                        # Votar por el idioma detectado
+                        if detected_lang:
+                            language_votes[detected_lang] = language_votes.get(detected_lang, 0) + 1
+                            # Log simplificado (solo cuando cambia el idioma dominante o cada 3 muestras)
+                            if i == 0 or i % 3 == 0 or detected_lang != list(language_votes.keys())[-1]:
+                                self.logger.info(f"   Muestra {i+1}/{len(timestamps)}: {detected_lang} ({probs.get(detected_lang, 0):.1%})")
+                    
+                except Exception as e:
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Error procesando muestra {i+1}: {e}")
+                    continue
+            
+            # Limpiar archivos temporales
+            for temp_file in temp_files:
+                try:
+                    if temp_file.exists():
+                        temp_file.unlink()
+                except Exception as e:
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Error eliminando archivo temporal {temp_file}: {e}")
+            
+            if not language_votes:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo detectar idioma en ninguna muestra")
+                return 'spa'  # Fallback a español
+            
+            # Determinar idioma ganador por votación
+            winner_lang = max(language_votes.items(), key=lambda x: x[1])
+            winner_code = lang_map.get(winner_lang[0], winner_lang[0])
+            
+            # Log resumido de votación (solo top 3)
+            top_3_votes = sorted(language_votes.items(), key=lambda x: x[1], reverse=True)[:3]
+            votes_summary = ", ".join([f"{lang_map.get(lang, lang)}:{votes}" for lang, votes in top_3_votes])
+            self.logger.info(f"🏆 Votación: {votes_summary} ({len(timestamps)} muestras)")
+            
+            # Aplicar reglas específicas para contenido latino
+            spanish_votes = language_votes.get('es', 0)
+            total_votes = len(timestamps)
+            
+            # Si español tiene al menos 30% de los votos, usarlo
+            if spanish_votes / total_votes >= 0.30:
+                self.logger.info(f"{EmojiGenerator.success()} Español con {spanish_votes}/{total_votes} votos ({spanish_votes/total_votes*100:.1f}%) - Usando español")
+                return 'spa'
+            
+            # Si el ganador tiene menos del 50% de votos y español está presente, usar español
+            if winner_lang[1] / total_votes < 0.50 and spanish_votes > 0:
+                self.logger.info(f"{EmojiGenerator.success()} Confianza baja del ganador ({winner_lang[1]}/{total_votes}), español presente - Usando español")
+                return 'spa'
+            
+            self.logger.info(f"{EmojiGenerator.success()} Idioma final seleccionado: {winner_lang[0]} ({winner_code})")
+            return winner_code
+            
+        except Exception as e:
+            self.logger.error(f"Error en detección multi-muestra: {e}")
+            return 'spa'  # Fallback a español
+    
+    def detect_audio_language(self, file_path: Path, stream_index: int) -> Optional[str]:
+        """
+        Detecta el idioma de una pista de audio usando el caché pre-analizado.
+        Si no está en caché, NO asume ningún idioma (retorna None).
+        """
+        try:
+            # Normalizar la ruta para comparación consistente
+            file_path_resolved = file_path.resolve()
+            file_path_str = str(file_path_resolved)
+            
+            # Crear ruta relativa al directorio media para búsqueda en caché
+            relative_path = None
+            if '/media/' in file_path_str:
+                relative_path = file_path_str.split('/media/', 1)[1]
+            
+            # Paso 1: Verificar caché de idiomas pre-detectados
+            cached_lang = None
+            if relative_path and relative_path in self.language_cache:
+                stream_idx_str = str(stream_index)
+                if stream_idx_str in self.language_cache[relative_path]:
+                    cached_lang = self.language_cache[relative_path][stream_idx_str]
+                    self.logger.info(f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index})")
+                    return cached_lang
+            elif file_path_str in self.language_cache:  # Fallback a ruta absoluta
+                stream_idx_str = str(stream_index)
+                if stream_idx_str in self.language_cache[file_path_str]:
+                    cached_lang = self.language_cache[file_path_str][stream_idx_str]
+                    self.logger.info(f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index})")
+                    return cached_lang
+                else:
+                    self.logger.debug(f"{EmojiGenerator.warning_msg()} Archivo en caché pero stream {stream_index} no encontrado: {file_path.name}")
+            else:
+                # Debug: mostrar algunas claves del caché para verificar formato de rutas
+                if self.language_cache:
+                    cache_keys = list(self.language_cache.keys())[:3]
+                    self.logger.debug(f"{EmojiGenerator.warning_msg()} Archivo no en caché: {file_path_str}")
+                    if relative_path:
+                        self.logger.debug(f"{EmojiGenerator.warning_msg()} Ruta relativa no en caché: {relative_path}")
+                    self.logger.debug(f"{EmojiGenerator.clipboard()} Ejemplos de rutas en caché: {cache_keys}")
+            
+            # Paso 2: Intentar detección por metadatos (solo si hay metadatos claros)
+            cmd = [
+                "ffprobe", "-v", "error", "-select_streams", f"a:{stream_index}",
+                "-show_entries", "stream=codec_name:stream_tags=title,handler_name",
+                "-of", "csv=p=0", str(file_path)
             ]
-            audio_result = subprocess.run(
-                audio_cmd, 
-                capture_output=True, 
-                timeout=MEDIUM_TIMEOUT,
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=SHORT_TIMEOUT,
                 encoding='utf-8',
                 errors='replace'
             )
-            audio_languages = audio_result.stdout.strip()
             
-            # Detecta subtítulos en español
-            subs_cmd = [
-                "ffprobe", "-v", "error", "-select_streams", "s",
-                "-show_entries", STREAM_LANGUAGE_QUERY,
-                "-of", CSV_FORMAT_PARAM, str(file_path)
+            if result.returncode == 0 and result.stdout.strip():
+                metadata = result.stdout.strip().lower()
+                
+                # Buscar patrones en metadatos que indiquen idioma
+                spanish_patterns = ['spanish', 'español', 'castellano', 'spa', 'esp', 'latino', 'lat']
+                english_patterns = ['english', 'inglés', 'eng']
+                japanese_patterns = ['japanese', 'japonés', 'jpn', 'jap']
+                
+                for pattern in spanish_patterns:
+                    if pattern in metadata:
+                        self.logger.info(f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (español) en stream {stream_index}: {file_path.name}")
+                        return 'spa'
+                
+                for pattern in english_patterns:
+                    if pattern in metadata:
+                        self.logger.info(f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (inglés) en stream {stream_index}: {file_path.name}")
+                        return 'eng'
+                
+                for pattern in japanese_patterns:
+                    if pattern in metadata:
+                        self.logger.info(f"{EmojiGenerator.clipboard()} Idioma detectado por metadatos (japonés) en stream {stream_index}: {file_path.name}")
+                        return 'jpn'
+            
+            # Paso 3: NO asumir ningún idioma por defecto - retornar None
+            self.logger.info(f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma detectado (no en caché, no metadatos): {file_path.name}")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error detectando idioma de audio en stream {stream_index} de {file_path}: {e}")
+            return None  # No asumir idioma en caso de error
+    
+    def detect_language_streams(self, file_path: Path) -> Tuple[bool, List[int], List[int], Dict[int, str]]:
+        """
+        Detecta streams de audio y subtítulos en español y devuelve índices.
+        También detecta y etiqueta streams sin idioma.
+        Retorna: (has_spanish, audio_indices, sub_indices, audio_languages)
+        """
+        try:
+            # Comando para detectar todos los streams (audio y subtítulos)
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "stream=index,codec_type:stream_tags=language",
+                "-of", "csv=p=0", str(file_path)
             ]
-            subs_result = subprocess.run(
-                subs_cmd, 
+            
+            result = subprocess.run(
+                cmd, 
                 capture_output=True, 
-                timeout=MEDIUM_TIMEOUT,
+                timeout=SHORT_TIMEOUT,
                 encoding='utf-8',
                 errors='replace'
             )
-            sub_languages = subs_result.stdout.strip()
             
-            # Verifica si hay español
-            spanish_patterns = ['spa', 'esp', 'es', 'es-LA', 'es-ES', 'lat']
-            has_spanish_audio = any(pattern in audio_languages.lower() for pattern in spanish_patterns)
-            has_spanish_subs = any(pattern in sub_languages.lower() for pattern in spanish_patterns)
+            lines = result.stdout.strip().split('\n')
+            audio_indices = []
+            sub_indices = []
+            audio_languages = {}  # Mapeo de índice relativo de audio a idioma
+            audio_stream_counter = 0
+            seen_indices = set()  # Para evitar duplicados en archivos con múltiples programas
             
-            return (has_spanish_audio or has_spanish_subs), audio_languages, sub_languages
+            # Solo loguear si hay streams sin etiquetar
+            needs_detection = any('und' in line or line.split(',')[2] == '' for line in lines if ',' in line and len(line.split(',')) >= 3 and line.split(',')[0].isdigit())
+            if needs_detection:
+                self.logger.info(f"{EmojiGenerator.magnifying_glass()} Detectando idiomas en {file_path.name}")
             
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Timeout detectando idiomas: {file_path}")
-            return False, "", ""
+            for line in lines:
+                if line.strip():
+                    parts = line.split(',')
+                    if len(parts) >= 2 and parts[0].isdigit():  # Verificar que el primer campo sea un número
+                        index = int(parts[0])
+                        
+                        # Evitar procesar el mismo stream múltiples veces (archivos con programas múltiples)
+                        if index in seen_indices:
+                            continue
+                        seen_indices.add(index)
+                        
+                        codec_type = parts[1] if len(parts) > 1 else ''
+                        lang = parts[2].lower() if len(parts) > 2 else ''
+                        
+                        if codec_type == 'audio':
+                            # Si no tiene etiqueta de idioma, detectarlo
+                            if not lang or lang == 'und':
+                                self.logger.info(f"{EmojiGenerator.audio()} Stream audio {audio_stream_counter} (índice absoluto {index}) sin etiqueta ('{lang}'), iniciando detección...")
+                                # Pasar el índice absoluto del stream
+                                detected_lang = self.detect_audio_language(file_path, index)
+                                if detected_lang:
+                                    lang = detected_lang
+                                    self.logger.info(f"{EmojiGenerator.success()} Idioma detectado: {detected_lang} para stream audio {audio_stream_counter}")
+                                else:
+                                    self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo detectar idioma para stream audio {audio_stream_counter}")
+                            
+                            # Guardar el idioma del stream usando el índice relativo de audio
+                            audio_languages[audio_stream_counter] = lang
+                            
+                            # Verificar si es español
+                            if any(pattern in lang for pattern in ['spa', 'esp', 'es', 'lat']):
+                                audio_indices.append(audio_stream_counter)
+                            
+                            audio_stream_counter += 1
+                            
+                        elif codec_type == 'subtitle':
+                            if any(pattern in lang for pattern in ['spa', 'esp', 'es', 'lat']):
+                                sub_indices.append(index)
+            
+            has_spanish = len(audio_indices) > 0 or len(sub_indices) > 0
+            
+            return has_spanish, audio_indices, sub_indices, audio_languages
+            
         except Exception as e:
             self.logger.error(f"Error detectando idiomas en {file_path}: {e}")
-            return False, "", ""
+            return False, [], [], {}
     
     def _validate_file_for_compression(self, file_path: Path) -> Tuple[bool, str]:
-        """Valida si el archivo necesita compresión"""
+        """Valida si el archivo necesita compresión con validaciones rápidas primero"""
+        # Validaciones rápidas primero
         if not file_path.exists():
             return False, f"Archivo no encontrado: {file_path}"
         
-        # Verifica si ya está comprimido
-        if file_path.suffix.lower() == '.mp4' and file_path.stat().st_size < 50 * 1024 * 1024:  # Menos de 50MB
-            return False, "archivo_pequeno"
+        try:
+            stat = file_path.stat()
+            file_size = stat.st_size
+            
+            # Verifica tamaño mínimo para compresión (archivos muy pequeños no necesitan compresión)
+            if file_path.suffix.lower() == '.mp4' and file_size < 50 * 1024 * 1024:  # Menos de 50MB
+                return False, "archivo_pequeno"
+            
+            # Verifica que no sea un archivo vacío o corrupto básicamente
+            if file_size == 0:
+                return False, f"Archivo vacío: {file_path}"
+                
+        except OSError as e:
+            return False, f"Error accediendo al archivo: {file_path} - {str(e)}"
         
-        # Verifica que el archivo no esté corrupto usando ffprobe
+        # Validación con ffprobe (más costosa, pero necesaria)
         try:
             probe_cmd = [
                 "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "csv=p=0", str(file_path)
+                "-of", CSV_FORMAT_PARAM, str(file_path)
             ]
             probe_result = subprocess.run(
                 probe_cmd, 
@@ -982,201 +1469,220 @@ class MediaJellyProcessor:
         
         return True, ""
 
-    def _detect_streams(self, file_path: Path) -> tuple[bool, bool, list, list]:
-        """Detecta streams de audio y subtítulos disponibles"""
+    def _get_video_codec(self, file_path: Path) -> str:
+        """Detecta el codec de video del archivo"""
         try:
-            # Primero verifica streams de audio
-            audio_cmd = [
-                "ffprobe", "-v", "error", "-select_streams", "a",
-                "-show_entries", STREAM_LANGUAGE_QUERY,
-                "-of", CSV_FORMAT_PARAM, str(file_path)
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(file_path)
             ]
-            audio_result = subprocess.run(
-                audio_cmd, 
-                capture_output=True, 
+            result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
                 timeout=SHORT_TIMEOUT,
                 encoding='utf-8',
                 errors='replace'
             )
-            audio_streams = audio_result.stdout.strip().split('\n') if audio_result.stdout.strip() else []
             
-            # Verifica streams de subtítulos
-            subs_cmd = [
-                "ffprobe", "-v", "error", "-select_streams", "s",
-                "-show_entries", STREAM_LANGUAGE_QUERY,
-                "-of", CSV_FORMAT_PARAM, str(file_path)
-            ]
-            subs_result = subprocess.run(
-                subs_cmd, 
-                capture_output=True, 
-                timeout=SHORT_TIMEOUT,
-                encoding='utf-8',
-                errors='replace'
-            )
-            sub_streams = subs_result.stdout.strip().split('\n') if subs_result.stdout.strip() else []
-            
-            has_audio_stream = len(audio_streams) > 0 and audio_streams[0] != ''
-            has_subtitle_stream = len(sub_streams) > 0 and sub_streams[0] != ''
-            
-            return has_audio_stream, has_subtitle_stream, audio_streams, sub_streams
-            
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as e:
-            self.logger.warning(f"Error detectando streams, usando fallback: {e}")
-            return True, False, [], []
-    
-    def _add_audio_mapping(self, ffmpeg_cmd: list, has_spanish: bool, audio_streams: list) -> None:
-        """Agrega mapeo de audio al comando ffmpeg"""
-        if has_spanish and audio_streams:
-            # Busca streams de audio en español
-            spanish_audio_found = any(
-                any(lang in stream_info.lower() for lang in ['spa', 'esp', 'es', 'lat'])
-                for stream_info in audio_streams
-            )
-            
-            if spanish_audio_found:
-                # Mapea audio en español si existe
-                ffmpeg_cmd.extend([
-                    "-map", "0:a:m:language:spa?",
-                    "-map", "0:a:m:language:esp?", 
-                    "-map", "0:a:m:language:es?",
-                    "-map", "0:a:m:language:lat?"
-                ])
-            else:
-                # Si no hay español, mapeo del primer audio
-                ffmpeg_cmd.extend(["-map", FIRST_AUDIO_STREAM])
-        else:
-            # Mapeo del primer stream de audio (más seguro)
-            ffmpeg_cmd.extend(["-map", FIRST_AUDIO_STREAM])
+            if result.returncode == 0:
+                return result.stdout.strip().lower()
+        except Exception as e:
+            self.logger.warning(f"Error detectando codec: {e}")
         
-        # Configuración de audio mejorada
-        ffmpeg_cmd.extend([
-            "-c:a", "aac",
-            "-b:a", "256k",  # Mejor calidad de audio
-            "-ac", "2",
-            "-ar", "48000"   # Sample rate consistente
-        ])
-    
-    def _add_subtitle_mapping(self, ffmpeg_cmd: list, has_spanish: bool, sub_streams: list) -> None:
-        """Agrega mapeo de subtítulos al comando ffmpeg"""
-        if not sub_streams:
-            return
-            
-        # Busca subtítulos en español
-        spanish_subs_found = any(
-            any(lang in stream_info.lower() for lang in ['spa', 'esp', 'es', 'lat'])
-            for stream_info in sub_streams
-        )
-        
-        if has_spanish and spanish_subs_found:
-            ffmpeg_cmd.extend([
-                "-map", "0:s:m:language:spa?",
-                "-map", "0:s:m:language:esp?",
-                "-map", "0:s:m:language:es?",
-                "-map", "0:s:m:language:lat?",
-                "-c:s", "mov_text"
-            ])
+        return ""
 
-    def _build_ffmpeg_command(self, file_path: Path, temp_output: Path, has_spanish: bool) -> List[str]:
-        """Construye comando ffmpeg optimizado con mejor manejo de errores"""
+    def _build_remux_command(self, file_path: Path, temp_output: Path, audio_indices: List[int], sub_indices: List[int], audio_languages: Dict[int, str] = None) -> List[str]:
+        """Construye comando ffmpeg para remux (sin recodificación) - Para archivos AV1"""
+        if audio_languages is None:
+            audio_languages = {}
+            
         ffmpeg_cmd = [
             "ffmpeg", "-hide_banner", "-y",
-            "-hwaccel", "vaapi",  # Decodificación por hardware
-            "-hwaccel_device", VAAPI_DEVICE_PATH,
             "-i", str(file_path),
-            "-vf", "format=nv12,hwupload",
-            "-c:v", "h264_vaapi",
-            "-qp", "28",  # Calidad constante más conservadora
-            "-low_power", "1",  # Usa codificación de bajo consumo (más eficiente)
-            "-max_muxing_queue_size", "1024"  # Buffer más grande para evitar pérdidas
+            "-c:v", "copy",  # Copiar video sin recodificar
         ]
         
-        # Detecta streams disponibles de forma más robusta
-        has_audio_stream, has_subtitle_stream, audio_streams, sub_streams = self._detect_streams(file_path)
-        
-        # Mapeo de video (siempre presente)
+        # Mapeo de streams de video
         ffmpeg_cmd.extend(["-map", "0:v:0"])
         
-        # Mapeo de audio más robusto
-        if has_audio_stream:
-            self._add_audio_mapping(ffmpeg_cmd, has_spanish, audio_streams)
+        # Audio: mapear español si existe, sino el primero
+        audio_map_count = 0
+        if audio_indices:
+            for idx in audio_indices:
+                ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
+                # Aplicar etiqueta de idioma si está disponible
+                if idx in audio_languages:
+                    ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                audio_map_count += 1
+            # Si hay audio en español, copiar sin convertir
+            ffmpeg_cmd.extend(["-c:a", "copy"])
+        else:
+            ffmpeg_cmd.extend(["-map", "0:a:0"])
+            # Aplicar etiqueta de idioma al primer audio si está disponible
+            if 0 in audio_languages:
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
+            # Si no hay audio en español, copiar el original sin convertir
+            ffmpeg_cmd.extend(["-c:a", "copy"])
         
-        # Mapeo de subtítulos más robusto
-        if has_subtitle_stream and has_spanish:
-            self._add_subtitle_mapping(ffmpeg_cmd, has_spanish, sub_streams)
+        # Subtítulos: mapear español si existe, sino el primero
+        if sub_indices:
+            for idx in sub_indices:
+                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+        else:
+            ffmpeg_cmd.extend(["-map", "0:s:0?"])
         
-        # Configuración final con parámetros anti-corrupción
+        # Convertir subtítulos a mov_text para MP4
+        ffmpeg_cmd.extend(["-c:s", "mov_text"])
+        
+        # Copiar metadatos
+        ffmpeg_cmd.extend(["-map_metadata", "0"])
+        
+        # Configuración final
         ffmpeg_cmd.extend([
-            "-movflags", "+faststart+frag_keyframe+empty_moov",  # Mejor estructura MP4
-            "-fflags", "+genpts",  # Regenera timestamps si es necesario
-            "-avoid_negative_ts", "make_zero",  # Evita timestamps negativos
+            "-movflags", MOVFLAGS_FASTSTART,
             str(temp_output)
         ])
         
         return ffmpeg_cmd
 
-    def _build_fallback_ffmpeg_command(self, file_path: Path, temp_output: Path) -> List[str]:
+
+    def _build_ffmpeg_command(self, file_path: Path, temp_output: Path, audio_indices: List[int], sub_indices: List[int], audio_languages: Dict[int, str] = None) -> List[str]:
+        """Construye comando ffmpeg optimizado"""
+        if audio_languages is None:
+            audio_languages = {}
+            
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-probesize", "50M",  # Aumentar para análisis completo
+            "-analyzeduration", "50M",  # Aumentar para análisis completo
+            "-hwaccel", "vaapi",
+            "-hwaccel_device", VAAPI_DEVICE_PATH,
+            "-hwaccel_output_format", "vaapi",
+            "-i", str(file_path),
+            "-c:v", "h264_vaapi",
+            "-qp", "28",
+            "-low_power", "1",
+            "-max_muxing_queue_size", "1024"
+        ]
+        
+        # Mapeo de streams
+        ffmpeg_cmd.extend(["-map", "0:v:0"])  # Video
+        
+        # Audio: mapear español si existe, sino el primero
+        audio_map_count = 0
+        if audio_indices:
+            for idx in audio_indices:
+                ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
+                # Aplicar etiqueta de idioma si está disponible
+                if idx in audio_languages:
+                    ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                audio_map_count += 1
+        else:
+            ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
+            # Aplicar etiqueta de idioma al primer audio si está disponible
+            if 0 in audio_languages:
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
+        
+        # Subtítulos: mapear español si existe, sino el primero (? = opcional)
+        if sub_indices:
+            for idx in sub_indices:
+                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+        else:
+            ffmpeg_cmd.extend(["-map", "0:s:0?"])  # Primer subtítulo si existe
+        
+        # Audio config
+        ffmpeg_cmd.extend([
+            "-c:a", "aac",
+            "-b:a", "256k",
+            "-ac", "2",
+            "-ar", "48000"
+        ])
+        
+        # Subtítulos config: convertir a mov_text para compatibilidad con MP4
+        ffmpeg_cmd.extend(["-c:s", "mov_text"])
+        
+        # Copiar metadatos principales
+        ffmpeg_cmd.extend(["-map_metadata", "0"])
+        
+        # Configuración final
+        ffmpeg_cmd.extend([
+            "-movflags", MOVFLAGS_FASTSTART,
+            "-avoid_negative_ts", "make_zero",
+            str(temp_output)
+        ])
+        
+        return ffmpeg_cmd
+
+    def _build_fallback_ffmpeg_command(self, file_path: Path, temp_output: Path, audio_indices: List[int], sub_indices: List[int], audio_languages: Dict[int, str] = None) -> List[str]:
         """Construye comando ffmpeg fallback sin aceleración de hardware"""
-        is_ts_file = file_path.suffix.lower() == '.ts'
+        if audio_languages is None:
+            audio_languages = {}
+            
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-probesize", "50M",  # Aumentar para análisis completo
+            "-analyzeduration", "50M",  # Aumentar para análisis completo
+            "-i", str(file_path)
+        ]
         
-        ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-y"]
-        
-        # Para archivos .ts (MPEG-TS), usar parámetros especiales de decodificación
-        if is_ts_file:
-            ffmpeg_cmd.extend([
-                "-fflags", "+genpts+igndts",  # Genera PTS y ignora DTS corruptos
-                "-analyzeduration", "10M",     # Analiza más del archivo para detectar streams
-                "-probesize", "10M",           # Tamaño de sondeo más grande
-                "-err_detect", "ignore_err"    # Ignora errores de decodificación menores
-            ])
-        
-        ffmpeg_cmd.extend(["-i", str(file_path)])
-        
-        # Configuración de video
+        # Video config
         ffmpeg_cmd.extend([
             "-c:v", "libx264",
-            "-preset", "medium",  # Balance entre velocidad y calidad
-            "-crf", "23",         # Calidad ligeramente mejor para compensar problemas de .ts
-            "-profile:v", "high", # Perfil H.264 high para mejor compatibilidad
-            "-level", "4.1",      # Nivel compatible con la mayoría de dispositivos
+            "-preset", "fast",  # Más rápido
+            "-crf", "23",
+            "-map", "0:v:0"
         ])
         
-        # Mapeo de video
-        ffmpeg_cmd.extend(["-map", "0:v:0"])
+        # Audio: mapear español si existe, sino el primero
+        audio_map_count = 0
+        if audio_indices:
+            for idx in audio_indices:
+                ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
+                # Aplicar etiqueta de idioma si está disponible
+                if idx in audio_languages:
+                    ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                audio_map_count += 1
+        else:
+            ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
+            # Aplicar etiqueta de idioma al primer audio si está disponible
+            if 0 in audio_languages:
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
         
-        # Mapeo de audio con mejor manejo de errores
+        # Subtítulos: mapear español si existe, sino el primero (? = opcional)
+        if sub_indices:
+            for idx in sub_indices:
+                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+        else:
+            ffmpeg_cmd.extend(["-map", "0:s:0?"])  # Primer subtítulo si existe
+        
+        # Audio config
         ffmpeg_cmd.extend([
-            "-map", "0:a:0?",     # El ? hace que sea opcional
             "-c:a", "aac",
-            "-b:a", "256k",       # Mejor calidad para fallback
+            "-b:a", "256k",
             "-ac", "2",
-            "-ar", "48000"        # Sample rate estándar
+            "-ar", "48000"
         ])
         
-        # No incluir subtítulos en fallback para simplicidad y estabilidad
+        # Subtítulos config: convertir a mov_text para compatibilidad con MP4
+        ffmpeg_cmd.extend(["-c:s", "mov_text"])
         
-        # Configuración final con parámetros anti-corrupción mejorados
+        # Copiar metadatos principales
+        ffmpeg_cmd.extend(["-map_metadata", "0"])
+        
+        # Final config
         ffmpeg_cmd.extend([
-            "-max_muxing_queue_size", "9999",  # Buffer muy grande para .ts problemáticos
-            "-movflags", "+faststart",         # Optimización para streaming
-            "-f", "mp4",                       # Forzar formato MP4 de salida
-        ])
-        
-        # Para archivos .ts, agregar parámetros adicionales de corrección
-        if is_ts_file:
-            ffmpeg_cmd.extend([
-                "-async", "1",                 # Sincronización de audio mejorada
-                "-vsync", "cfr"                # Frame rate constante para evitar problemas
-            ])
-        
-        ffmpeg_cmd.extend([
-            "-avoid_negative_ts", "make_zero", # Evita timestamps negativos
+            "-movflags", MOVFLAGS_FASTSTART,
+            "-avoid_negative_ts", "make_zero",
             str(temp_output)
         ])
         
         return ffmpeg_cmd
 
-    def _validate_compressed_file(self, compressed_file: Path, original_file: Path) -> Tuple[bool, str]:
-        """Valida la integridad del archivo comprimido y verifica que tenga streams de audio"""
+    def _validate_compressed_file(self, compressed_file: Path) -> Tuple[bool, str]:
+        """Valida la integridad del archivo comprimido de forma simplificada"""
         try:
             # Verifica que el archivo exista y tenga tamaño
             if not compressed_file.exists() or compressed_file.stat().st_size == 0:
@@ -1184,72 +1690,44 @@ class MediaJellyProcessor:
             
             # Verifica integridad básica con ffprobe
             probe_cmd = [
-                "ffprobe", "-v", "quiet", "-print_format", "json", 
-                "-show_streams", "-show_format", str(compressed_file)
+                "ffprobe", "-v", "quiet", "-show_format", str(compressed_file)
             ]
             
-            # Usar encoding robusto para manejar caracteres no-UTF-8 en metadatos
             result = subprocess.run(
                 probe_cmd, 
                 capture_output=True, 
-                timeout=MEDIUM_TIMEOUT,
+                timeout=SHORT_TIMEOUT,
                 encoding='utf-8',
-                errors='replace'  # Reemplaza caracteres inválidos con �
+                errors='replace'
             )
             
             if result.returncode != 0:
-                return False, f"FFprobe falló: {result.stderr[:200]}"
+                return False, "FFprobe falló: archivo corrupto"
             
-            # Parsea JSON de ffprobe
-            import json
-            try:
-                probe_data = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                return False, "Error parseando salida de ffprobe"
+            # Verifica que tenga duración razonable
+            duration_cmd = [
+                "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                "-of", CSV_FORMAT_PARAM, str(compressed_file)
+            ]
             
-            # Verifica que tenga streams
-            streams = probe_data.get('streams', [])
-            if not streams:
-                return False, "No se encontraron streams en el archivo"
+            duration_result = subprocess.run(
+                duration_cmd,
+                capture_output=True,
+                timeout=SHORT_TIMEOUT,
+                encoding='utf-8',
+                errors='replace'
+            )
             
-            # Verifica que tenga al menos un stream de video
-            video_streams = [s for s in streams if s.get('codec_type') == 'video']
-            if not video_streams:
-                return False, "No se encontró stream de video"
+            if duration_result.returncode == 0:
+                duration_str = duration_result.stdout.strip()
+                try:
+                    duration = float(duration_str)
+                    if duration < 10.0:
+                        return False, f"Archivo demasiado corto ({duration:.1f}s)"
+                except ValueError:
+                    pass  # No crítico si no se puede leer la duración
             
-            # Verifica que tenga al menos un stream de audio
-            audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
-            if not audio_streams:
-                return False, "No se encontraron streams de audio"
-            
-            # Verifica duración similar al original (±5 segundos de tolerancia)
-            try:
-                compressed_duration = float(probe_data.get('format', {}).get('duration', 0))
-                
-                # Obtiene duración del archivo original
-                original_probe_cmd = [
-                    "ffprobe", "-v", "quiet", "-print_format", "json", 
-                    "-show_format", str(original_file)
-                ]
-                original_result = subprocess.run(
-                    original_probe_cmd, 
-                    capture_output=True, 
-                    timeout=MEDIUM_TIMEOUT,
-                    encoding='utf-8',
-                    errors='replace'  # Reemplaza caracteres inválidos
-                )
-                
-                if original_result.returncode == 0:
-                    original_data = json.loads(original_result.stdout)
-                    original_duration = float(original_data.get('format', {}).get('duration', 0))
-                    
-                    if abs(compressed_duration - original_duration) > 60.0:
-                        return False, f"Duración muy diferente: original={original_duration:.1f}s, comprimido={compressed_duration:.1f}s"
-                        
-            except ValueError:
-                self.logger.warning(f"No se pudo verificar duración de {compressed_file.name}")
-            
-            return True, f"Archivo válido: {len(video_streams)} video, {len(audio_streams)} audio"
+            return True, "Archivo válido"
             
         except subprocess.TimeoutExpired:
             return False, "Timeout validando archivo"
@@ -1258,19 +1736,22 @@ class MediaJellyProcessor:
 
     def _process_compression_result(self, process: subprocess.CompletedProcess, 
                                   file_path: Path, temp_output: Path, 
-                                  elapsed_time: float, used_gpu: bool = True, has_spanish: bool = False) -> Dict:
+                                  elapsed_time: float, used_gpu: bool = True) -> Dict:
         """Procesa el resultado de la compresión"""
         if process.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 1024:  # Mínimo 1KB
-            return self._handle_successful_compression(temp_output, file_path, elapsed_time, used_gpu, has_spanish)
+            return self._handle_successful_compression(temp_output, file_path, elapsed_time, used_gpu)
         else:
             return self._handle_failed_compression(process, file_path, temp_output)
 
-    def _handle_successful_compression(self, temp_output: Path, file_path: Path, elapsed_time: float, used_gpu: bool, has_spanish: bool) -> Dict:
+    def _handle_successful_compression(self, temp_output: Path, file_path: Path, elapsed_time: float, used_gpu: bool) -> Dict:
         """Maneja el caso de compresión exitosa"""
         result = {'compressed': False, 'renamed': False, 'success': True, 'error': None, 'no_spanish': False, 'skipped': False}
         
+        # Inicializar la ruta final (por defecto es la original)
+        final_name = file_path
+        
         # Validación
-        is_valid, validation_msg = self._validate_compressed_file(temp_output, file_path)
+        is_valid, validation_msg = self._validate_compressed_file(temp_output)
         
         if not is_valid:
             self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
@@ -1278,7 +1759,7 @@ class MediaJellyProcessor:
             if temp_output.exists():
                 temp_output.unlink()
             # Marcar como fallido para evitar reintentos
-            failed_files_path = self.scripts_dir / "failed-compression.txt"
+            failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
             self._add_to_failed_files(str(file_path), failed_files_path, f"Validación fallida: {validation_msg}")
             return result
         
@@ -1290,66 +1771,66 @@ class MediaJellyProcessor:
         
         if compressed_size >= original_size:
             method_str = "GPU" if used_gpu else "CPU"
-            self.logger.info(f"Archivo comprimido es mayor, renombrando ({method_str}): {file_path.name}")
+            self.logger.info(f"Archivo comprimido es mayor, pero renombrando a MP4 con metadatos ({method_str}): {file_path.name}")
+            # Renombrar a .mp4 con metadatos aplicados
             final_name = file_path.with_suffix('.mp4')
-            temp_output.rename(final_name)
-            file_path.unlink()
+            temp_output.replace(final_name)
+            file_path.unlink()  # Eliminar el original
             result['renamed'] = True
+            result['compressed'] = True  # Contar como procesado
             result['original_size'] = original_size
             result['compressed_size'] = compressed_size
             
-            # Sin mejoras de calidad aplicadas
+            # Actualizar pending si cambió extensión
+            self._update_pending_file(file_path, final_name)
         else:
             reduction_percent = ((original_size - compressed_size) / original_size) * 100
             method_str = "GPU" if used_gpu else "CPU"
             self.logger.info(f"Compresión {method_str} exitosa: {file_path.name} ({elapsed_time:.1f}s, -{reduction_percent:.1f}%)")
-            file_path.unlink()
+            
+            # Crear el nombre final con extensión .mp4
             final_name = file_path.with_suffix('.mp4')
+            
+            # Renombrar el archivo comprimido
             temp_output.rename(final_name)
+            
+            # Si el archivo original no es .mp4, eliminarlo
+            if file_path.suffix.lower() != '.mp4':
+                self.logger.info(f"Eliminando archivo original: {file_path.name}")
+                try:
+                    file_path.unlink()
+                    self.logger.info(f"Archivo original eliminado exitosamente: {file_path.name}")
+                except Exception as e:
+                    self.logger.error(f"Error eliminando archivo original {file_path}: {e}")
+                    # Marcar como fallido si no se puede eliminar el original
+                    failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+                    self._add_to_failed_files(str(file_path), failed_files_path, f"Error eliminando original: {e}")
+            else:
+                self.logger.info(f"Archivo original es .mp4, manteniendo: {file_path.name}")
+            
             result['compressed'] = True
             result['original_size'] = original_size
             result['compressed_size'] = compressed_size
             
             # Sin mejoras de calidad aplicadas
         
-        # Marca como completado
+        # Marca como completado (usar la ruta final)
         with open(self.completed_file, 'a') as f:
-            f.write(f"{file_path.with_suffix('.mp4')}\n")
+            f.write(f"{final_name}\n")
+        
+        # Si se comprimió exitosamente y cambió la extensión, actualizar pending-compression.txt
+        if result.get('compressed', False) and final_name != file_path:
+            self._update_pending_file(str(file_path), str(final_name))
         
         return result
 
-    def _apply_quality_improvements(self, final_file: Path, has_spanish: bool) -> None:
+    def _apply_quality_improvements(self, final_file: Path) -> None:
         """Aplica mejoras de calidad al archivo final - DESHABILITADO TEMPORALMENTE
         
         Las mejoras de calidad requieren re-encoding completo y causan archivos corruptos.
         Se deshabilitan hasta integrarlas en el proceso de compresión inicial.
         """
         self.logger.info(f"Mejoras de calidad deshabilitadas temporalmente para: {final_file.name}")
-        return  # Deshabilitado temporalmente
-        
-        try:
-            # Crear archivo temporal para las mejoras
-            quality_temp = final_file.with_suffix('.quality.mp4')
-            
-            # Aplicar mejoras de calidad
-            if self.quality_improver.improve_video_quality(final_file, quality_temp, has_spanish):
-                # Si las mejoras fueron exitosas, reemplazar el archivo original
-                quality_temp.replace(final_file)
-                self.logger.info(f"Mejoras de calidad aplicadas exitosamente a: {final_file.name}")
-            else:
-                # Si fallaron las mejoras, mantener el archivo original
-                if quality_temp.exists():
-                    quality_temp.unlink()
-                self.logger.warning(f"No se pudieron aplicar mejoras de calidad a: {final_file.name}")
-                
-        except Exception as e:
-            self.logger.error(f"Error aplicando mejoras de calidad: {e}")
-            # Limpiar archivo temporal si existe
-            if 'quality_temp' in locals() and quality_temp.exists():
-                try:
-                    quality_temp.unlink()
-                except Exception:
-                    pass
 
     def _handle_failed_compression(self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path) -> Dict:
         """Maneja el caso de compresión fallida"""
@@ -1366,8 +1847,7 @@ class MediaJellyProcessor:
         if process.returncode == 124:
             error_msg = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
         
-        if process.stderr:
-            self.logger.error(f"FFmpeg stderr: {process.stderr[:1000]}")  # Más caracteres para debugging
+        # No se captura stderr para evitar MemoryError, así que no se puede loggear
         
         result['error'] = error_msg
         
@@ -1375,15 +1855,71 @@ class MediaJellyProcessor:
             temp_output.unlink()
         
         # Marcar como fallido para evitar reintentos infinitos
-        failed_files_path = self.scripts_dir / "failed-compression.txt"
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
         self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
         
         return result
 
-    def compress_single_file(self, file_path: Path) -> Dict:
+    def _handle_timeout_error(self, result: Dict, file_path: Path, temp_output: Path) -> None:
+        """Maneja errores de timeout en la compresión"""
+        error_msg = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
+        result.update({
+            'success': False,
+            'error': error_msg,
+            'compressed': False,
+            'renamed': False,
+            'no_spanish': False,
+            'skipped': False
+        })
+        
+        if temp_output and temp_output.exists():
+            temp_output.unlink()
+        
+        # Marcar como fallido
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
+        
+        self.logger.error(error_msg)
+
+    def _handle_unexpected_error(self, result: Dict, file_path: Path, exception: Exception, temp_output: Path) -> None:
+        """Maneja errores inesperados durante la compresión"""
+        error_msg = f"Error inesperado procesando {file_path}: {str(exception)}"
+        result.update({
+            'success': False,
+            'error': error_msg,
+            'compressed': False,
+            'renamed': False,
+            'no_spanish': False,
+            'skipped': False
+        })
+        
+        if temp_output and temp_output.exists():
+            temp_output.unlink()
+        
+        # Marcar como fallido
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
+        
+        self.logger.error(error_msg)
+        self.logger.error(f"Traceback completo: {exception}", exc_info=True)
+
+    def _log_no_spanish_info(self, file_path: Path, audio_indices: List[int], sub_indices: List[int]) -> None:
+        """Loggea información cuando no se detecta español en el archivo"""
+        self.logger.warning(f"No se detectó audio/subtítulos en español: {file_path.name}")
+        if audio_indices:
+            self.logger.info(f"  Pistas de audio detectadas: {', '.join(map(str, audio_indices))}")
+        else:
+            self.logger.info("  No se detectaron pistas de audio")
+        if sub_indices:
+            self.logger.info(f"  Pistas de subtítulos detectadas: {', '.join(map(str, sub_indices))}")
+        else:
+            self.logger.info("  No se detectaron pistas de subtítulos")
+
+    def compress_single_file(self, file_path_str: str) -> Dict:
         """Comprime un solo archivo con selección inteligente de método de compresión
         Completamente independiente - errores en este archivo no afectan otros procesos
         """
+        file_path = Path(file_path_str)
         result = {
             'file': str(file_path),
             'success': False,
@@ -1401,89 +1937,97 @@ class MediaJellyProcessor:
             self.set_resource_limits()
             
             # Prepara compresión: validación, detección de idiomas, selección de método
-            is_prepared, compression_info, temp_output, audio_langs, sub_langs = self._prepare_compression(file_path)
+            is_prepared, compression_info, temp_output, audio_indices, sub_indices, audio_languages = self._prepare_compression(file_path)
             if not is_prepared:
                 return {**result, **compression_info}
             
             use_gpu = compression_info['use_gpu']
             has_spanish = compression_info['has_spanish']
+            use_remux = compression_info.get('use_remux', False)
             
             # Log de método seleccionado (independiente por archivo)
-            method_str = "GPU (VAAPI)" if use_gpu else "CPU (libx264)"
+            if use_remux:
+                method_str = "REMUX (AV1→MP4)"
+            else:
+                method_str = "GPU (VAAPI)" if use_gpu else "CPU (libx264)"
             self.logger.info(f"Procesando [{method_str}]: {file_path.name}")
             
             if not has_spanish:
                 result['no_spanish'] = True
-                self.no_spanish_logger.info(f"{file_path}")
-                self.no_spanish_logger.info(f"   Idiomas de audio: {audio_langs.replace(chr(10), ', ')}")
-                self.no_spanish_logger.info(f"   Idiomas de subtítulos: {sub_langs.replace(chr(10), ', ')}")
-                self.no_spanish_logger.info("   ---")
+                self._log_no_spanish_info(file_path, audio_indices, sub_indices)
             
-            # Ejecuta compresión (aislada)
-            process, elapsed_time = self._execute_compression_attempt(file_path, temp_output, use_gpu, has_spanish)
+            # Ejecuta compresión (aislada) - ahora pasa audio_languages también
+            process, elapsed_time = self._execute_compression_attempt(file_path, temp_output, use_gpu, audio_indices, sub_indices, use_remux, audio_languages)
             
             # Procesa resultado inicial
-            compression_result = self._process_compression_result(process, file_path, temp_output, elapsed_time, use_gpu, has_spanish)
+            compression_result = self._process_compression_result(process, file_path, temp_output, elapsed_time, use_gpu)
             
-            # Lógica de fallback en caso de fallo con GPU (solo si este archivo usó GPU)
-            compression_result = self._handle_fallback_logic(compression_result, process, file_path, temp_output, use_gpu, has_spanish)
+            # Lógica de fallback en caso de fallo con GPU (solo si NO es remux y usó GPU)
+            if not use_remux:
+                compression_result = self._handle_fallback_logic(compression_result, process, file_path, temp_output, use_gpu, audio_indices, sub_indices, audio_languages)
             
             result.update(compression_result)
                     
         except subprocess.TimeoutExpired:
-            result['error'] = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
-            self.logger.error(result['error'])
-            if temp_output and temp_output.exists():
-                try:
-                    temp_output.unlink()
-                except Exception as cleanup_err:
-                    self.logger.warning(f"Error limpiando archivo temporal tras timeout: {cleanup_err}")
+            self._handle_timeout_error(result, file_path, temp_output)
         except Exception as e:
-            result['error'] = f"Error inesperado: {file_path} - {str(e)}"
-            self.logger.error(result['error'])
-            # Limpieza segura del archivo temporal en caso de error
-            if temp_output and temp_output.exists():
-                try:
-                    temp_output.unlink()
-                except Exception as cleanup_err:
-                    self.logger.warning(f"Error limpiando archivo temporal tras excepción: {cleanup_err}")
+            self._handle_unexpected_error(result, file_path, e, temp_output)
             
         return result
 
-    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Path, List, List]:
+    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Path, List[int], List[int], Dict[int, str]]:
         """Prepara la compresión: validación, idiomas, método"""
         # Validación
         valid, validation_msg = self._validate_file_for_compression(file_path)
         if not valid:
             result = {'skipped': validation_msg == "archivo_pequeno", 'error': validation_msg if validation_msg != "archivo_pequeno" else None}
-            return False, result, None, [], []
+            return False, result, None, [], [], {}
         
-        # Idiomas
-        has_spanish, audio_langs, sub_langs = self.detect_language_streams(file_path)
+        # Idiomas - ahora retorna también audio_languages
+        has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(file_path)
         
         # Temporal
         temp_output = file_path.with_suffix(COMPRESSED_FILE_SUFFIX)
         
-        # Método
-        use_gpu = self._should_use_gpu_compression(file_path)
+        # Detectar codec de video
+        video_codec = self._get_video_codec(file_path)
+        is_av1 = video_codec == 'av1'
         
-        return True, {'use_gpu': use_gpu, 'has_spanish': has_spanish}, temp_output, audio_langs, sub_langs
+        # Método: si es AV1, usar remux; sino, compresión normal
+        if is_av1:
+            use_gpu = False  # No usar GPU para remux
+            use_remux = True
+            self.logger.info(f"{EmojiGenerator.refresh()} Archivo AV1 detectado, usando remux (sin recodificación): {file_path.name}")
+        else:
+            use_gpu = self._should_use_gpu_compression(file_path)
+            use_remux = False
+        
+        return True, {'use_gpu': use_gpu, 'has_spanish': has_spanish, 'use_remux': use_remux}, temp_output, audio_indices, sub_indices, audio_languages
 
-    def _execute_compression_attempt(self, file_path: Path, temp_output: Path, use_gpu: bool, has_spanish: bool) -> Tuple[subprocess.CompletedProcess, float]:
-        """Ejecuta un intento de compresión"""
-        if use_gpu:
-            ffmpeg_cmd = self._build_ffmpeg_command(file_path, temp_output, has_spanish)
+    def _execute_compression_attempt(self, file_path: Path, temp_output: Path, use_gpu: bool, audio_indices: List[int], sub_indices: List[int], use_remux: bool = False, audio_languages: Dict[int, str] = None) -> Tuple[subprocess.CompletedProcess, float]:
+        """Ejecuta un intento de compresión o remux"""
+        if audio_languages is None:
+            audio_languages = {}
+            
+        if use_remux:
+            # Usar remux para archivos AV1 (sin recodificación)
+            ffmpeg_cmd = self._build_remux_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
+            cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [REMUX/copy/output]"
+            self.logger.info(f"Comando ffmpeg REMUX: {cmd_str}")
+        elif use_gpu:
+            ffmpeg_cmd = self._build_ffmpeg_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
             cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [GPU/audio/subs/output]"
             self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
         else:
-            ffmpeg_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output)
+            ffmpeg_cmd = self._build_fallback_ffmpeg_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
             self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
         
         start_time = time.time()
         process = subprocess.run(
             ffmpeg_cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # No capturar stderr para evitar MemoryError
             text=True,
             timeout=FFMPEG_TIMEOUT
         )
@@ -1491,20 +2035,23 @@ class MediaJellyProcessor:
         
         return process, elapsed_time
 
-    def _handle_fallback_logic(self, compression_result: Dict, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path, use_gpu: bool, has_spanish: bool) -> Dict:
+    def _handle_fallback_logic(self, compression_result: Dict, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path, use_gpu: bool, audio_indices: List[int], sub_indices: List[int], audio_languages: Dict[int, str] = None) -> Dict:
         """Maneja la lógica de fallback CPU"""
+        if audio_languages is None:
+            audio_languages = {}
+            
         if not compression_result['success'] and use_gpu and 'corrupto' in str(compression_result.get('error', '')):
             self.logger.warning(f"Archivo corrupto con GPU, intentando fallback CPU: {file_path.name}")
             if temp_output.exists():
                 temp_output.unlink()
-            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, has_spanish)
-            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False, has_spanish)
+            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages)
+            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False)
         elif process.returncode != 0 and use_gpu:
             self.logger.warning(f"Compresión GPU falló, intentando fallback CPU: {file_path.name}")
             if temp_output.exists():
                 temp_output.unlink()
-            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, has_spanish)
-            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False, has_spanish)
+            process, new_elapsed_time = self._execute_compression_attempt(file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages)
+            compression_result = self._process_compression_result(process, file_path, temp_output, new_elapsed_time, False)
         
         return compression_result
 
@@ -1623,6 +2170,9 @@ class MediaJellyProcessor:
         total_files = len(files)
         self.logger.info(f"Iniciando procesamiento de {total_files} archivos con {MAX_CONCURRENT_COMPRESSIONS} workers")
         
+        # NOTA: No pre-cargar Whisper - cada worker lo cargará cuando necesite (archivo ya descargado)
+        # Con 1 worker y modelo descargado, no habrá problemas de memoria
+        
         # Limpia archivos temporales de ejecución anterior
         (self.tmp_dir / "error_files.tmp").unlink(missing_ok=True)
         (self.tmp_dir / "no_spanish_files.tmp").unlink(missing_ok=True)
@@ -1641,14 +2191,63 @@ class MediaJellyProcessor:
 
         return current_file
 
+    def _reset_progress_if_corrupted(self, progress_info: dict) -> bool:
+        """Resetea el progreso si está corrupto (porcentaje > 100%)"""
+        current_percentage = progress_info.get('percentage', 0)
+        if current_percentage > 100:
+            self.logger.warning(f"Progreso corrupto detectado ({current_percentage:.1f}%) - Reseteando completamente")
+            
+            # Crear nuevo estado de progreso limpio
+            clean_progress = {
+                "processing": {
+                    "current_file": 0,
+                    "total_files": 0,
+                    "current_file_name": "",
+                    "percentage": 0.0,
+                    "last_updated": datetime.now().isoformat(),
+                    "status": "idle",
+                    "notified": False,
+                    "over_100_notified": False,
+                    "stats": {
+                        "files_found": 0,
+                        "files_new": 0,
+                        "files_processed": 0,
+                        "files_compressed": 0,
+                        "files_renamed": 0,
+                        "files_skipped": 0,
+                        "total_original_size": 0,
+                        "total_compressed_size": 0,
+                        "errors": [],
+                        "no_spanish": []
+                    },
+                    "processed_files": {},
+                    "last_notification": None,
+                    "last_cleanup_notification": None,
+                    "last_cleanup_files_processed": 0,
+                    "last_cleanup_timestamp": datetime.now().isoformat()
+                }
+            }
+            
+            # Si existe sección de subtítulos, mantenerla
+            if 'subtitle_translation' in progress_info:
+                clean_progress['subtitle_translation'] = progress_info['subtitle_translation']
+            
+            # Guardar progreso limpio
+            try:
+                with open(self.tmp_dir / PROGRESS_FILE_NAME, 'w') as f:
+                    json.dump(clean_progress, f, indent=2)
+                self.logger.info("Progreso reseteado completamente")
+                return True
+            except Exception as e:
+                self.logger.error(f"Error reseteando progreso: {e}")
+                return False
+        
+        return False
+
     def _load_previous_stats(self, progress_info: dict, current_file: int) -> int:
         """Carga estadísticas previas del progreso"""
-        if 'stats' not in progress_info:
-            return current_file
-
-        prev_stats = progress_info['stats']
-        self.logger.info(f"Cargando estadísticas previas (progreso anterior: {progress_info.get('percentage', 0):.1f}%)")
-
+        prev_stats = progress_info.get('stats', {})
+        
         self.stats.files_found = prev_stats.get('files_found', 0)
         self.stats.files_new = prev_stats.get('files_new', 0)
         self.stats.files_processed = prev_stats.get('files_processed', 0)
@@ -1701,8 +2300,8 @@ class MediaJellyProcessor:
         current_no_spanish = []
         processed_count = current_file
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_COMPRESSIONS) as executor:
-            future_to_file = {executor.submit(self.compress_single_file, file_path): file_path
+        with ProcessPoolExecutor(max_workers=MAX_CONCURRENT_COMPRESSIONS) as executor:
+            future_to_file = {executor.submit(self.compress_single_file, str(file_path)): file_path
                             for file_path in files}
             files_in_progress = [f.name for f in files]
 
@@ -1841,12 +2440,14 @@ class MediaJellyProcessor:
         # Construye mensaje de archivos en procesamiento
         current_file_name = self._build_progress_message(files_in_progress)
 
-        # Actualiza progreso inmediatamente después de cada compresión
-        self._save_progress_state(processed_count, total_files, current_file_name, status='processing')
+        # Actualiza progreso cada archivo procesado para mejor precisión
+        if processed_count % 1 == 0 or processed_count == total_files:
+            self._save_progress_state(processed_count, total_files, current_file_name, status='processing')
 
-        # Log progreso
-        percentage = (processed_count / total_files) * 100
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Progreso: {processed_count}/{total_files} ({percentage:.1f}%) - Archivo procesado: {file_path.name}", flush=True)
+        # Log progreso cada archivo o al final
+        if processed_count % 1 == 0 or processed_count == total_files:
+            percentage = min(100.0, (processed_count / total_files) * 100)
+            self.logger.info(f"Progreso: {processed_count}/{total_files} ({percentage:.1f}%) - Archivo procesado: {file_path.name}")
 
     def _build_progress_message(self, files_in_progress: list) -> str:
         """Construye mensaje de archivos actualmente en procesamiento"""
@@ -1980,55 +2581,78 @@ class MediaJellyProcessor:
         remaining_pending = []
         orphaned_files = []
         files_removed = 0
-        failed_files_path = self.scripts_dir / "failed-compression.txt"
-        
+
         with open(self.pending_file, 'r') as f:
             for line in f:
                 file_path = line.strip()
-                if file_path:
-                    pending_path_obj = Path(file_path)
-                    mp4_path = pending_path_obj.with_suffix('.mp4')
-                    
-                    # 1. Si ya está completado como .mp4, remover
-                    if str(mp4_path) in completed_files and mp4_path.exists():
-                        files_removed += 1
-                        continue  # Remover archivos procesados
-                    
-                    # 2. Si el archivo original no existe (huérfano), remover
-                    elif not pending_path_obj.exists():
-                        orphaned_files.append(file_path)
-                        files_removed += 1
-                        self.logger.warning(f"Archivo huérfano removido de pending (no existe): {pending_path_obj.name}")
-                        continue
-                    
-                    # 3. Remover archivos fallidos persistentemente
-                    elif file_path in self.processed_files and self.processed_files[file_path].get('status') == 'failed':
-                        # Para archivos .ts fallidos, remover inmediatamente
-                        if pending_path_obj.suffix.lower() == '.ts':
-                            self.logger.warning(f"Removiendo archivo .ts fallido de pendientes: {file_path}")
-                            self._add_to_failed_files(file_path, failed_files_path, "Formato .ts incompatible con VAAPI")
-                            files_removed += 1
-                            continue
-                        # Para otros formatos, verificar si han fallado recientemente
-                        failed_info = self.processed_files[file_path]
-                        if 'timestamp' in failed_info:
-                            try:
-                                failed_time = datetime.fromisoformat(failed_info['timestamp'])
-                                if (datetime.now() - failed_time).total_seconds() > 86400:  # 24 horas
-                                    self.logger.warning(f"Removiendo archivo fallido antiguo de pendientes: {file_path}")
-                                    self._add_to_failed_files(file_path, failed_files_path, "Falló múltiples veces")
-                                    files_removed += 1
-                                    continue
-                            except (ValueError, TypeError):
-                                self.logger.warning(f"Removiendo archivo fallido con timestamp inválido de pendientes: {file_path}")
-                                self._add_to_failed_files(file_path, failed_files_path, "Timestamp inválido")
-                                files_removed += 1
-                                continue
-                    
-                    # 4. Archivo válido, mantener en pending
+                if not file_path:
+                    continue
+
+                result = self._get_pending_file_action(file_path, completed_files)
+                if result == "remove":
+                    files_removed += 1
+                elif result == "orphan":
+                    orphaned_files.append(file_path)
+                    files_removed += 1
+                else:
                     remaining_pending.append(file_path)
-        
+
         return remaining_pending, orphaned_files, files_removed
+
+    def _get_pending_file_action(self, file_path: str, completed_files: set) -> str:
+        """Procesa una línea individual del archivo pending y retorna la acción a tomar"""
+        pending_path_obj = Path(file_path)
+
+        # 1. Si ya está completado (procesado exitosamente), remover de pending
+        # Verificar tanto la ruta original como la ruta con extensión .mp4 (por si fue comprimido)
+        if file_path in completed_files:
+            return "remove"
+        
+        # También verificar si existe una versión .mp4 del archivo en completed
+        mp4_version = str(pending_path_obj.with_suffix('.mp4'))
+        if mp4_version in completed_files:
+            return "remove"
+
+        # 2. Si el archivo original no existe (huérfano), remover
+        if not pending_path_obj.exists():
+            self.logger.warning(f"Archivo huérfano removido de pending (no existe): {pending_path_obj.name}")
+            return "orphan"
+
+        # 3. Remover archivos fallidos persistentemente
+        if self._should_remove_failed_file(file_path, pending_path_obj):
+            return "remove"
+
+        # 4. Archivo válido, mantener en pending
+        return "keep"
+
+    def _should_remove_failed_file(self, file_path: str, pending_path_obj: Path) -> bool:
+        """Determina si un archivo fallido debe ser removido de pending"""
+        if file_path not in self.processed_files or self.processed_files[file_path].get('status') != 'failed':
+            return False
+
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+
+        # Para archivos .ts fallidos, remover inmediatamente
+        if pending_path_obj.suffix.lower() == '.ts':
+            self.logger.warning(f"Removiendo archivo .ts fallido de pendientes: {file_path}")
+            self._add_to_failed_files(file_path, failed_files_path, "Formato .ts incompatible con VAAPI")
+            return True
+
+        # Para otros formatos, verificar si han fallado recientemente
+        failed_info = self.processed_files[file_path]
+        if 'timestamp' in failed_info:
+            try:
+                failed_time = datetime.fromisoformat(failed_info['timestamp'])
+                if (datetime.now() - failed_time).total_seconds() > 86400:  # 24 horas
+                    self.logger.warning(f"Removiendo archivo fallido antiguo de pendientes: {file_path}")
+                    self._add_to_failed_files(file_path, failed_files_path, "Falló múltiples veces")
+                    return True
+            except (ValueError, TypeError):
+                self.logger.warning(f"Removiendo archivo fallido con timestamp inválido de pendientes: {file_path}")
+                self._add_to_failed_files(file_path, failed_files_path, "Timestamp inválido")
+                return True
+
+        return False
     
     def _add_to_failed_files(self, file_path: str, failed_files_path: Path, reason: str) -> None:
         """Agrega un archivo a la lista de archivos fallidos con su razón"""
@@ -2134,10 +2758,13 @@ class MediaJellyProcessor:
                 self.logger.warning("Script de notificaciones no encontrado, omitiendo notificación")
                 return
             
+            # Determinar status basado en si hubo errores
+            status = "error" if self.stats.errors else "success"
+            
             # Preparar comando de notificación
             cmd = [
                 sys.executable, str(notifier_script),
-                "scan_result", "success",
+                "scan_result", status,
                 str(self.stats.files_found),
                 str(self.stats.files_new), 
                 str(self.stats.files_processed),
@@ -2163,6 +2790,44 @@ class MediaJellyProcessor:
                 
         except Exception as e:
             self.logger.error(f"Error enviando notificación de completado: {e}")
+
+    def _send_over_100_notification(self, raw_percentage: float, current_file: int, total_files: int, files_new: int) -> None:
+        """Envía notificación de aviso cuando el progreso excede 100%"""
+        try:
+            notifier_script = self.scripts_dir / "mediajelly_notifier.py"
+            if not notifier_script.exists():
+                self.logger.warning("Script de notificaciones no encontrado, omitiendo notificación de progreso >100%")
+                return
+            
+            error_message = f"{EmojiGenerator.warning_msg()} AVISO: Progreso excedió 100% ({raw_percentage:.1f}%) - Revisar estado del sistema"
+            
+            # Preparar comando de notificación de procesamiento con información real
+            cmd = [
+                sys.executable, str(notifier_script),
+                "scan_result", "warning",
+                str(total_files),      # files_found
+                str(files_new),        # files_new  
+                str(current_file),     # files_processed
+                str(self.stats.files_compressed),  # files_compressed
+                str(self.stats.files_renamed),     # files_renamed
+                str(self.stats.files_skipped)      # files_skipped
+            ]
+            
+            self.logger.warning(f"Enviando notificación de progreso >100%: {raw_percentage:.1f}%")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode == 0:
+                self.logger.info("Notificación de progreso >100% enviada correctamente")
+            else:
+                self.logger.error(f"Error enviando notificación de progreso >100%: {result.stderr}")
+                
+        except Exception as e:
+            self.logger.error(f"Error enviando notificación de progreso >100%: {e}")
 
 class VideoQualityImprover:
     """Clase para mejorar la calidad de videos sin aumentar significativamente el tamaño"""
@@ -2262,7 +2927,7 @@ class VideoQualityImprover:
             "-metadata", "artist=MediaJelly",
             "-metadata", "comment=Procesado con mejoras de calidad",
             "-metadata", "creation_time=" + datetime.now().isoformat(),
-            "-movflags", "+faststart",
+            "-movflags", MOVFLAGS_FASTSTART,
             "-avoid_negative_ts", "make_zero",
             str(output_file)
         ])
@@ -2284,32 +2949,36 @@ def main():
     # Manejo de señales para terminación limpia
     def signal_handler(signum, frame):
         processor.logger.info(f"Recibida señal {signum}, guardando progreso y terminando...")
-        # Obtiene el progreso actual antes de guardar
-        current_progress = processor.get_progress_info()
-        current_file = current_progress.get('current_file', processor.stats.files_processed)
-        total_files = current_progress.get('total_files', processor.stats.files_found)
-        current_file_name = current_progress.get('current_file_name', f"Terminado por señal {signum}")
+        # Usa las estadísticas actuales en memoria para guardar el progreso
+        current_file = processor.stats.files_processed
+        total_files = processor.stats.files_found
+        current_file_name = f"Terminado por señal {signum}"
         
-        # Guarda el progreso actual antes de terminar
+        # Guarda el progreso con las estadísticas actuales
         processor._save_progress_state(
             current_file, 
             total_files, 
             current_file_name, 
             status='interrupted'
         )
-        sys.exit(0)
+        # En lugar de sys.exit(0), lanza KeyboardInterrupt para una terminación limpia
+        raise KeyboardInterrupt(f"Señal {signum} recibida")
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
     # Ejecuta procesamiento
-    stats = processor.run()
-    
-    # Imprime estadísticas
-    print(f"Procesados: {stats.files_processed}")
-    print(f"Comprimidos: {stats.files_compressed}")
-    print(f"Renombrados: {stats.files_renamed}")
-    print(f"Omitidos: {stats.files_skipped}")
+    try:
+        stats = processor.run()
+        
+        # Imprime estadísticas
+        print(f"Procesados: {stats.files_processed}")
+        print(f"Comprimidos: {stats.files_compressed}")
+        print(f"Renombrados: {stats.files_renamed}")
+        print(f"Omitidos: {stats.files_skipped}")
+    except KeyboardInterrupt:
+        processor.logger.info("Procesamiento interrumpido por señal")
+        print("Procesamiento interrumpido")
 
 if __name__ == "__main__":
     main()

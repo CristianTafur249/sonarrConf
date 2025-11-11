@@ -1,46 +1,42 @@
-services:
-  # qbittorrent:
-  #   container_name: qbittorrent
-  #   image: linuxserver/qbittorrent:5.1.1
-  #   networks:
-  #     - mynetwork
-  #   environment:
-  #     - PUID=${PUID}
-  #     - PGID=${PGID}
-  #     - TZ=${TZ}
-  #     - WEBUI_PORT=5080
-  #   volumes:
-  #     - ./qbittorrent-config:/config
-  #     - ./1tb1/Bittorrent:/downloads
-  #     - ./media/Peliculas:/movies
-  #     - ./media/series:/tvshows
-  #   ports:
-  #     - 5080:5080
-  #     - 6881:6881
-  #     - 6881:6881/udp
-  #   restart: "unless-stopped"
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
 
+services:
   transmission:
     image: jaymoulin/transmission:4.0.6
+    container_name: transmission
     networks:
       - mynetwork
     environment:
       - TZ=${TZ}
     command: transmission-daemon -f -g /config
     volumes:
-      - ./config/transmission:/config
-      - ./config/1tb1/Bittorrent:/downloads
-      - ./media/Peliculas:/movies
-      - ./media/series:/tvshows
+      - ./config/transmission:/config:rw
+      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./media/Peliculas:/movies:rw
+      - ./media/series:/tvshows:rw
     ports:
-      - 9091:9091
-      - 51413:51413
-      - 51413:51413/udp
-    restart: "unless-stopped"
+      - "9091:9091"
+      - "51413:51413"
+      - "51413:51413/udp"
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 
   samba:
     image: dperson/samba
+    container_name: samba
     command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s "scripts;/scripts;yes;no;yes;all;pi"'
     stdin_open: true
     tty: true
@@ -49,13 +45,17 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
     ports:
-      - 139:139
-      - 445:445
+      - "139:139"
+      - "445:445"
     volumes:
-      - ./media:/media
-      - ./config/1tb1/Bittorrent:/downloads
-      - ./scripts:/scripts
+      - ./media:/media:rw
+      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./scripts:/scripts:ro
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: '0.5'
 
   radarr:
     container_name: radarr
@@ -67,14 +67,23 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     ports:
-      - 7878:7878
+      - "7878:7878"
     volumes:
-      - ./config/radarr-config:/config
-      - ./media/Peliculas:/movies
-      - ./media/anime:/anime
-      - ./scripts:/scripts
-      - ./config/1tb1/Bittorrent:/downloads
-    restart: "unless-stopped"
+      - ./config/radarr-config:/config:rw
+      - ./media/Peliculas:/movies:rw
+      - ./media/anime:/anime:rw
+      - ./scripts:/scripts:ro
+      - ./config/1tb1/Bittorrent:/downloads:rw
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: '1.5'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7878/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   sonarr:
     image: lscr.io/linuxserver/sonarr:latest
@@ -86,14 +95,23 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - ./config/sonarr-config:/config
-      - ./scripts:/scripts
-      - ./media/series:/tvshows
-      - ./media/anime:/anime
-      - ./config/1tb1/Bittorrent:/downloads
+      - ./config/sonarr-config:/config:rw
+      - ./scripts:/scripts:ro
+      - ./media/series:/tvshows:rw
+      - ./media/anime:/anime:rw
+      - ./config/1tb1/Bittorrent:/downloads:rw
     ports:
-      - 8989:8989
+      - "8989:8989"
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: '1.5'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8989/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   prowlarr:
     container_name: prowlarr
@@ -105,10 +123,19 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     volumes:
-      - ./config/prowlarr-config:/config
+      - ./config/prowlarr-config:/config:rw
     ports:
-      - 9696:9696
+      - "9696:9696"
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9696/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
@@ -120,14 +147,23 @@ services:
       - PGID=${PGID}
       - TZ=${TZ}
     ports:
-      - 6767:6767
+      - "6767:6767"
     volumes:
-      - ./config/bazarr-config:/config
-      - ./media/Peliculas:/movies
-      - ./media/series:/tvshows
-      - ./media/anime:/anime
-      - ./config/1tb1/Bittorrent:/downloads
+      - ./config/bazarr-config:/config:rw
+      - ./media/Peliculas:/movies:rw
+      - ./media/series:/tvshows:rw
+      - ./media/anime:/anime:rw
+      - ./config/1tb1/Bittorrent:/downloads:ro
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6767/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 
   jellyfin:
@@ -137,54 +173,53 @@ services:
       - /dev/dri:/dev/dri
     environment:
       - TZ=${TZ}
+      - JELLYFIN_PublishedServerUrl=http://localhost:8096
     group_add:
       - "44"
     networks:
       - mynetwork
     volumes:
-      - ./config/jellyfin-config:/config
-      - ./config/jellyfin-cache:/cache
-      - ./media/Peliculas:/movies
-      - ./media/series:/tvshows
-      - ./media/anime:/anime
+      - ./config/jellyfin-config:/config:rw
+      - ./config/jellyfin-cache:/cache:rw
+      - ./media/Peliculas:/movies:ro
+      - ./media/series:/tvshows:ro
+      - ./media/anime:/anime:ro
     ports:
-      - 8096:8096
+      - "8096:8096"
     restart: unless-stopped
-
-  # plex:
-  #   image: jaymoulin/plex:1.41.8.9834
-  #   expose:
-  #     - 32400
-  #     - 33400
-  #   # Descomentar si NO usas network_mode: "host"
-  #   # ports:
-  #   #  - 32400:32400
-  #   #  - 33400:33400
-  #   environment:
-  #     - TZ=${TZ}
-  #   volumes:
-  #     - ./config/plex/PlexMediaServer:/root/Library/Application Support/Plex Media Server
-  #     - ./media/:/media
-  #     - ./config/plex/tmp:/tmp
-  #   restart: unless-stopped
-  #   security_opt:
-  #     - no-new-privileges:false
-  #   network_mode: "host" # Solo funciona en Linux
+    logging: *default-logging
+    mem_limit: 4g
+    mem_reservation: 2g
+    cpus: '3.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   jellyseerr:
     image: fallenbagel/jellyseerr:latest
     container_name: jellyseerr
     environment:
-      - LOG_LEVEL=debug
+      - LOG_LEVEL=info
       - TZ=${TZ}
       - PORT=5055
     networks:
       - mynetwork
     ports:
-      - 5055:5055
+      - "5055:5055"
     volumes:
-      - ./config/jellyseerr-config:/app/config
+      - ./config/jellyseerr-config:/app/config:rw
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
+    mem_reservation: 512m
+    cpus: '1.0'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5055/api/v1/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   mediajelly-cron:
     build:
@@ -195,17 +230,24 @@ services:
       - TZ=${TZ}
       - PUID=${PUID}
       - PGID=${PGID}
-      - MEDIAJELLY_MODE=${MEDIAJELLY_MODE}
+      - MEDIAJELLY_MODE=${MEDIAJELLY_MODE:-python}
+      - PYTHONUNBUFFERED=1
+      - PYTHONOPTIMIZE=2
+      - OMP_NUM_THREADS=4
     networks:
       - mynetwork
     volumes:
-      - ./scripts:/mediajelly/scripts
-      - ./config:/mediajelly/config
-      - ./media:/mediajelly/media
-      - ./config/1tb1/Bittorrent:/mediajelly/downloads
+      - ./scripts:/mediajelly/scripts:rw
+      - ./config:/mediajelly/config:ro
+      - ./media:/mediajelly/media:rw
+      - ./config/1tb1/Bittorrent:/mediajelly/downloads:rw
     devices:
       - /dev/dri:/dev/dri  # Hardware acceleration
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 6g
+    mem_reservation: 4g
+    cpus: '4.0'
     depends_on:
       - transmission
       - radarr
@@ -213,4 +255,13 @@ services:
 
 networks:
   mynetwork:
-    external: false
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.driver.mtu: "1500"
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          ip_range: 172.20.240.0/20

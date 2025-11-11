@@ -2,6 +2,74 @@
 
 Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado con Docker.
 
+## [v3.2.4] - 2025-11-10
+
+### 🚀 Nuevas Características
+
+- **🗣️ Sistema de Detección Inteligente de Idiomas**:
+  - Nuevo script `mediajelly_language_detector.py` con integración de Whisper AI
+  - Análisis automático de streams de audio para detectar idiomas precisos
+  - Validación segura de comandos subprocess con lista blanca (solo ffprobe/ffmpeg)
+  - Detección de idiomas embebidos y externos con prioridades inteligentes
+  - Optimización de recursos con modelo Whisper 'tiny' para mejor rendimiento
+
+- **🧹 Limpieza Automática de Subtítulos Duplicados**:
+  - Nuevo script `clean_duplicate_subtitles.py` para gestión de subtítulos
+  - Eliminación automática de archivos .hi.srt (hindú) y .es-MX.srt duplicados
+  - Priorización de subtítulos .es.srt sobre variantes regionales
+  - Agrupación inteligente por nombre base de archivo para detectar duplicados
+  - Compatibilidad con contenedor Docker y sistema host
+
+- **🏗️ Infraestructura Docker Optimizada**:
+  - Reorganización completa de `docker-compose.yaml` con mejores prácticas
+  - Límites de recursos (CPU, memoria) para todos los servicios
+  - Healthchecks automáticos para servicios críticos
+  - Configuración de logging centralizada con rotación automática
+  - Optimización de volúmenes con permisos específicos (ro/rw)
+  - Red personalizada con configuración de bridge optimizada
+
+### 🔧 Mejoras del Sistema
+
+- **📊 Refactorización Completa del Cron Runner**:
+  - Nuevo sistema de ejecución cíclica con detección de idiomas integrada
+  - Ejecución secuencial: scanner → detector de idiomas → processor/subtítulos
+  - Lógica horaria mejorada: compresión diurna, subtítulos nocturnos (00:00-05:59)
+  - Integración directa de funciones Python en lugar de subprocess
+  - Mejor manejo de concurrencia y bloqueos de archivos
+
+- **🛡️ Seguridad y Validación Mejorada**:
+  - Corrección de vulnerabilidades SonarQube en `mediajelly_language_detector.py`
+  - Validación de entrada en todas las funciones críticas
+  - Manejo seguro de subprocess con timeouts y validación de comandos
+  - Eliminación de imports incorrectos y variables globales no utilizadas
+  - Constantes definidas para rutas de archivos y configuración
+
+- **⚡ Optimizaciones de Rendimiento**:
+  - Modelo Whisper optimizado de 'small' a 'tiny' para mejor velocidad
+  - Procesador con configuración adaptativa de concurrencia
+  - Mejora en el manejo de memoria y CPU en contenedores
+  - Optimización de timeouts y reintentos en operaciones críticas
+
+### 🐛 Correcciones
+
+- **Sintaxis y Linting**:
+  - Corrección de errores de sintaxis en scripts Python
+  - Eliminación de código duplicado y variables no utilizadas
+  - Mejora en la legibilidad y mantenibilidad del código
+
+- **Gestión de Errores**:
+  - Manejo mejorado de excepciones en operaciones críticas
+  - Logging mejorado con emojis informativos
+  - Recuperación automática de estados corruptos
+
+### 📚 Documentación
+
+- **README.md Actualizado**:
+  - Nueva sección detallada de scripts Python del sistema
+  - Descripción de funcionalidades clave y arquitectura
+  - Información sobre detección de idiomas y limpieza de subtítulos
+  - Estructura del proyecto actualizada con nuevos scripts
+
 ## [v3.2.3] - 2025-01-27
 
 ### Características
