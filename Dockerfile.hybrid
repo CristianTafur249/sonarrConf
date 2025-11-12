@@ -17,19 +17,16 @@ RUN apt-get update && apt-get install -y \
     vainfo \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/"$TZ" /etc/localtime && echo "$TZ" > /etc/timezone \
-    && pip3 install --no-cache-dir \
-    requests \
-    psutil \
-    translatepy \
-    langdetect \
-    openai-whisper \
-    torch \
-    torchaudio \
     && groupadd -g 992 render \
     && useradd -m -s /bin/bash -G video,render mediauser \
     && mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp \
     && chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp \
     && chown -R mediauser:mediauser /mediajelly
+
+# Instalar dependencias de Python
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # Copiar scripts y configuraciones
 COPY config/crontab.example /etc/cron.d/mediajelly

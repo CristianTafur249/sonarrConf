@@ -1,0 +1,26 @@
+{
+  "metrics": [
+    {
+      "files_processed": 50,
+      "compression_ratio": 0.72,
+      "errors_count": 1,
+      "execution_time_seconds": 3600,
+      "avg_time_per_file": 72.0,
+      "space_saved_gb": 15.5,
+      "space_saved_percentage": 28,
+      "success_rate": 98.0,
+      "timestamp": "2024-11-11T10:00:00"
+    },
+    {
+      "files_processed": 100,
+      "compression_ratio": 0.68,
+      "errors_count": 3,
+      "execution_time_seconds": 7200,
+      "avg_time_per_file": 72.0,
+      "space_saved_gb": 32.4,
+      "space_saved_percentage": 30,
+      "success_rate": 97.0,
+      "timestamp": "2024-11-11T11:00:00"
+    }
+  ]
+}

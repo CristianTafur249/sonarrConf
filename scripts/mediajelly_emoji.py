@@ -3,6 +3,7 @@
 MediaJelly Emoji Utilities - Generador de emojis para mensajes
 """
 
+
 class EmojiGenerator:
     """Generador de emojis para diferentes tipos de mensajes"""
 

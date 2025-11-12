@@ -1,35 +1,191 @@
+# ============================================================================
+# MEDIAJELLY GITIGNORE
+# ============================================================================
+
 # Configuraciones sensibles
-config/*
-!config/transmission/settings.json
+config/telegram.conf
+.env
+
+# Mantener ejemplos y configuraciones no sensibles
 !config/telegram.conf.example
 !config/crontab.example
-config/telegram.conf
+!config/english_indicators.json
 
-# Archivos de medios
-media/*
+# Configuraciones de servicios (grandes y regenerables)
+config/*/
+!config/*.example
+!config/*.json
 
-# Archivos de trabajo
-magnets.txt
-scripts/logs/*
-scripts/pending-*
+# ============================================================================
+# ARCHIVOS DE MEDIOS Y DATOS
+# ============================================================================
+
+# Archivos de medios (demasiado grandes)
+media/
+
+# Archivos de trabajo temporal
 scripts/tmp/
-scripts/__pycache__
-scripts/*.txt
-scripts/completed.txt
-scripts/pending-compression.txt
+scripts/logs/*.log
+scripts/logs/*.log.*
 
-# Archivos de sistema y temporales
+# Mantener estructura de directorios
+!scripts/tmp/.gitkeep
+!scripts/logs/.gitkeep
+
+# Archivos de estado
+scripts/pending-*.txt
+scripts/completed.txt
+scripts/*.txt
+!scripts/README.md
+
+# Magnets y torrents
+magnets.txt
+*.torrent
+
+# ============================================================================
+# PYTHON
+# ============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+coverage.xml
+*.cover
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# ============================================================================
+# IDE Y EDITORES
+# ============================================================================
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# ============================================================================
+# SISTEMA OPERATIVO
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================================================
+# LOGS Y ARCHIVOS TEMPORALES
+# ============================================================================
+
+# Logs
 *.log
+*.log.*
+
+# Archivos temporales y de respaldo
 *.tmp
 *.bak
-*.compressed.mp4
-.DS_Store
-Thumbs.db
+*.backup
+*.old
+*.swp
+*.swo
 
 # Archivos de bloqueo
 *.lock
+*.pid
 last_run
 
-# Archivos de respaldo de configuración
-*.old
-*.backup
+# Archivos comprimidos generados
+*.compressed.mp4
+
+# ============================================================================
+# DOCKER Y CONTENEDORES
+# ============================================================================
+
+# Redis
+*.rdb
+
+# Portainer data
+config/portainer/portainer.db
+
+# ============================================================================
+# BACKUPS
+# ============================================================================
+
+backups/
+*.sql
+*.dump
+
+# ============================================================================
+# NODE (Si se usa alguna herramienta JS)
+# ============================================================================
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock

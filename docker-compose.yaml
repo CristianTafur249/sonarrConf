@@ -28,7 +28,7 @@ services:
     mem_reservation: 256m
     cpus: '1.0'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091"]
+      test: ["CMD", "pgrep", "transmission-daemon"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -181,9 +181,9 @@ services:
     volumes:
       - ./config/jellyfin-config:/config:rw
       - ./config/jellyfin-cache:/cache:rw
-      - ./media/Peliculas:/movies:ro
-      - ./media/series:/tvshows:ro
-      - ./media/anime:/anime:ro
+      - ./media/Peliculas:/movies:rw
+      - ./media/series:/tvshows:rw
+      - ./media/anime:/anime:rw
     ports:
       - "8096:8096"
     restart: unless-stopped
@@ -212,14 +212,14 @@ services:
       - ./config/jellyseerr-config:/app/config:rw
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 1g
-    mem_reservation: 512m
+    mem_limit: 500m
+    mem_reservation: 256m
     cpus: '1.0'
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5055/api/v1/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5055/api/v1/status"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
 
   mediajelly-cron:
     build:
@@ -234,6 +234,8 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONOPTIMIZE=2
       - OMP_NUM_THREADS=4
+      - MEDIAJELLY_API_PORT=8000
+      - MEDIAJELLY_METRICS_PORT=9090
     networks:
       - mynetwork
     volumes:
@@ -243,6 +245,9 @@ services:
       - ./config/1tb1/Bittorrent:/mediajelly/downloads:rw
     devices:
       - /dev/dri:/dev/dri  # Hardware acceleration
+    ports:
+      - "8000:8000"  # API REST
+      - "9090:9090"  # Prometheus metrics
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 6g
@@ -252,6 +257,51 @@ services:
       - transmission
       - radarr
       - sonarr
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mediajelly-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - mynetwork
+    volumes:
+      - ./config/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9092:9090"
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    depends_on:
+      - mediajelly-cron
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mediajelly-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=
+    networks:
+      - mynetwork
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
+    mem_reservation: 256m
+    cpus: '1.0'
+    depends_on:
+      - prometheus
 
 networks:
   mynetwork:
@@ -265,3 +315,9 @@ networks:
       config:
         - subnet: 172.20.0.0/16
           ip_range: 172.20.240.0/20
+
+volumes:
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
