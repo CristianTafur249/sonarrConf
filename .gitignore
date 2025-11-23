@@ -138,6 +138,7 @@ tmp/
 config/*.conf
 config/*.yaml
 config/*.xml
+config/crontab*
 !config/*.example
 !config/*.json
 
