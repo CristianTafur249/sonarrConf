@@ -5,6 +5,8 @@
 # Configuraciones sensibles
 config/telegram.conf
 .env
+.env
+TODO.md
 
 # Mantener ejemplos y configuraciones no sensibles
 !config/telegram.conf.example
@@ -96,6 +98,55 @@ dmypy.json
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# ============================================================================
+# ADICIONALES
+# ============================================================================
+
+# IDE y editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs y temporales
+*.log
+*.log.*
+logs/
+tmp/
+*.tmp
+*.temp
+
+# Archivos de base de datos
+*.db
+*.sqlite
+*.sqlite3
+
+# Archivos de configuración sensibles adicionales
+.env.*
+!.env.example
+config/*.conf
+config/*.yaml
+config/*.xml
+!config/*.example
+!config/*.json
+
+# Docker
+docker-compose.override.yml
+
+# Archivos de backup
+*.bak
+*.backup
 
 # ============================================================================
 # IDE Y EDITORES

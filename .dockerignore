@@ -22,6 +22,15 @@ config/*/*/*.db-*
 *.pid
 *.dat
 
+# Directorios de Redis
+config/redis/
+config/*/appendonlydir/
+
+# Otros directorios de datos de servicios
+config/portainer/
+config/prometheus/
+config/grafana/
+
 # Directorios de medios (no necesarios para build)
 media/
 config/1tb1/
