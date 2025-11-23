@@ -236,6 +236,7 @@ main() {
     declare -a RUNNING_SCRIPTS
     declare -a RUNNING_PIDS
     declare -a RUNNING_CONTAINERS
+    local cancelled_processes=false
 
     if ! list_running_processes; then
         exit 0
@@ -247,6 +248,7 @@ main() {
         case $choice in
             0)
                 cancel_all_processes
+                cancelled_processes=true
                 break
                 ;;
             q|Q)
@@ -257,6 +259,7 @@ main() {
                 index=$((choice-1))
                 if [ $index -ge 0 ] && [ $index -lt ${#RUNNING_SCRIPTS[@]} ]; then
                     cancel_process "${RUNNING_PIDS[$index]}" "${RUNNING_SCRIPTS[$index]}" "${RUNNING_CONTAINERS[$index]}"
+                    cancelled_processes=true
                     echo ""
                     # Actualizar lista
                     if ! list_running_processes; then
@@ -273,7 +276,9 @@ main() {
     done
 
     echo ""
-    echo "Cancelación completada."
+    if [ "$cancelled_processes" = true ]; then
+        echo "Cancelación completada."
+    fi
 }
 
 # Ejecutar función principal

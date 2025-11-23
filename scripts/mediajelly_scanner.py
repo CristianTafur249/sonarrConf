@@ -48,6 +48,8 @@ import subprocess
 from pathlib import Path
 from typing import List
 
+from mediajelly_utils import MediaJellyPaths
+
 
 class MediaScanner:
     """
@@ -79,8 +81,8 @@ class MediaScanner:
         Total: 212, Nuevos: 5
     """
 
-    EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
-    EXCLUDED_FOLDERS = {".delete", ".deleted", ".tmp", ".temp", ".trash", ".recycle"}
+    EXTENSIONS = MediaJellyPaths.EXTENSIONS
+    EXCLUDED_FOLDERS = MediaJellyPaths.EXCLUDED_FOLDERS
 
     def __init__(self):
         # Detecta el entorno
@@ -495,7 +497,7 @@ class MediaScanner:
             self.logger.info(f"  ... y {len(files_needing_subtitles) - 5} más")
 
     def validate_file_integrity(self, file_path: Path) -> bool:
-        """Valida la integridad de un archivo multimedia usando ffmpeg
+        """Valida la integridad de un archivo multimedia usando ffprobe
 
         Args:
             file_path: Ruta al archivo a validar
@@ -504,11 +506,11 @@ class MediaScanner:
             True si el archivo es válido, False si está corrupto
         """
         try:
-            # Comando ffmpeg para validar archivo
-            cmd = ["ffmpeg", "-v", "error", "-i", str(file_path), "-f", "null", "-"]
+            # Comando ffprobe para validar archivo (más rápido que ffmpeg)
+            cmd = ["ffprobe", "-v", "error", "-show_format", "-show_streams", str(file_path)]
 
-            # Ejecutar comando con timeout de 30 segundos
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
+            # Ejecutar comando con timeout de 120 segundos
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, text=True)
 
             # Si hay errores en stderr, el archivo puede estar corrupto
             if result.stderr:

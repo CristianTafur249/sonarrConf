@@ -90,6 +90,32 @@ queue_completed_files = Gauge(
     registry=registry
 )
 
+# Métricas de traducción de subtítulos
+subtitles_translated_total = Counter(
+    'mediajelly_subtitles_translated_total',
+    'Total number of subtitles translated',
+    registry=registry
+)
+
+subtitles_translation_errors_total = Counter(
+    'mediajelly_subtitles_translation_errors_total',
+    'Total number of subtitle translation errors',
+    registry=registry
+)
+
+subtitles_extracted_total = Counter(
+    'mediajelly_subtitles_extracted_total',
+    'Total number of subtitles extracted from audio',
+    registry=registry
+)
+
+translation_time_seconds = Histogram(
+    'mediajelly_translation_time_seconds',
+    'Time spent translating subtitles',
+    buckets=[1, 5, 10, 30, 60, 120, 300],
+    registry=registry
+)
+
 # Métricas de sistema
 system_cpu_percent = Gauge(
     'mediajelly_system_cpu_percent',
@@ -143,6 +169,7 @@ class MediaJellyMetricsCollector:
         try:
             logger.info("Actualizando métricas...")
             self._update_processing_metrics()
+            self._update_translation_metrics()
             self._update_queue_metrics()
             self._update_system_metrics()
             
@@ -198,6 +225,36 @@ class MediaJellyMetricsCollector:
         except Exception as e:
             logger.error(f"Error actualizando métricas de procesamiento: {e}")
 
+    def _update_translation_metrics(self):
+        """Actualiza métricas de traducción de subtítulos"""
+        try:
+            translation_metrics_file = tmp_dir / "translation_metrics.json"
+            
+            if translation_metrics_file.exists():
+                with open(translation_metrics_file, 'r', encoding='utf-8') as f:
+                    metrics_data = json.load(f)
+
+                # Manejar tanto listas como diccionarios
+                if isinstance(metrics_data, list) and metrics_data:
+                    latest_metrics = metrics_data[-1]  # Última entrada
+                elif isinstance(metrics_data, dict):
+                    latest_metrics = metrics_data
+                else:
+                    return
+
+                # Actualizar métricas de traducción
+                subtitles_translated_total._value.set(latest_metrics.get('subtitles_translated', 0))
+                subtitles_translation_errors_total._value.set(latest_metrics.get('translation_errors', 0))
+                subtitles_extracted_total._value.set(latest_metrics.get('subtitles_extracted', 0))
+                
+                # Actualizar histograma de tiempo de traducción
+                avg_translation_time = latest_metrics.get('avg_translation_time', 0.0)
+                if avg_translation_time > 0:
+                    translation_time_seconds.observe(avg_translation_time)
+
+        except Exception as e:
+            logger.error(f"Error actualizando métricas de traducción: {e}")
+
     def _update_queue_metrics(self):
         """Actualiza métricas de cola"""
         try:
@@ -235,7 +292,8 @@ class MediaJellyMetricsCollector:
 def main():
     """Función principal"""
     # Configurar puerto
-    port = int(os.getenv("MEDIAJELLY_METRICS_PORT", "9090"))
+    port = 9090  # Puerto fijo para evitar conflictos
+    # port = int(os.getenv("MEDIAJELLY_METRICS_PORT", "9090"))
     
     logger.info(f"Iniciando Prometheus exporter en puerto {port}")
     logger.info(f"Base directory: {base_dir}")

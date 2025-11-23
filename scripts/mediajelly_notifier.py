@@ -14,6 +14,9 @@ import logging
 
 from mediajelly_emoji import EmojiGenerator
 
+# Importar configuración centralizada
+from mediajelly_config import get_config
+
 # Constantes
 REQUEST_TIMEOUT = 30  # Timeout para requests HTTP (segundos)
 
@@ -22,42 +25,56 @@ class TelegramNotifier:
     """Notificador de Telegram optimizado"""
 
     def __init__(self):
+        # Configura logging ANTES de cualquier cosa
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Inicializando TelegramNotifier...")
+        
+        # Cargar configuración centralizada
+        try:
+            self.config_obj = get_config()
+            print(f"{EmojiGenerator.success()} Configuración YAML cargada exitosamente")
+        except Exception as e:
+            print(f"Error cargando configuración: {e}")
+            sys.exit(1)
+
         # Detecta el entorno
         self.is_container = Path("/mediajelly").exists()
         self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
         self.scripts_dir = self.base_dir / "scripts"
-        self.config_file = self.base_dir / "config" / "telegram.conf"
         self.state_file = self.scripts_dir / "tmp" / "last_notification_state"
         self.queue_file = self.scripts_dir / "tmp" / "notification_queue.json"
 
         # Crea directorio tmp
         (self.scripts_dir / "tmp").mkdir(parents=True, exist_ok=True)
 
-        # Carga la configuración
-        self.config = self.load_config()
-
-        # Configura logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        # Cargar configuración de Telegram
+        try:
+            self.config = self.load_config()
+            self.logger.info("Configuración de Telegram cargada exitosamente")
+        except Exception as e:
+            self.logger.error(f"Error cargando configuración de Telegram: {e}")
+            sys.exit(1)
 
     def load_config(self) -> Dict[str, str]:
-        """Cargar configuración de Telegram desde archivo bash"""
+        """Cargar configuración de Telegram desde YAML centralizado"""
         config = {}
-        if self.config_file.exists():
-            with open(self.config_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        # Remueve comillas
-                        value = value.strip("\"'")
-                        config[key] = value
+
+        try:
+            # Extraer configuración de telegram del objeto de configuración
+            config["TELEGRAM_BOT_TOKEN"] = self.config_obj.telegram.bot_token
+            config["TELEGRAM_CHAT_ID"] = self.config_obj.telegram.chat_id
+        except AttributeError as e:
+            self.logger.error(f"Error accediendo a configuración de Telegram: {e}")
+            self.logger.error("Verifica que la configuración YAML tenga la sección 'telegram' con 'bot_token' y 'chat_id'")
+            raise ValueError(f"Configuración de Telegram inválida: {e}")
 
         # Verifica configuración requerida
         required = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
         for req in required:
-            if req not in config:
+            if req not in config or not config[req]:
                 self.logger.error(f"Configuración faltante: {req}")
+                raise ValueError(f"Configuración requerida faltante: {req}")
 
         return config
 

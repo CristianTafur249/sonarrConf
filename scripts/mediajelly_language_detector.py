@@ -12,63 +12,47 @@ import subprocess
 import tempfile
 import random
 import traceback
+import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
+
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 # Importar módulo de emojis
 from mediajelly_emoji import EmojiGenerator
+
+# Importar configuración centralizada
+from mediajelly_config import MediaJellyConfig
 
 # ============================================================================
 # CONFIGURACIÓN
 # ============================================================================
 
-# Detectar si estamos en contenedor o host
-if Path("/mediajelly").exists():
-    MEDIA_PATHS = ["/mediajelly/media/anime", "/mediajelly/media/series", "/mediajelly/media/Peliculas"]
-    CACHE_FILE_PATH = "/mediajelly/scripts/tmp/language_detection_cache.json"
-    LOG_FILE_PATH = "/mediajelly/scripts/logs/language-detection.log"
-else:
-    MEDIA_PATHS = [
-        "/home/tafurc/mediaJelly/media/anime",
-        "/home/tafurc/mediaJelly/media/series",
-        "/home/tafurc/mediaJelly/media/Peliculas",
-    ]
-    CACHE_FILE_PATH = "/home/tafurc/mediaJelly/scripts/tmp/language_detection_cache.json"
-    LOG_FILE_PATH = "/home/tafurc/mediaJelly/scripts/logs/language-detection.log"
+# Cargar configuración centralizada
+try:
+    config = MediaJellyConfig()
+    print(f"{EmojiGenerator.success()} Configuración YAML cargada exitosamente")
+except Exception as e:
+    print(f"Error cargando configuración: {e}")
+    sys.exit(1)
 
-LANGUAGE_CODE_MAP = {
-    "es": "spa",
-    "en": "eng",
-    "ja": "jpn",
-    "fr": "fra",
-    "de": "deu",
-    "it": "ita",
-    "pt": "por",
-    "ru": "rus",
-    "zh": "chi",
-    "ko": "kor",
-    "ar": "ara",
-    "hi": "hin",
-    "tr": "tur",
-    "pl": "pol",
-    "nl": "nld",
-    "sv": "swe",
-    "no": "nor",
-    "da": "dan",
-    "fi": "fin",
-    "cs": "cze",
-    "hu": "hun",
-    "ro": "rum",
-    "th": "tha",
-    "vi": "vie",
-    "id": "ind",
-    "he": "heb",
-    "el": "gre",
-    "uk": "ukr",
-    "ca": "cat",
-    "hr": "hrv",
-}
+# Extraer configuración específica del módulo
+MEDIA_PATHS = config.paths.media_paths
+CACHE_FILE_PATH = config.paths.cache_file_path
+LOG_FILE_PATH = config.logging.language_detection_log
+
+# Configuración Redis para cache
+REDIS_HOST = config.language_detection.redis_host
+REDIS_PORT = config.language_detection.redis_port
+REDIS_DB = config.language_detection.redis_db
+CACHE_TTL = config.language_detection.cache_ttl_seconds
+
+LANGUAGE_CODE_MAP = config.language_detection.language_code_map
 
 # ============================================================================
 # UTILIDADES
@@ -76,7 +60,19 @@ LANGUAGE_CODE_MAP = {
 
 
 def validate_file_path(file_path: Union[str, Path]) -> Path:
-    """Valida que la ruta de archivo sea segura y exista."""
+    """
+    Valida que la ruta de archivo sea segura y exista.
+
+    Args:
+        file_path: Ruta del archivo a validar.
+
+    Returns:
+        Path: Objeto Path resuelto y validado.
+
+    Raises:
+        ValueError: Si la ruta es inválida o es un directorio.
+        FileNotFoundError: Si el archivo no existe.
+    """
     if not file_path or not isinstance(file_path, (str, Path)):
         raise ValueError("Ruta de archivo inválida")
 
@@ -92,7 +88,19 @@ def validate_file_path(file_path: Union[str, Path]) -> Path:
 
 
 def safe_subprocess_run(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
-    """Ejecuta subprocess.run con validación adicional de seguridad."""
+    """
+    Ejecuta subprocess.run con validación adicional de seguridad.
+
+    Args:
+        cmd: Lista de argumentos del comando.
+        **kwargs: Argumentos adicionales para subprocess.run.
+
+    Returns:
+        subprocess.CompletedProcess: Resultado de la ejecución.
+
+    Raises:
+        ValueError: Si el comando es inválido o no permitido.
+    """
     if not cmd or not isinstance(cmd, list):
         raise ValueError("Comando inválido")
 
@@ -134,7 +142,12 @@ def log(message: str, level: str = "INFO") -> None:
 
 
 def load_cache() -> Dict[str, Any]:
-    """Carga el caché de idiomas detectados."""
+    """
+    Carga el caché de idiomas detectados desde el archivo JSON.
+
+    Returns:
+        Dict[str, Any]: Diccionario con el caché cargado o vacío si hay error.
+    """
     if os.path.exists(CACHE_FILE_PATH):
         try:
             with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
@@ -145,14 +158,140 @@ def load_cache() -> Dict[str, Any]:
 
 
 def save_cache(cache: Dict[str, Any]) -> None:
-    """Guarda el caché de idiomas detectados."""
+    """
+    Guarda el caché de idiomas detectados en el archivo JSON.
+
+    Args:
+        cache: Diccionario con los datos a guardar.
+    """
     try:
         os.makedirs(os.path.dirname(CACHE_FILE_PATH), exist_ok=True)
         with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
+        # Asegurar permisos de escritura para todos los usuarios
+        os.chmod(CACHE_FILE_PATH, 0o666)
         log(f"Caché guardado: {len(cache)} archivos", "SUCCESS")
     except Exception as e:
         log(f"Error guardando caché: {e}", "ERROR")
+
+
+def get_redis_client():
+    """
+    Obtiene cliente Redis si está disponible y configurado.
+
+    Returns:
+        redis.Redis or None: Cliente Redis conectado o None si no está disponible.
+    """
+    if not REDIS_AVAILABLE:
+        return None
+    try:
+        client = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2
+        )
+        client.ping()  # Verificar conexión
+        return client
+    except Exception as e:
+        log(f"Redis no disponible: {e}", "WARNING")
+        return None
+
+
+def get_file_hash(file_path: Union[str, Path]) -> Optional[str]:
+    """
+    Genera hash SHA256 del archivo para uso como clave de caché.
+
+    Args:
+        file_path: Ruta del archivo.
+
+    Returns:
+        str: Hash SHA256 en formato hexadecimal, o None si hay error.
+    """
+    try:
+        hash_sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            # Leer en chunks para archivos grandes
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
+    except Exception as e:
+        log(f"Error generando hash para {file_path}: {e}", "WARNING")
+        return None
+
+
+def get_cached_language(file_path: Union[str, Path], stream_index: int) -> Optional[str]:
+    """
+    Obtiene el idioma cacheado para un archivo y stream específico.
+
+    Intenta obtenerlo de Redis primero, y luego del caché local en archivo.
+
+    Args:
+        file_path: Ruta del archivo.
+        stream_index: Índice del stream de audio.
+
+    Returns:
+        str: Código de idioma si se encuentra, None en caso contrario.
+    """
+    redis_client = get_redis_client()
+    if not redis_client:
+        # Fallback al cache de archivo
+        cache = load_cache()
+        file_key = str(file_path)
+        if file_key in cache and str(stream_index) in cache[file_key]:
+            return cache[file_key][str(stream_index)]
+        return None
+
+    # Usar Redis cache
+    file_hash = get_file_hash(file_path)
+    if not file_hash:
+        return None
+
+    cache_key = f"lang:{file_hash}:{stream_index}"
+    try:
+        cached_result = redis_client.get(cache_key)
+        if cached_result:
+            log(f"Cache hit para {file_path} stream {stream_index}: {cached_result}", "SUCCESS")
+            return cached_result
+    except Exception as e:
+        log(f"Error leyendo cache Redis: {e}", "WARNING")
+
+    return None
+
+
+def set_cached_language(file_path: Union[str, Path], stream_index: int, language: str) -> None:
+    """
+    Guarda el idioma detectado en caché (Redis y/o archivo).
+
+    Args:
+        file_path: Ruta del archivo.
+        stream_index: Índice del stream de audio.
+        language: Código de idioma detectado.
+    """
+    redis_client = get_redis_client()
+    if not redis_client:
+        # Fallback al cache de archivo
+        cache = load_cache()
+        file_key = str(file_path)
+        if file_key not in cache:
+            cache[file_key] = {}
+        cache[file_key][str(stream_index)] = language
+        save_cache(cache)
+        return
+
+    # Usar Redis cache
+    file_hash = get_file_hash(file_path)
+    if not file_hash:
+        return
+
+    cache_key = f"lang:{file_hash}:{stream_index}"
+    try:
+        redis_client.setex(cache_key, CACHE_TTL, language)
+        log(f"Cacheado idioma para {file_path} stream {stream_index}: {language}", "SUCCESS")
+    except Exception as e:
+        log(f"Error guardando en cache Redis: {e}", "WARNING")
 
 
 # ============================================================================
@@ -160,10 +299,15 @@ def save_cache(cache: Dict[str, Any]) -> None:
 # ============================================================================
 
 
-def get_streams_needing_detection(file_path):
+def get_streams_needing_detection(file_path: Union[str, Path]) -> List[Tuple[int, str, float]]:
     """
-    Detecta streams de audio sin etiqueta de idioma.
-    Retorna lista de tuplas (stream_index_absoluto, codec, duration).
+    Detecta streams de audio que no tienen etiqueta de idioma válida.
+
+    Args:
+        file_path: Ruta del archivo a analizar.
+
+    Returns:
+        List[Tuple[int, str, float]]: Lista de tuplas (stream_index_absoluto, codec, duration).
     """
     try:
         # Validar entrada
@@ -222,7 +366,15 @@ def get_streams_needing_detection(file_path):
 
 
 def get_file_duration(file_path: Union[str, Path]) -> float:
-    """Obtiene la duración del archivo en segundos."""
+    """
+    Obtiene la duración del archivo multimedia en segundos.
+
+    Args:
+        file_path: Ruta del archivo.
+
+    Returns:
+        float: Duración en segundos, o 0.0 si hay error.
+    """
     try:
         # Validar entrada
         validated_path = validate_file_path(file_path)
@@ -256,12 +408,18 @@ def get_file_duration(file_path: Union[str, Path]) -> float:
 
 
 def load_whisper_model():
-    """Carga el modelo Whisper."""
+    """
+    Carga el modelo Whisper configurado.
+
+    Returns:
+        whisper.model: Modelo cargado o None si hay error.
+    """
     try:
         import whisper
 
-        log(f"{EmojiGenerator.refresh()} Cargando modelo Whisper (base)...", "INFO")
-        model = whisper.load_model("base")
+        model_name = config.language_detection.whisper_model
+        log(f"{EmojiGenerator.refresh()} Cargando modelo Whisper ({model_name})...", "INFO")
+        model = whisper.load_model(model_name)
         log(f"{EmojiGenerator.success()} Modelo Whisper cargado exitosamente", "SUCCESS")
         return model
     except Exception as e:
@@ -271,7 +429,18 @@ def load_whisper_model():
 
 
 def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_time: Union[int, float], duration: int = 60) -> Optional[str]:
-    """Extrae una muestra de audio desde un timestamp específico."""
+    """
+    Extrae una muestra de audio de un archivo multimedia.
+
+    Args:
+        file_path: Ruta del archivo original.
+        stream_index: Índice del stream de audio a extraer.
+        start_time: Tiempo de inicio en segundos.
+        duration: Duración de la muestra en segundos.
+
+    Returns:
+        str: Ruta del archivo temporal .wav generado, o None si hay error.
+    """
     try:
         # Validar entrada
         validated_path = validate_file_path(file_path)
@@ -320,8 +489,17 @@ def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_t
         return None
 
 
-def detect_language_with_whisper(model, audio_file):
-    """Detecta el idioma de un archivo de audio usando Whisper."""
+def detect_language_with_whisper(model, audio_file: str) -> Tuple[Optional[str], Dict]:
+    """
+    Detecta el idioma de un archivo de audio usando Whisper.
+
+    Args:
+        model: Modelo Whisper cargado.
+        audio_file: Ruta al archivo de audio.
+
+    Returns:
+        Tuple[Optional[str], Dict]: Idioma detectado y diccionario de probabilidades.
+    """
     try:
         # Transcribir solo para detección de idioma (sin transcripción completa)
         audio = model.transcribe(audio_file, language=None, task="transcribe", fp16=False)
@@ -341,25 +519,36 @@ def detect_language_with_whisper(model, audio_file):
         return None, {}
 
 
-def detect_language_with_multiple_samples(model, file_path, stream_index, total_duration):
+def detect_language_with_multiple_samples(model, file_path: Union[str, Path], stream_index: int, total_duration: float) -> str:
     """
     Detecta el idioma usando múltiples muestras aleatorias y votación.
-    Retorna el idioma detectado en formato ISO 639-2 (3 letras).
+
+    Toma varias muestras del archivo, detecta el idioma en cada una y realiza
+    una votación ponderada para determinar el idioma final.
+
+    Args:
+        model: Modelo Whisper cargado.
+        file_path: Ruta del archivo multimedia.
+        stream_index: Índice del stream de audio.
+        total_duration: Duración total del archivo en segundos.
+
+    Returns:
+        str: Código de idioma detectado en formato ISO 639-2 (3 letras).
     """
     if total_duration < 60:
         log(f"Archivo muy corto ({total_duration:.1f}s), usando muestra única", "WARNING")
         return detect_single_sample(model, file_path, stream_index, total_duration)
 
-    # Calcular número de muestras (máximo 10)
-    num_samples = min(10, int(total_duration / 60))
-    log(f"🎙️ Analizando {num_samples} muestras aleatorias de 60s...", "DETECT")
+    # Calcular número de muestras (máximo 15, duración 30s cada una)
+    num_samples = min(15, int(total_duration / 30))
+    log(f"🎙️ Analizando {num_samples} muestras aleatorias de 30s...", "DETECT")
 
-    # Generar timestamps aleatorios (evitar primeros y últimos 30s)
-    safe_start = 30
-    safe_end = total_duration - 90  # -60s para la muestra, -30s de margen
-
+    # Generar timestamps aleatorios (evitar primeros y últimos 15s)
+    safe_start = 15
+    safe_end = total_duration - 45  # -30s para la muestra, -15s de margen
+    
     if safe_end <= safe_start:
-        safe_end = total_duration - 60 if total_duration > 60 else 0
+        safe_end = total_duration - 30 if total_duration > 30 else 0
 
     timestamps = sorted(random.sample(range(int(safe_start), int(safe_end)), num_samples))
 
@@ -368,7 +557,7 @@ def detect_language_with_multiple_samples(model, file_path, stream_index, total_
     temp_files = []
 
     for i, timestamp in enumerate(timestamps, 1):
-        temp_audio = extract_audio_sample(file_path, stream_index, timestamp, 60)
+        temp_audio = extract_audio_sample(file_path, stream_index, timestamp, 30)
 
         if not temp_audio:
             continue
@@ -433,8 +622,19 @@ def detect_language_with_multiple_samples(model, file_path, stream_index, total_
     return LANGUAGE_CODE_MAP.get(final_lang, final_lang)
 
 
-def detect_single_sample(model, file_path, stream_index, total_duration):
-    """Detecta idioma con una sola muestra (archivos cortos)."""
+def detect_single_sample(model, file_path: Union[str, Path], stream_index: int, total_duration: float) -> str:
+    """
+    Detecta el idioma usando una única muestra (para archivos cortos).
+
+    Args:
+        model: Modelo Whisper cargado.
+        file_path: Ruta del archivo multimedia.
+        stream_index: Índice del stream de audio.
+        total_duration: Duración total del archivo en segundos.
+
+    Returns:
+        str: Código de idioma detectado en formato ISO 639-2.
+    """
     start_time = min(10, total_duration / 2) if total_duration > 15 else 0
 
     temp_audio = extract_audio_sample(file_path, stream_index, start_time, min(60, total_duration))
@@ -472,8 +672,13 @@ def detect_single_sample(model, file_path, stream_index, total_duration):
 # ============================================================================
 
 
-def validate_media_paths():
-    """Valida que los directorios de medios existan."""
+def validate_media_paths() -> bool:
+    """
+    Valida que los directorios de medios configurados existan.
+
+    Returns:
+        bool: True si todos los directorios existen, False si falta alguno.
+    """
     missing_paths = []
     for path in MEDIA_PATHS:
         if not Path(path).exists():
@@ -485,8 +690,15 @@ def validate_media_paths():
     return True
 
 
-def scan_files_needing_detection():
-    """Escanea archivos pendientes de procesamiento y detecta cuáles necesitan análisis de idioma."""
+def scan_files_needing_detection() -> List[Dict[str, Any]]:
+    """
+    Escanea archivos pendientes de procesamiento y detecta cuáles necesitan análisis de idioma.
+
+    Lee el archivo de pendientes y verifica si cada archivo tiene streams de audio sin etiqueta de idioma.
+
+    Returns:
+        List[Dict[str, Any]]: Lista de diccionarios con información de archivos a analizar.
+    """
     # Validar que los directorios de medios existan
     if not validate_media_paths():
         log("Algunos directorios de medios no existen", "ERROR")
@@ -553,8 +765,17 @@ def scan_files_needing_detection():
     return files_to_analyze
 
 
-def process_files(files_to_analyze, cache):
-    """Procesa los archivos detectando idiomas de sus streams."""
+def process_files(files_to_analyze: List[Dict[str, Any]], cache: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Procesa los archivos detectando idiomas de sus streams.
+
+    Args:
+        files_to_analyze: Lista de archivos a analizar.
+        cache: Caché actual de idiomas.
+
+    Returns:
+        Dict[str, Any]: Caché actualizado.
+    """
     if not files_to_analyze:
         log("No hay archivos que necesiten análisis de idioma", "INFO")
         return cache
@@ -586,10 +807,18 @@ def process_files(files_to_analyze, cache):
         for stream_index, codec, duration in streams:
             log(f"\n🎙️ Analizando stream {stream_index} ({codec}, {duration:.1f}s)...", "DETECT")
 
-            detected_lang = detect_language_with_multiple_samples(model, absolute_path, stream_index, duration)
+            # Verificar cache primero
+            cached_lang = get_cached_language(absolute_path, stream_index)
+            if cached_lang:
+                detected_lang = cached_lang
+                log(f"Stream {stream_index}: {detected_lang} (cacheado)", "SUCCESS")
+            else:
+                detected_lang = detect_language_with_multiple_samples(model, absolute_path, stream_index, duration)
+                set_cached_language(absolute_path, stream_index, detected_lang)
+                log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
 
+            # Mantener compatibilidad con cache de archivo
             cache[absolute_path][str(stream_index)] = detected_lang
-            log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
 
         # Guardar caché cada 5 archivos
         if idx % 5 == 0:

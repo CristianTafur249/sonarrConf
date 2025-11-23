@@ -15,6 +15,9 @@ from typing import Optional, List, Tuple
 # Importar módulo de emojis
 from mediajelly_emoji import EmojiGenerator
 
+# Agregar scripts al path para imports
+sys.path.insert(0, str(Path(__file__).parent))
+
 # Importar módulos directamente para evitar subprocess overhead
 try:
     from mediajelly_scanner import MediaScanner
@@ -113,13 +116,15 @@ class MediaJellyCron:
     def _run_script(self, script_path: Path, timeout: int = 300) -> Tuple[bool, str]:
         """
         Ejecuta un script Python con timeout.
-        
+
         Args:
-            script_path: Ruta al script a ejecutar
-            timeout: Timeout en segundos
-            
+            script_path: Ruta al script a ejecutar.
+            timeout: Tiempo máximo de ejecución en segundos.
+
         Returns:
-            Tuple con (éxito, output)
+            Tuple conteniendo:
+            - bool: True si la ejecución fue exitosa (código 0), False en caso contrario.
+            - str: Salida estándar (stdout) si fue exitoso, o error (stderr) si falló.
         """
         try:
             self.logger.info(f"Ejecutando: {script_path}")
@@ -140,7 +145,15 @@ class MediaJellyCron:
             return False, str(e)
 
     def run_scanner(self) -> bool:
-        """Ejecuta el scanner de archivos usando la clase directamente"""
+        """
+        Ejecuta el scanner de archivos.
+
+        Intenta usar la clase MediaScanner directamente si está disponible,
+        de lo contrario hace fallback a ejecución por subprocess.
+
+        Returns:
+            bool: True si la ejecución fue exitosa.
+        """
         if not SCANNER_AVAILABLE:
             self.logger.error("MediaScanner no disponible, usando subprocess fallback")
             success, _ = self._run_script(self.scanner_script, timeout=600)
@@ -161,13 +174,26 @@ class MediaJellyCron:
             return False
 
     def _is_night_time(self) -> bool:
-        """Verifica si es hora de procesar subtítulos (noche: 00:00-05:59)"""
+        """
+        Verifica si es hora de procesar subtítulos (horario nocturno).
+
+        Returns:
+            bool: True si la hora actual está entre 00:00 y 05:59.
+        """
         current_hour = datetime.now().hour
         # Noche: de 00:00 a 05:59 (0-5)
         return current_hour <= 5
 
     def run_subtitle_translator(self) -> bool:
-        """Ejecuta el traductor de subtítulos usando función directa"""
+        """
+        Ejecuta el traductor de subtítulos.
+
+        Intenta usar la función main del módulo directamente si está disponible,
+        de lo contrario hace fallback a ejecución por subprocess.
+
+        Returns:
+            bool: True si la ejecución fue exitosa.
+        """
         if not SUBTITLE_AVAILABLE:
             self.logger.error("Subtitle translator no disponible, usando subprocess fallback")
             success, _ = self._run_script(self.subtitle_script, timeout=3600)
@@ -213,7 +239,14 @@ class MediaJellyCron:
             return False
 
     def run_language_detector(self) -> bool:
-        """Ejecuta el detector de idiomas antes del procesador"""
+        """
+        Ejecuta el detector de idiomas.
+
+        Realiza un pre-análisis de idiomas antes del procesamiento principal.
+
+        Returns:
+            bool: True si la ejecución fue exitosa.
+        """
         if not LANGUAGE_DETECTOR_AVAILABLE:
             self.logger.warning("Language detector no disponible, usando subprocess fallback")
             success, _ = self._run_script(self.language_detector_script, timeout=1800)  # 30 minutos
@@ -232,7 +265,15 @@ class MediaJellyCron:
             return False
 
     def run_processor(self) -> bool:
-        """Ejecuta el procesador de archivos usando la clase directamente"""
+        """
+        Ejecuta el procesador de archivos principal.
+
+        Intenta usar la clase MediaJellyProcessor directamente si está disponible,
+        de lo contrario hace fallback a ejecución por subprocess.
+
+        Returns:
+            bool: True si la ejecución fue exitosa.
+        """
         if not PROCESSOR_AVAILABLE:
             self.logger.error("MediaJellyProcessor no disponible, usando subprocess fallback")
             success, _ = self._run_script(self.processor_script, timeout=7200)
@@ -251,7 +292,18 @@ class MediaJellyCron:
             return False
 
     def run_cycle(self) -> bool:
-        """Ejecuta un ciclo completo de scanner + detector de idiomas + processor/subtítulos según la hora"""
+        """
+        Ejecuta un ciclo completo de procesamiento.
+
+        Flujo de ejecución:
+        1. Scanner: Detecta nuevos archivos.
+        2. Language Detector: Pre-analiza idiomas.
+        3. Subtitle Translator (solo noche): Traduce subtítulos si es necesario.
+        4. Processor: Comprime y optimiza archivos.
+
+        Returns:
+            bool: True si el ciclo completo fue exitoso.
+        """
         try:
             self.logger.info("Iniciando ciclo de procesamiento")
 

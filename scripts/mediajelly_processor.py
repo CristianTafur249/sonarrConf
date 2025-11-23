@@ -37,6 +37,14 @@ except ImportError:
 
 # Importar módulo de emojis
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_exceptions import (
+    MediaJellyError,
+    CompressionError,
+    ValidationError,
+    ConfigurationError,
+    LanguageDetectionError,
+)
+from mediajelly_utils import MediaJellyPaths
 
 # Configuración optimizada de constantes
 MAX_MEMORY_GB = 4
@@ -52,7 +60,7 @@ LOG_RETENTION_DAYS = 7  # Reducido para ahorrar espacio
 SHORT_TIMEOUT = 10
 MEDIUM_TIMEOUT = 60  # Reducido para mayor eficiencia
 PROCESSING_COMPLETED_MESSAGE = "Procesamiento completado"
-EXCLUDED_FOLDERS = {".delete", ".deleted", ".tmp", ".temp", ".trash", ".recycle"}
+EXCLUDED_FOLDERS = MediaJellyPaths.EXCLUDED_FOLDERS
 MOVFLAGS_FASTSTART = "+faststart"
 
 
@@ -136,7 +144,8 @@ class MetricsCollector:
 
     def __init__(self, logs_dir: Path):
         self.logs_dir = logs_dir
-        self.metrics_file = logs_dir / "processing_metrics.json"
+        self.tmp_dir = logs_dir.parent / "tmp"  # Cambiar a tmp_dir
+        self.metrics_file = self.tmp_dir / "processing_metrics.json"
 
     def calculate_metrics(self, stats: ProcessingStats, execution_time: float) -> ProcessingMetrics:
         """Calcula métricas detalladas desde estadísticas de procesamiento"""
@@ -231,7 +240,6 @@ class MediaJellyProcessor:
         # Archivos
         self.pending_file = self.tmp_dir / "pending-compression.txt"
         self.completed_file = self.tmp_dir / "completed.txt"
-        self.config_file = self.base_dir / "config" / "telegram.conf"
         self.failed_file = self.tmp_dir / FAILED_COMPRESSION_FILE
 
         # Logs
@@ -255,7 +263,7 @@ class MediaJellyProcessor:
         self.quality_improver = VideoQualityImprover(self.logger)
 
         # Caché de idiomas pre-detectados (llenado por mediajelly_language_detector.py)
-        self.language_cache_file = self.tmp_dir / "language_detection_cache.json"
+        self.language_cache_file = self.tmp_dir / "language_cache.json"
         self.language_cache = self._load_language_cache()
 
         # Modelo Whisper deshabilitado (se usa pre-análisis)
@@ -1218,6 +1226,11 @@ class MediaJellyProcessor:
         """Carga el caché de idiomas pre-detectados por mediajelly_language_detector.py"""
         if self.language_cache_file.exists():
             try:
+                # Check if file is empty before parsing
+                if self.language_cache_file.stat().st_size == 0:
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Caché de idiomas vacío, inicializando...")
+                    return {}
+                    
                 with open(self.language_cache_file, "r", encoding="utf-8") as f:
                     cache = json.load(f)
                 self.logger.info(f"{EmojiGenerator.folder()} Caché de idiomas cargado: {len(cache)} archivos")
@@ -1628,11 +1641,20 @@ class MediaJellyProcessor:
             self.logger.error(f"Error detectando idiomas en {file_path}: {e}")
             return False, [], [], {}
 
-    def _validate_file_for_compression(self, file_path: Path) -> Tuple[bool, str]:
-        """Valida si el archivo necesita compresión con validaciones rápidas primero"""
+    def _validate_file_for_compression(self, file_path: Path) -> None:
+        """
+        Valida si el archivo necesita compresión con validaciones rápidas primero.
+
+        Args:
+            file_path: Ruta al archivo a validar.
+
+        Raises:
+            ValidationError: Si el archivo no es válido para compresión.
+            FileNotFoundError: Si el archivo no existe.
+        """
         # Validaciones rápidas primero
         if not file_path.exists():
-            return False, f"Archivo no encontrado: {file_path}"
+            raise FileNotFoundError(f"Archivo no encontrado: {file_path}")
 
         try:
             stat = file_path.stat()
@@ -1640,14 +1662,14 @@ class MediaJellyProcessor:
 
             # Verifica tamaño mínimo para compresión (archivos muy pequeños no necesitan compresión)
             if file_path.suffix.lower() == ".mp4" and file_size < 50 * 1024 * 1024:  # Menos de 50MB
-                return False, "archivo_pequeno"
+                raise ValidationError("archivo_pequeno")
 
             # Verifica que no sea un archivo vacío o corrupto básicamente
             if file_size == 0:
-                return False, f"Archivo vacío: {file_path}"
+                raise ValidationError(f"Archivo vacío: {file_path}")
 
         except OSError as e:
-            return False, f"Error accediendo al archivo: {file_path} - {str(e)}"
+            raise ValidationError(f"Error accediendo al archivo: {file_path} - {str(e)}")
 
         # Validación con ffprobe (más costosa, pero necesaria)
         try:
@@ -1666,27 +1688,27 @@ class MediaJellyProcessor:
             )
 
             if probe_result.returncode != 0:
-                return False, f"Archivo corrupto o no válido: {file_path}"
+                raise ValidationError(f"Archivo corrupto o no válido: {file_path}")
 
             # Verifica que tenga duración
             duration_str = probe_result.stdout.strip()
             if not duration_str or duration_str == "N/A":
-                return False, f"Archivo sin duración válida: {file_path}"
+                raise ValidationError(f"Archivo sin duración válida: {file_path}")
 
             # Verifica que la duración sea razonable (más de 10 segundos)
             try:
                 duration = float(duration_str)
                 if duration < 10.0:
-                    return False, f"Archivo demasiado corto ({duration:.1f}s): {file_path}"
+                    raise ValidationError(f"Archivo demasiado corto ({duration:.1f}s): {file_path}")
             except ValueError:
-                return False, f"Duración no válida: {file_path}"
+                raise ValidationError(f"Duración no válida: {file_path}")
 
         except subprocess.TimeoutExpired:
-            return False, f"Timeout validando archivo: {file_path}"
+            raise ValidationError(f"Timeout validando archivo: {file_path}")
         except Exception as e:
-            return False, f"Error validando archivo: {file_path} - {str(e)}"
-
-        return True, ""
+            if isinstance(e, ValidationError):
+                raise
+            raise ValidationError(f"Error validando archivo: {file_path} - {str(e)}")
 
     def _get_video_codec(self, file_path: Path) -> str:
         """Detecta el codec de video del archivo"""
@@ -1973,7 +1995,21 @@ class MediaJellyProcessor:
         elapsed_time: float,
         used_gpu: bool = True,
     ) -> Dict:
-        """Procesa el resultado de la compresión"""
+        """
+        Procesa el resultado del intento de compresión.
+
+        Evalúa el código de retorno y el archivo de salida para determinar éxito o fallo.
+
+        Args:
+            process: Resultado del proceso subprocess.run.
+            file_path: Ruta del archivo original.
+            temp_output: Ruta del archivo temporal de salida.
+            elapsed_time: Tiempo transcurrido en segundos.
+            used_gpu: Si se usó GPU en el intento.
+
+        Returns:
+            Dict con el resultado del procesamiento.
+        """
         if process.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 1024:  # Mínimo 1KB
             return self._handle_successful_compression(temp_output, file_path, elapsed_time, used_gpu)
         else:
@@ -1982,133 +2018,198 @@ class MediaJellyProcessor:
     def _handle_successful_compression(
         self, temp_output: Path, file_path: Path, elapsed_time: float, used_gpu: bool
     ) -> Dict:
-        """Maneja el caso de compresión exitosa"""
-        result = {
+        """
+        Maneja el caso de una compresión exitosa.
+
+        Orquesta la validación y finalización del proceso de compresión.
+
+        Args:
+            temp_output: Ruta del archivo comprimido temporal.
+            file_path: Ruta del archivo original.
+            elapsed_time: Tiempo de procesamiento en segundos.
+            used_gpu: Si se usó GPU.
+
+        Returns:
+            Dict con el resultado final y estadísticas.
+        """
+        # Validación
+        is_valid, validation_msg = self._validate_compressed_output(temp_output, file_path)
+
+        if not is_valid:
+            return self._handle_validation_failure(temp_output, file_path, validation_msg)
+
+        self.logger.info(f"Validación exitosa para {file_path.name}: {validation_msg}")
+
+        # Comparación de tamaños
+        original_size = file_path.stat().st_size
+        compressed_size = temp_output.stat().st_size
+
+        if compressed_size >= original_size:
+            return self._finalize_compression_larger(
+                temp_output, file_path, used_gpu, original_size, compressed_size
+            )
+        else:
+            return self._finalize_compression_smaller(
+                temp_output, file_path, used_gpu, original_size, compressed_size, elapsed_time
+            )
+
+    def _validate_compressed_output(self, temp_output: Path, file_path: Path) -> Tuple[bool, str]:
+        """
+        Valida el archivo comprimido generado.
+
+        Args:
+            temp_output: Ruta del archivo temporal.
+            file_path: Ruta del archivo original (para contexto).
+
+        Returns:
+            Tuple[bool, str]: (Es válido, Mensaje de validación/error).
+        """
+        return self._validate_compressed_file(temp_output)
+
+    def _handle_validation_failure(self, temp_output: Path, file_path: Path, validation_msg: str) -> Dict:
+        """
+        Maneja el fallo de validación del archivo comprimido.
+
+        Args:
+            temp_output: Ruta del archivo temporal.
+            file_path: Ruta del archivo original.
+            validation_msg: Mensaje de error de validación.
+
+        Returns:
+            Dict con el resultado de error.
+        """
+        self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
+        
+        if temp_output.exists():
+            temp_output.unlink()
+            
+        # Marcar como fallido para evitar reintentos
+        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        self._add_to_failed_files(str(file_path), failed_files_path, f"Validación fallida: {validation_msg}")
+        
+        return {
             "compressed": False,
+            "renamed": False,
+            "success": True, # El proceso terminó "bien" pero la validación falló
+            "error": f"Archivo comprimido corrupto: {validation_msg}",
+            "no_spanish": False,
+            "skipped": False,
+        }
+
+    def _finalize_compression_larger(
+        self, temp_output: Path, file_path: Path, used_gpu: bool, original_size: int, compressed_size: int
+    ) -> Dict:
+        """
+        Finaliza el proceso cuando el archivo comprimido es más grande que el original.
+        
+        En este caso, se renombra a .mp4 (contenedor estándar) pero se mantiene la calidad/tamaño.
+        """
+        method_str = "GPU" if used_gpu else "CPU"
+        self.logger.info(
+            f"Archivo comprimido es mayor, pero renombrando a MP4 con metadatos ({method_str}): {file_path.name}"
+        )
+        
+        # Renombrar a .mp4 con metadatos aplicados
+        final_name = file_path.with_suffix(".mp4")
+        temp_output.replace(final_name)
+        
+        if file_path != final_name and file_path.exists():
+            file_path.unlink()  # Eliminar el original si el nombre cambió
+            
+        # Actualizar pending si cambió extensión
+        self._update_pending_file(str(file_path), str(final_name))
+        
+        # Marcar como completado
+        self._mark_as_completed(final_name)
+
+        return {
+            "compressed": True, # Contar como procesado
+            "renamed": True,
+            "success": True,
+            "error": "",
+            "no_spanish": False,
+            "skipped": False,
+            "original_size": original_size,
+            "compressed_size": compressed_size
+        }
+
+    def _finalize_compression_smaller(
+        self, temp_output: Path, file_path: Path, used_gpu: bool, original_size: int, compressed_size: int, elapsed_time: float
+    ) -> Dict:
+        """
+        Finaliza el proceso cuando la compresión fue efectiva (tamaño reducido).
+        """
+        reduction_percent = ((original_size - compressed_size) / original_size) * 100
+        method_str = "GPU" if used_gpu else "CPU"
+        self.logger.info(
+            f"Compresión {method_str} exitosa: {file_path.name} ({elapsed_time:.1f}s, -{reduction_percent:.1f}%)"
+        )
+
+        # Crear el nombre final con extensión .mp4
+        final_name = file_path.with_suffix(".mp4")
+
+        # Renombrar el archivo comprimido
+        temp_output.rename(final_name)
+
+        # Si el archivo original no es .mp4, eliminarlo
+        if file_path.suffix.lower() != ".mp4":
+            self._delete_original_file(file_path)
+        else:
+            self.logger.info(f"Archivo original es .mp4, manteniendo: {file_path.name}")
+
+        # Si se comprimió exitosamente y cambió la extensión, actualizar pending-compression.txt
+        if final_name != file_path:
+            self._update_pending_file(str(file_path), str(final_name))
+            
+        # Marcar como completado
+        self._mark_as_completed(final_name)
+
+        return {
+            "compressed": True,
             "renamed": False,
             "success": True,
             "error": "",
             "no_spanish": False,
             "skipped": False,
+            "original_size": original_size,
+            "compressed_size": compressed_size
         }
 
-        # Inicializar la ruta final (por defecto es la original)
-        final_name = file_path
-
-        # Validación
-        is_valid, validation_msg = self._validate_compressed_file(temp_output)
-
-        if not is_valid:
-            self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
-            result["error"] = f"Archivo comprimido corrupto: {validation_msg}"
-            if temp_output.exists():
-                temp_output.unlink()
-            # Marcar como fallido para evitar reintentos
+    def _delete_original_file(self, file_path: Path):
+        """Elimina el archivo original de forma segura."""
+        self.logger.info(f"Eliminando archivo original: {file_path.name}")
+        try:
+            file_path.unlink()
+            self.logger.info(f"Archivo original eliminado exitosamente: {file_path.name}")
+        except Exception as e:
+            self.logger.error(f"Error eliminando archivo original {file_path}: {e}")
+            # Marcar como fallido si no se puede eliminar el original
             failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
-            self._add_to_failed_files(str(file_path), failed_files_path, f"Validación fallida: {validation_msg}")
-            return result
+            self._add_to_failed_files(str(file_path), failed_files_path, f"Error eliminando original: {e}")
 
-        self.logger.info(f"Validación exitosa para {file_path.name}: {validation_msg}")
-
-        # Tamaños
-        original_size = file_path.stat().st_size
-        compressed_size = temp_output.stat().st_size
-
-        if compressed_size >= original_size:
-            method_str = "GPU" if used_gpu else "CPU"
-            self.logger.info(
-                f"Archivo comprimido es mayor, pero renombrando a MP4 con metadatos ({method_str}): {file_path.name}"
-            )
-            # Renombrar a .mp4 con metadatos aplicados
-            final_name = file_path.with_suffix(".mp4")
-            temp_output.replace(final_name)
-            file_path.unlink()  # Eliminar el original
-            result["renamed"] = True
-            result["compressed"] = True  # Contar como procesado
-            result["original_size"] = original_size
-            result["compressed_size"] = compressed_size
-
-            # Actualizar pending si cambió extensión
-            self._update_pending_file(str(file_path), str(final_name))
-        else:
-            reduction_percent = ((original_size - compressed_size) / original_size) * 100
-            method_str = "GPU" if used_gpu else "CPU"
-            self.logger.info(
-                f"Compresión {method_str} exitosa: {file_path.name} ({elapsed_time:.1f}s, -{reduction_percent:.1f}%)"
-            )
-
-            # Crear el nombre final con extensión .mp4
-            final_name = file_path.with_suffix(".mp4")
-
-            # Renombrar el archivo comprimido
-            temp_output.rename(final_name)
-
-            # Si el archivo original no es .mp4, eliminarlo
-            if file_path.suffix.lower() != ".mp4":
-                self.logger.info(f"Eliminando archivo original: {file_path.name}")
-                try:
-                    file_path.unlink()
-                    self.logger.info(f"Archivo original eliminado exitosamente: {file_path.name}")
-                except Exception as e:
-                    self.logger.error(f"Error eliminando archivo original {file_path}: {e}")
-                    # Marcar como fallido si no se puede eliminar el original
-                    failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
-                    self._add_to_failed_files(str(file_path), failed_files_path, f"Error eliminando original: {e}")
-            else:
-                self.logger.info(f"Archivo original es .mp4, manteniendo: {file_path.name}")
-
-            result["compressed"] = True
-            result["original_size"] = original_size
-            result["compressed_size"] = compressed_size
-
-            # Sin mejoras de calidad aplicadas
-
-        # Marca como completado (usar la ruta final)
+    def _mark_as_completed(self, final_name: Path):
+        """Marca el archivo como completado en el registro."""
         with open(self.completed_file, "a") as f:
             f.write(f"{final_name}\n")
-
-        # Si se comprimió exitosamente y cambió la extensión, actualizar pending-compression.txt
-        if result.get("compressed", False) and final_name != file_path:
-            self._update_pending_file(str(file_path), str(final_name))
-
-        return result
-
-    def _apply_quality_improvements(self, final_file: Path) -> None:
-        """Aplica mejoras de calidad al archivo final - DESHABILITADO TEMPORALMENTE
-
-        Las mejoras de calidad requieren re-encoding completo y causan archivos corruptos.
-        Se deshabilitan hasta integrarlas en el proceso de compresión inicial.
-        """
-        self.logger.info(f"Mejoras de calidad deshabilitadas temporalmente para: {final_file.name}")
 
     def _handle_failed_compression(
         self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path
     ) -> Dict:
-        """Maneja el caso de compresión fallida"""
-        result = {
-            "compressed": False,
-            "renamed": False,
-            "success": False,
-            "error": "",
-            "no_spanish": False,
-            "skipped": False,
-        }
+        """
+        Maneja el caso de una compresión fallida.
 
-        if process.returncode == 0:
-            if temp_output.exists():
-                error_msg = f"Compresión aparentemente exitosa pero archivo muy pequeño o corrupto: {file_path} (tamaño: {temp_output.stat().st_size} bytes)"
-            else:
-                error_msg = f"Compresión aparentemente exitosa pero archivo no creado: {file_path}"
-        else:
-            error_msg = f"Falló compresión (código {process.returncode}): {file_path}"
+        Registra el error, limpia archivos temporales y actualiza la lista de fallos.
 
-        if process.returncode == 124:
-            error_msg = f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
+        Args:
+            process: Resultado del proceso subprocess.run.
+            file_path: Ruta del archivo original.
+            temp_output: Ruta del archivo temporal de salida.
 
-        # No se captura stderr para evitar MemoryError, así que no se puede loggear
-
-        result["error"] = error_msg
-
+        Returns:
+            Dict con detalles del error.
+        """
+        error_msg = self._generate_compression_error_message(process, file_path, temp_output)
+        
         if temp_output.exists():
             temp_output.unlink()
 
@@ -2116,7 +2217,29 @@ class MediaJellyProcessor:
         failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
         self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
 
-        return result
+        return {
+            "compressed": False,
+            "renamed": False,
+            "success": False,
+            "error": error_msg,
+            "no_spanish": False,
+            "skipped": False,
+        }
+
+    def _generate_compression_error_message(
+        self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path
+    ) -> str:
+        """Genera un mensaje de error descriptivo para fallos de compresión."""
+        if process.returncode == 0:
+            if temp_output.exists():
+                return f"Compresión aparentemente exitosa pero archivo muy pequeño o corrupto: {file_path} (tamaño: {temp_output.stat().st_size} bytes)"
+            else:
+                return f"Compresión aparentemente exitosa pero archivo no creado: {file_path}"
+        
+        if process.returncode == 124:
+            return f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
+            
+        return f"Falló compresión (código {process.returncode}): {file_path}"
 
     def _handle_timeout_error(self, result: Dict, file_path: Path, temp_output: Optional[Path]) -> None:
         """Maneja errores de timeout en la compresión"""
@@ -2178,8 +2301,15 @@ class MediaJellyProcessor:
             self.logger.info("  No se detectaron pistas de subtítulos")
 
     def compress_single_file(self, file_path_str: str) -> Dict:
-        """Comprime un solo archivo con selección inteligente de método de compresión
-        Completamente independiente - errores en este archivo no afectan otros procesos
+        """
+        Comprime un solo archivo con selección inteligente de método de compresión.
+        Completamente independiente - errores en este archivo no afectan otros procesos.
+
+        Args:
+            file_path_str: Ruta del archivo a comprimir como string.
+
+        Returns:
+            Dict con el resultado del procesamiento.
         """
         file_path = Path(file_path_str)
         result = {
@@ -2204,6 +2334,10 @@ class MediaJellyProcessor:
             )
             if not is_prepared:
                 return {**result, **compression_info}
+
+            if temp_output is None:
+                result["error"] = "Error interno: temp_output es None"
+                return result
 
             use_gpu = compression_info["use_gpu"]
             has_spanish = compression_info["has_spanish"]
@@ -2247,21 +2381,44 @@ class MediaJellyProcessor:
 
         except subprocess.TimeoutExpired:
             self._handle_timeout_error(result, file_path, temp_output)
+        except MediaJellyError as e:
+             result["error"] = str(e)
+             if temp_output and temp_output.exists():
+                 temp_output.unlink()
         except Exception as e:
             self._handle_unexpected_error(result, file_path, e, temp_output)
 
         return result
 
-    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Path, List[int], List[int], Dict[int, str]]:
-        """Prepara la compresión: validación, idiomas, método"""
+    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Optional[Path], List[int], List[int], Dict[int, str]]:
+        """
+        Prepara la compresión: validación, idiomas, método.
+
+        Args:
+            file_path: Ruta al archivo a procesar.
+
+        Returns:
+            Tuple conteniendo:
+            - bool: Si la preparación fue exitosa.
+            - Dict: Información de resultado (error, skipped, etc.) o configuración.
+            - Path: Ruta temporal de salida (o None si falla).
+            - List[int]: Índices de streams de audio.
+            - List[int]: Índices de streams de subtítulos.
+            - Dict[int, str]: Idiomas de streams de audio.
+        """
         # Validación
-        valid, validation_msg = self._validate_file_for_compression(file_path)
-        if not valid:
+        try:
+            self._validate_file_for_compression(file_path)
+        except ValidationError as e:
+            error_msg = str(e)
             result = {
-                "skipped": validation_msg == "archivo_pequeno",
-                "error": validation_msg if validation_msg != "archivo_pequeno" else None,
+                "skipped": error_msg == "archivo_pequeno",
+                "error": error_msg if error_msg != "archivo_pequeno" else None,
             }
-            return False, result, file_path, [], [], {}
+            return False, result, None, [], [], {}
+        except FileNotFoundError as e:
+            result = {"skipped": False, "error": str(e)}
+            return False, result, None, [], [], {}
 
         # Idiomas - ahora retorna también audio_languages
         has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(file_path)
@@ -2303,7 +2460,23 @@ class MediaJellyProcessor:
         use_remux: bool = False,
         audio_languages: Optional[Dict[int, str]] = None,
     ) -> Tuple[subprocess.CompletedProcess, float]:
-        """Ejecuta un intento de compresión o remux"""
+        """
+        Ejecuta un intento de compresión o remux usando ffmpeg.
+
+        Args:
+            file_path: Ruta del archivo original.
+            temp_output: Ruta del archivo temporal de salida.
+            use_gpu: Si True, intenta usar aceleración por hardware (VAAPI).
+            audio_indices: Lista de índices de streams de audio a conservar.
+            sub_indices: Lista de índices de streams de subtítulos a conservar.
+            use_remux: Si True, usa modo remux (copia de streams) en lugar de recodificar.
+            audio_languages: Diccionario de idiomas de audio {index: lang_code}.
+
+        Returns:
+            Tuple conteniendo:
+            - subprocess.CompletedProcess: Resultado del proceso ffmpeg.
+            - float: Tiempo transcurrido en segundos.
+        """
         if audio_languages is None:
             audio_languages = {}
 

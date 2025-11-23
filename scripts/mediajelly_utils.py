@@ -48,7 +48,7 @@ class MediaJellyPaths:
         "__pycache__",
     }
 
-    EXTENSIONS: Set[str] = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v"}
+    EXTENSIONS: Set[str] = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 
     @staticmethod
     def is_container() -> bool:
