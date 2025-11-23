@@ -236,6 +236,12 @@ services:
       - OMP_NUM_THREADS=4
       - MEDIAJELLY_API_PORT=8000
       - MEDIAJELLY_METRICS_PORT=9090
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LANGUAGE_CACHE_TTL=86400
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     networks:
       - mynetwork
     volumes:
@@ -247,7 +253,7 @@ services:
       - /dev/dri:/dev/dri  # Hardware acceleration
     ports:
       - "8000:8000"  # API REST
-      - "9090:9090"  # Prometheus metrics
+      - "9093:9090"  # Prometheus metrics
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 6g
@@ -258,50 +264,21 @@ services:
       - radarr
       - sonarr
 
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: mediajelly-prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+  redis:
+    image: redis:7-alpine
+    container_name: mediajelly-redis
     networks:
       - mynetwork
     volumes:
-      - ./config/prometheus:/etc/prometheus:ro
-      - prometheus-data:/prometheus
+      - ./config/redis:/data
     ports:
-      - "9092:9090"
+      - "6379:6379"
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: '1.0'
-    depends_on:
-      - mediajelly-cron
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: mediajelly-grafana
-    environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_INSTALL_PLUGINS=
-    networks:
-      - mynetwork
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-    ports:
-      - "3000:3000"
-    restart: unless-stopped
-    logging: *default-logging
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: '1.0'
-    depends_on:
-      - prometheus
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: '0.5'
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
 
 networks:
   mynetwork:
@@ -315,9 +292,3 @@ networks:
       config:
         - subnet: 172.20.0.0/16
           ip_range: 172.20.240.0/20
-
-volumes:
-  prometheus-data:
-    driver: local
-  grafana-data:
-    driver: local
