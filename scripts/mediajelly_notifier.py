@@ -12,6 +12,20 @@ from datetime import datetime
 from typing import List, Optional, Dict
 import logging
 
+# Cargar variables de entorno desde .env
+try:
+    from dotenv import load_dotenv
+    # Buscar .env en el directorio del proyecto
+    project_root = Path(__file__).parent.parent
+    env_path = project_root / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"✅ Variables de entorno cargadas desde {env_path}")
+    else:
+        print(f"⚠️ Archivo .env no encontrado en {env_path}")
+except ImportError:
+    print("⚠️ python-dotenv no está instalado, usando variables de entorno del sistema")
+
 from mediajelly_emoji import EmojiGenerator
 
 # Importar configuración centralizada
@@ -57,17 +71,30 @@ class TelegramNotifier:
             sys.exit(1)
 
     def load_config(self) -> Dict[str, str]:
-        """Cargar configuración de Telegram desde YAML centralizado"""
+        """Cargar configuración de Telegram desde YAML centralizado o variables de entorno"""
         config = {}
 
         try:
             # Extraer configuración de telegram del objeto de configuración
-            config["TELEGRAM_BOT_TOKEN"] = self.config_obj.telegram.bot_token
-            config["TELEGRAM_CHAT_ID"] = self.config_obj.telegram.chat_id
+            bot_token = self.config_obj.telegram.bot_token
+            chat_id = self.config_obj.telegram.chat_id
+            
+            # Si los valores del YAML son variables de entorno sin expandir, usar variables de entorno directamente
+            if bot_token.startswith("${") and bot_token.endswith("}"):
+                config["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            else:
+                config["TELEGRAM_BOT_TOKEN"] = bot_token
+                
+            if chat_id.startswith("${") and chat_id.endswith("}"):
+                config["TELEGRAM_CHAT_ID"] = os.environ.get("TELEGRAM_CHAT_ID", "")
+            else:
+                config["TELEGRAM_CHAT_ID"] = chat_id
+                
         except AttributeError as e:
-            self.logger.error(f"Error accediendo a configuración de Telegram: {e}")
-            self.logger.error("Verifica que la configuración YAML tenga la sección 'telegram' con 'bot_token' y 'chat_id'")
-            raise ValueError(f"Configuración de Telegram inválida: {e}")
+            # Fallback: cargar directamente desde variables de entorno
+            self.logger.warning(f"YAML no tiene configuración de Telegram, usando variables de entorno: {e}")
+            config["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            config["TELEGRAM_CHAT_ID"] = os.environ.get("TELEGRAM_CHAT_ID", "")
 
         # Verifica configuración requerida
         required = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
