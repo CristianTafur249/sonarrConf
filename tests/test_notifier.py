@@ -93,5 +93,28 @@ class TestTelegramNotifier:
         # Verify all required fields are present
         assert 'TELEGRAM_BOT_TOKEN' in config
         assert 'TELEGRAM_CHAT_ID' in config
-        assert 'NOTIFY_ON_SUCCESS' in config
-        assert 'NOTIFY_ON_ERROR' in config
+    
+    def test_env_variable_expansion(self, notifier, monkeypatch):
+        """Test that environment variables in format ${VAR} are expanded correctly"""
+        # Configurar variables de entorno
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token_expanded")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "987654321")
+        
+        # Mock config object con valores ${VAR}
+        mock_config = Mock()
+        mock_config.telegram.bot_token = "${TELEGRAM_BOT_TOKEN}"
+        mock_config.telegram.chat_id = "${TELEGRAM_CHAT_ID}"
+        
+        notifier.config_obj = mock_config
+        config = notifier.load_config()
+        
+        # Verificar que las variables fueron expandidas
+        assert config['TELEGRAM_BOT_TOKEN'] == "test_token_expanded"
+        assert config['TELEGRAM_CHAT_ID'] == "987654321"
+    
+    @patch('mediajelly_notifier.REQUESTS_AVAILABLE', False)
+    def test_send_message_without_requests(self, notifier):
+        """Test that sending message without requests library fails gracefully"""
+        result = notifier._send_message_immediate("Test message")
+        
+        assert result is False

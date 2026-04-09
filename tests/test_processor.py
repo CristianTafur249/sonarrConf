@@ -28,6 +28,11 @@ class TestMediaJellyProcessor(unittest.TestCase):
             self.processor.completed_file = self.processor.scripts_dir / "completed.txt"
             self.processor.failed_file = self.processor.scripts_dir / "failed.txt"
             self.processor.logger = MagicMock()
+            # mimic config object
+            cfg = MagicMock()
+            cfg.processing.reprocess_on_label_change = False
+            cfg.processing.apply_audio_tagging_on_skip = True
+            self.processor.config = cfg
             
             # Ensure directories exist
             self.processor.scripts_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +146,32 @@ class TestMediaJellyProcessor(unittest.TestCase):
         
         self.assertEqual(result["error"], "Corrupt")
         self.processor._handle_validation_failure.assert_called_once()
+
+    def test_filter_reprocess_on_label_change(self):
+        # configure to reprocess when suffix differs
+        self.processor.config.processing.reprocess_on_label_change = True
+        # pretend the file was processed previously with a different label
+        self.processor.processed_files = {
+            str(self.temp_video_file): {"status": "success", "label": ".mkv"}
+        }
+        files = [self.temp_video_file]
+        filtered = self.processor._filter_already_processed_files(files)
+        self.assertEqual(filtered, files)
+
+    def test_filter_apply_audio_tagging_on_skip(self):
+        # make config allow tagging on skip
+        self.processor.config.processing.apply_audio_tagging_on_skip = True
+        # mark as processed so it would normally skip
+        self.processor.processed_files = {
+            str(self.temp_video_file): {"status": "success", "label": ".mp4"}
+        }
+        # detection returns an unlabeled stream so tagging should run
+        self.processor.detect_language_streams = MagicMock(return_value=(False, [], [], {0: "und"}))
+        self.processor._ensure_audio_tags = MagicMock(return_value=True)
+
+        filtered = self.processor._filter_already_processed_files([self.temp_video_file])
+        self.processor._ensure_audio_tags.assert_called_once_with(self.temp_video_file)
+        self.assertEqual(filtered, [])
 
 if __name__ == "__main__":
     unittest.main()
