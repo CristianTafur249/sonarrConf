@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import json
+import re
 import logging
 import logging.handlers
 import resource
@@ -45,10 +46,22 @@ from mediajelly_exceptions import (
     LanguageDetectionError,
 )
 from mediajelly_utils import MediaJellyPaths
+try:
+    from mediajelly_language_detector import set_cached_language, detect_language_with_whisper_for_processor
+    LANGUAGE_DETECTOR_AVAILABLE = True
+except Exception:
+    LANGUAGE_DETECTOR_AVAILABLE = False
+    set_cached_language = None
+    detect_language_with_whisper_for_processor = None
+
+try:
+    from mediajelly_config import get_config
+except Exception:
+    get_config = None
 
 # Configuración optimizada de constantes
 MAX_MEMORY_GB = 4
-FFMPEG_TIMEOUT = 7200  # 2 horas por archivo
+FFMPEG_TIMEOUT = 14400  # 4 horas por archivo
 COMPRESSED_FILE_SUFFIX = ".compressed.mp4"
 STREAM_LANGUAGE_QUERY = "stream=index:stream_tags=language"
 CSV_FORMAT_PARAM = "csv=p=0"
@@ -58,7 +71,7 @@ FAILED_COMPRESSION_FILE = "failed-compression.txt"
 VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
 LOG_RETENTION_DAYS = 7  # Reducido para ahorrar espacio
 SHORT_TIMEOUT = 10
-MEDIUM_TIMEOUT = 60  # Reducido para mayor eficiencia
+MEDIUM_TIMEOUT = 300  # Aumentado para probes más largos
 PROCESSING_COMPLETED_MESSAGE = "Procesamiento completado"
 EXCLUDED_FOLDERS = MediaJellyPaths.EXCLUDED_FOLDERS
 MOVFLAGS_FASTSTART = "+faststart"
@@ -122,109 +135,6 @@ class ProcessingStats:
             self.no_spanish = []
 
 
-@dataclass
-class ProcessingMetrics:
-    """Métricas calculadas de procesamiento"""
-
-    files_processed: int = 0
-    compression_ratio: float = 0.0
-    errors_count: int = 0
-    execution_time_seconds: float = 0.0
-    avg_time_per_file: float = 0.0
-    total_original_size_gb: float = 0.0
-    total_compressed_size_gb: float = 0.0
-    space_saved_gb: float = 0.0
-    space_saved_percentage: float = 0.0
-    timestamp: str = ""
-    success_rate: float = 0.0
-
-
-class MetricsCollector:
-    """Colector de métricas de procesamiento"""
-
-    def __init__(self, logs_dir: Path):
-        self.logs_dir = logs_dir
-        self.tmp_dir = logs_dir.parent / "tmp"  # Cambiar a tmp_dir
-        self.metrics_file = self.tmp_dir / "processing_metrics.json"
-
-    def calculate_metrics(self, stats: ProcessingStats, execution_time: float) -> ProcessingMetrics:
-        """Calcula métricas detalladas desde estadísticas de procesamiento"""
-
-        # Evitar división por cero
-        files_processed = max(1, stats.files_processed)
-
-        # Calcular ratio de compresión
-        compression_ratio = 0.0
-        if stats.total_original_size > 0:
-            compression_ratio = stats.total_compressed_size / stats.total_original_size
-
-        # Calcular métricas de espacio
-        total_original_gb = stats.total_original_size / (1024**3)
-        total_compressed_gb = stats.total_compressed_size / (1024**3)
-        space_saved_gb = total_original_gb - total_compressed_gb
-        space_saved_percentage = 0.0
-        if total_original_gb > 0:
-            space_saved_percentage = (space_saved_gb / total_original_gb) * 100
-
-        # Calcular tasa de éxito
-        total_operations = stats.files_processed + len(stats.errors)
-        success_rate = 0.0
-        if total_operations > 0:
-            success_rate = (stats.files_processed / total_operations) * 100
-
-        return ProcessingMetrics(
-            files_processed=stats.files_processed,
-            compression_ratio=compression_ratio,
-            errors_count=len(stats.errors),
-            execution_time_seconds=execution_time,
-            avg_time_per_file=execution_time / files_processed,
-            total_original_size_gb=round(total_original_gb, 2),
-            total_compressed_size_gb=round(total_compressed_gb, 2),
-            space_saved_gb=round(space_saved_gb, 2),
-            space_saved_percentage=round(space_saved_percentage, 2),
-            timestamp=datetime.now().isoformat(),
-            success_rate=round(success_rate, 2)
-        )
-
-    def save_metrics(self, metrics: ProcessingMetrics) -> None:
-        """Guarda métricas en archivo JSON"""
-        try:
-            # Leer métricas existentes
-            existing_metrics = []
-            if self.metrics_file.exists():
-                with open(self.metrics_file, 'r', encoding='utf-8') as f:
-                    existing_metrics = json.load(f)
-                    if not isinstance(existing_metrics, list):
-                        existing_metrics = [existing_metrics]
-
-            # Agregar nuevas métricas
-            existing_metrics.append(asdict(metrics))
-
-            # Mantener solo las últimas 100 entradas
-            if len(existing_metrics) > 100:
-                existing_metrics = existing_metrics[-100:]
-
-            # Guardar archivo
-            with open(self.metrics_file, 'w', encoding='utf-8') as f:
-                json.dump(existing_metrics, f, indent=2, ensure_ascii=False)
-
-            self._log_metrics_summary(metrics)
-
-        except Exception as e:
-            print(f"Error guardando métricas: {e}")
-
-    def _log_metrics_summary(self, metrics: ProcessingMetrics) -> None:
-        """Registra resumen de métricas"""
-        print("📊 **Métricas de Procesamiento:**")
-        print(f"   📁 Archivos procesados: {metrics.files_processed}")
-        print(f"   🕐 Tiempo total: {metrics.execution_time_seconds:.2f}s")
-        print(f"   ⏱️  Tiempo promedio por archivo: {metrics.avg_time_per_file:.2f}s")
-        print(f"   📊 Ratio de compresión: {metrics.compression_ratio:.2f}")
-        print(f"   ❌ Errores: {metrics.errors_count}")
-        print(f"   💾 Espacio ahorrado: {metrics.space_saved_gb} GB ({metrics.space_saved_percentage}%)")
-        print(f"   ✅ Tasa de éxito: {metrics.success_rate}%")
-
-
 class MediaJellyProcessor:
     """Procesador principal de MediaJelly"""
 
@@ -253,17 +163,42 @@ class MediaJellyProcessor:
         # Estadísticas
         self.stats = ProcessingStats()
 
-        # Sistema de métricas
-        self.metrics_collector = MetricsCollector(self.logs_dir)
-
-        # Archivos procesados con estado
+        # Archivos procesados con estado. Cada entrada guarda al menos
+        # {'status': 'success', 'timestamp': ..., 'label': '.mp4'}.
+        # La etiqueta se usa para detectar cambios en el tipo de archivo.
         self.processed_files = {}
+
+        # Cargar configuración general si está disponible; guardarla para
+        # usos posteriores.
+        self.config = None
+        if get_config:
+            try:
+                self.config = get_config()
+            except Exception:
+                self.config = None
 
         # Mejorador de calidad
         self.quality_improver = VideoQualityImprover(self.logger)
 
         # Caché de idiomas pre-detectados (llenado por mediajelly_language_detector.py)
-        self.language_cache_file = self.tmp_dir / "language_cache.json"
+        # Determinar ruta del caché, preferir configuración si está disponible
+        cache_file_path = None
+        if get_config:
+            try:
+                config = get_config()
+                cache_file_path = Path(config.paths.cache_file_path)
+            except Exception:
+                cache_file_path = None
+
+        if cache_file_path:
+            # Si no se puede crear el directorio en la ruta de config, usar tmp local
+            try:
+                cache_file_path.parent.mkdir(parents=True, exist_ok=True)
+                self.language_cache_file = cache_file_path
+            except Exception:
+                self.language_cache_file = self.tmp_dir / "language_cache.json"
+        else:
+            self.language_cache_file = self.tmp_dir / "language_cache.json"
         self.language_cache = self._load_language_cache()
 
         # Modelo Whisper deshabilitado (se usa pre-análisis)
@@ -755,7 +690,7 @@ class MediaJellyProcessor:
 
         files_cleaned = 0
         files_added_to_pending = 0
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        failed_files_path = self.failed_file
 
         # Carga archivos que han fallado previamente
         failed_files = self._load_failed_files(failed_files_path)
@@ -1230,14 +1165,77 @@ class MediaJellyProcessor:
                 if self.language_cache_file.stat().st_size == 0:
                     self.logger.warning(f"{EmojiGenerator.warning_msg()} Caché de idiomas vacío, inicializando...")
                     return {}
-                    
+
                 with open(self.language_cache_file, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
+                    try:
+                        cache = json.load(f)
+                    except json.JSONDecodeError as e:
+                        # Archivo corrupto: mover a backup y reinicializar caché
+                        backup_path = self.language_cache_file.with_suffix(".corrupt.json")
+                        try:
+                            os.replace(str(self.language_cache_file), str(backup_path))
+                            self.logger.warning(f"{EmojiGenerator.warning_msg()} Caché corrupto movido a {backup_path}")
+                        except Exception:
+                            self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo mover caché corrupto: {e}")
+                        return {}
                 self.logger.info(f"{EmojiGenerator.folder()} Caché de idiomas cargado: {len(cache)} archivos")
                 return cache
             except Exception as e:
                 self.logger.warning(f"{EmojiGenerator.warning_msg()} Error cargando caché de idiomas: {e}")
         return {}
+
+    def _ensure_three_letter_codes(self, audio_languages: Dict[int, str]) -> Dict[int, str]:
+        """Asegura que los valores de audio_languages sean códigos ISO 639-2 (tres letras).
+
+        Usa la configuración para invertir el mapeo si se encuentran códigos ISO 639-1 (dos letras).
+        Agrega logging que permita depurar si los valores no están en el formato esperado.
+        """
+        if not audio_languages:
+            return {}
+
+        try:
+            cfg = get_config() if get_config else None
+            inv_map = {}
+            if cfg:
+                inv_map = {v: k for k, v in cfg.language_detection.language_code_map.items()}
+            # Fallback a small default map en caso de no tener configuración
+            if not inv_map:
+                inv_map = {
+                    'en': 'eng',
+                    'es': 'spa',
+                    'fr': 'fra',
+                    'de': 'deu',
+                    'it': 'ita',
+                    'pt': 'por',
+                    'ja': 'jpn',
+                    'zh': 'chi',
+                    'ru': 'rus',
+                    'ar': 'ara',
+                }
+
+            new_map = {}
+            for idx, val in audio_languages.items():
+                if not val:
+                    new_map[idx] = val
+                    continue
+                # val puede ser ya 3 letras (p.ej. 'eng') o 2 letras ('en')
+                if len(val) == 3:
+                    new_map[idx] = val
+                elif len(val) == 2 and val in inv_map:
+                    new_map[idx] = inv_map[val]
+                    self.logger.info(
+                        f"{EmojiGenerator.clipboard()} Mapeando código idioma 2-letras '{val}' a 3-letras '{new_map[idx]}' para stream {idx}"
+                    )
+                else:
+                    # No se reconoce, dejar tal cual y avisar
+                    new_map[idx] = val
+                    self.logger.warning(
+                        f"{EmojiGenerator.warning_msg()} Código idioma inesperado '{val}' para stream {idx}, no se pudo mapear a 3 letras"
+                    )
+            return new_map
+        except Exception as e:
+            self.logger.warning(f"{EmojiGenerator.warning_msg()} Error mapeando idiomas a 3-letras: {e}")
+            return audio_languages
 
     def _detect_language_with_whisper(self, audio_file: Path, file_duration: float = 0) -> Tuple[Optional[str], Dict[str, float]]:
         """
@@ -1444,6 +1442,12 @@ class MediaJellyProcessor:
                 return "spa"
 
             self.logger.info(f"{EmojiGenerator.success()} Idioma final seleccionado: {winner_lang[0]} ({winner_code})")
+            # Guardar el resultado en caché si está disponible la función
+            try:
+                if set_cached_language:
+                    set_cached_language(str(file_path), stream_index, winner_code)
+            except Exception as e:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} No se pudo cachear idioma desde processor: {e}")
             return winner_code
 
         except Exception as e:
@@ -1462,7 +1466,10 @@ class MediaJellyProcessor:
 
             # Crear ruta relativa al directorio media para búsqueda en caché
             relative_path = None
-            if "/media/" in file_path_str:
+            # Aceptar tanto /media/ (host-standard) como /mediajelly/media/ (contract inside container)
+            if "/mediajelly/media/" in file_path_str:
+                relative_path = file_path_str.split("/mediajelly/media/", 1)[1]
+            elif "/media/" in file_path_str:
                 relative_path = file_path_str.split("/media/", 1)[1]
 
             # Paso 1: Verificar caché de idiomas pre-detectados
@@ -1471,16 +1478,43 @@ class MediaJellyProcessor:
                 stream_idx_str = str(stream_index)
                 if stream_idx_str in self.language_cache[relative_path]:
                     cached_lang = self.language_cache[relative_path][stream_idx_str]
+                    # Normalizar a código ISO 639-2 de 3 letras (ffmpeg espera 3 letras en tags)
+                    try:
+                        if get_config:
+                            cfg = get_config()
+                            inv_map = {v: k for k, v in cfg.language_detection.language_code_map.items()}
+                            orig_cached = cached_lang
+                            if cached_lang in inv_map:
+                                cached_lang = inv_map[cached_lang]
+                            if orig_cached != cached_lang:
+                                self.logger.info(
+                                    f"{EmojiGenerator.clipboard()} Caché: mapeado '{orig_cached}' -> '{cached_lang}' para {relative_path}"
+                                )
+                    except Exception:
+                        pass
                     self.logger.info(
-                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index})"
+                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index}) - key: {relative_path}"
                     )
                     return cached_lang
             elif file_path_str in self.language_cache:  # Fallback a ruta absoluta
                 stream_idx_str = str(stream_index)
                 if stream_idx_str in self.language_cache[file_path_str]:
                     cached_lang = self.language_cache[file_path_str][stream_idx_str]
+                    try:
+                        if get_config:
+                            cfg = get_config()
+                            inv_map = {v: k for k, v in cfg.language_detection.language_code_map.items()}
+                            orig_cached = cached_lang
+                            if cached_lang in inv_map:
+                                cached_lang = inv_map[cached_lang]
+                            if orig_cached != cached_lang:
+                                self.logger.info(
+                                    f"{EmojiGenerator.clipboard()} Caché: mapeado '{orig_cached}' -> '{cached_lang}' para {file_path_str}"
+                                )
+                    except Exception:
+                        pass
                     self.logger.info(
-                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index})"
+                        f"{EmojiGenerator.folder()} Idioma desde caché: {cached_lang} (stream {stream_index}) - key: {file_path_str}"
                     )
                     return cached_lang
                 else:
@@ -1541,9 +1575,28 @@ class MediaJellyProcessor:
                         )
                         return "jpn"
 
-            # Paso 3: NO asumir ningún idioma por defecto - retornar None
+            # Paso 3: Intentar detección con Whisper si está disponible
+            if LANGUAGE_DETECTOR_AVAILABLE:
+                self.logger.info(
+                    f"{EmojiGenerator.magnifying_glass()} Stream {stream_index} sin idioma en caché/metadatos, ejecutando detección con Whisper: {file_path.name}"
+                )
+                try:
+                    detected_lang = detect_language_with_whisper_for_processor(file_path, stream_index)
+                    if detected_lang:
+                        self.logger.info(
+                            f"{EmojiGenerator.success()} Idioma detectado con Whisper: {detected_lang} para stream {stream_index}"
+                        )
+                        return detected_lang
+                    else:
+                        self.logger.warning(
+                            f"{EmojiGenerator.warning_msg()} Whisper no pudo detectar idioma para stream {stream_index}"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error ejecutando detector de idiomas con Whisper: {e}")
+
+            # Paso 4: NO asumir ningún idioma por defecto - retornar None
             self.logger.info(
-                f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma detectado (no en caché, no metadatos): {file_path.name}"
+                f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma detectado (no en caché, no metadatos, detección falló): {file_path.name}"
             )
             return None
 
@@ -1577,6 +1630,7 @@ class MediaJellyProcessor:
             sub_indices = []
             audio_languages = {}  # Mapeo de índice relativo de audio a idioma
             audio_stream_counter = 0
+            subtitle_stream_counter = 0
             seen_indices = set()  # Para evitar duplicados en archivos con múltiples programas
 
             # Solo loguear si hay streams sin etiquetar
@@ -1630,8 +1684,12 @@ class MediaJellyProcessor:
                             audio_stream_counter += 1
 
                         elif codec_type == "subtitle":
+                            # Usar un contador relativo para subtítulos (0:s:N espera índices relativos)
+                            current_sub_index = subtitle_stream_counter
                             if any(pattern in lang for pattern in ["spa", "esp", "es", "lat"]):
-                                sub_indices.append(index)
+                                sub_indices.append(current_sub_index)
+                            # Incrementar contador relativo de subtítulos siempre
+                            subtitle_stream_counter += 1
 
             has_spanish = len(audio_indices) > 0 or len(sub_indices) > 0
 
@@ -1736,6 +1794,38 @@ class MediaJellyProcessor:
 
         return ""
 
+    def _get_video_bitrate(self, file_path: Path) -> Optional[Dict[str, int]]:
+        """Obtiene información de bitrate del video"""
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=bit_rate",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ]
+            result = subprocess.run(
+                probe_cmd, capture_output=True, timeout=SHORT_TIMEOUT, encoding="utf-8", errors="replace"
+            )
+
+            if result.returncode == 0:
+                bitrate_str = result.stdout.strip()
+                if bitrate_str and bitrate_str != "N/A":
+                    try:
+                        bitrate_bps = int(bitrate_str)
+                        return {"bitrate_kbps": bitrate_bps // 1000}
+                    except ValueError:
+                        pass
+        except Exception as e:
+            self.logger.warning(f"Error obteniendo bitrate: {e}")
+
+        return None
+
     def _build_remux_command(
         self,
         file_path: Path,
@@ -1748,14 +1838,23 @@ class MediaJellyProcessor:
         if audio_languages is None:
             audio_languages = {}
 
+        # Asegurarnos de que los códigos de idioma sean ISO 639-2 (tres letras) para MP4
+        audio_languages = self._ensure_three_letter_codes(audio_languages)
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-hide_banner",
             "-y",
+            "-probesize",
+            "100M",
+            "-analyzeduration",
+            "100M",
             "-i",
             str(file_path),
             "-c:v",
             "copy",  # Copiar video sin recodificar
+            "-max_muxing_queue_size",
+            "1024",
         ]
 
         # Mapeo de streams de video
@@ -1763,32 +1862,110 @@ class MediaJellyProcessor:
 
         # Audio: mapear español si existe, sino el primero
         audio_map_count = 0
-        if audio_indices:
-            for idx in audio_indices:
-                ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
-                # Aplicar etiqueta de idioma si está disponible
-                if idx in audio_languages:
-                    ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
-                audio_map_count += 1
-            # Si hay audio en español, copiar sin convertir
+        # Logging de idiomas que se aplicarán a metadatos
+        if audio_languages:
+            self.logger.debug(f"{EmojiGenerator.clipboard()} Remux: idiomas de audio para metadata: {audio_languages}")
+
+        # Intentar detectar códec y canales del primer stream de audio mapeado
+        detected_codec = ""
+        detected_channels = 2
+        try:
+            probe_idx = audio_indices[0] if audio_indices else 0
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                f"a:{probe_idx}",
+                "-show_entries",
+                "stream=codec_name,channels",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ]
+            probe_res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=SHORT_TIMEOUT)
+            probe_lines = [l.strip() for l in probe_res.stdout.splitlines() if l.strip()]
+            if len(probe_lines) >= 1:
+                detected_codec = probe_lines[0].lower()
+            if len(probe_lines) >= 2 and probe_lines[1].isdigit():
+                detected_channels = int(probe_lines[1])
+            self.logger.debug(f"Detected audio codec={detected_codec} channels={detected_channels} for {file_path.name}")
+        except Exception:
+            detected_codec = ""
+            detected_channels = 2
+
+        for idx in audio_indices:
+            ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
+            # Aplicar etiqueta de idioma si está disponible
+            if idx in audio_languages:
+                ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+            audio_map_count += 1
+
+        if not audio_indices:
+            ffmpeg_cmd.extend(["-map", "0:a:0"])
+            if 0 in audio_languages:
+                lang_code = audio_languages[0]
+                self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={lang_code}"])
+            else:
+                self.logger.warning(f"  No hay idioma disponible para audio stream 0")
+
+        # Decidir si copiar audio o recodificar a AAC para compatibilidad MP4
+        # Copiar solo si ya es AAC; en otros casos recodificar a AAC (preservando canales cuando sea posible)
+        if detected_codec == "aac":
             ffmpeg_cmd.extend(["-c:a", "copy"])
         else:
-            ffmpeg_cmd.extend(["-map", "0:a:0"])
-            # Aplicar etiqueta de idioma al primer audio si está disponible
-            if 0 in audio_languages:
-                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
-            # Si no hay audio en español, copiar el original sin convertir
-            ffmpeg_cmd.extend(["-c:a", "copy"])
+            target_channels = str(detected_channels if detected_channels and detected_channels <= 6 else 2)
+            target_bitrate = "384k" if detected_channels >= 6 else "256k"
+            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", target_bitrate, "-ac", target_channels, "-ar", "48000"])
 
-        # Subtítulos: mapear español si existe, sino el primero
+        # Subtítulos: mapear SOLO subtítulos textuales (subrip/ass/etc.).
+        # Evitar PGS (hdmv_pgs_subtitle) ya que no se pueden convertir a mov_text.
+        mapped_subs = 0
+        try:
+            probe_subs_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ]
+            probe_subs = subprocess.run(probe_subs_cmd, capture_output=True, text=True, timeout=SHORT_TIMEOUT)
+            subtitle_codecs = [l.strip() for l in probe_subs.stdout.splitlines() if l.strip()]
+        except Exception:
+            subtitle_codecs = []
+
+        # Definir codecs textuales que podemos convertir a mov_text
+        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+
         if sub_indices:
             for idx in sub_indices:
-                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                    mapped_subs += 1
+                else:
+                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
         else:
-            ffmpeg_cmd.extend(["-map", "0:s:0?"])
+            # Intentar mapear el primer subtítulo textual disponible
+            mapped = False
+            for i, codec in enumerate(subtitle_codecs):
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
+                    mapped_subs += 1
+                    mapped = True
+                    break
+            if not mapped:
+                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
 
-        # Convertir subtítulos a mov_text para MP4
-        ffmpeg_cmd.extend(["-c:s", "mov_text"])
+        # Añadir conversión solo si se mapearon subtítulos
+        if mapped_subs > 0:
+            ffmpeg_cmd.extend(["-c:s", "mov_text"])
 
         # Copiar metadatos
         ffmpeg_cmd.extend(["-map_metadata", "0"])
@@ -1810,14 +1987,17 @@ class MediaJellyProcessor:
         if audio_languages is None:
             audio_languages = {}
 
+        # Asegurarnos de que los códigos de idioma sean ISO 639-2 (tres letras) para MP4
+        audio_languages = self._ensure_three_letter_codes(audio_languages)
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-hide_banner",
             "-y",
             "-probesize",
-            "50M",  # Aumentar para análisis completo
+            "100M",
             "-analyzeduration",
-            "50M",  # Aumentar para análisis completo
+            "100M",
             "-hwaccel",
             "vaapi",
             "-hwaccel_device",
@@ -1837,6 +2017,9 @@ class MediaJellyProcessor:
         ]
 
         # Mapeo de streams
+        # Logging de idiomas que se aplicarán a metadatos
+        if audio_languages:
+            self.logger.debug(f"{EmojiGenerator.clipboard()} FFmpeg: idiomas de audio para metadata: {audio_languages}")
         ffmpeg_cmd.extend(["-map", "0:v:0"])  # Video
 
         # Audio: mapear español si existe, sino el primero
@@ -1852,20 +2035,59 @@ class MediaJellyProcessor:
             ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
             # Aplicar etiqueta de idioma al primer audio si está disponible
             if 0 in audio_languages:
-                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
+                lang_code = audio_languages[0]
+                self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={lang_code}"])
+            else:
+                self.logger.warning(f"  No hay idioma disponible para audio stream 0")
 
-        # Subtítulos: mapear español si existe, sino el primero (? = opcional)
+        # Subtítulos: mapear SOLO subtítulos textuales (subrip/ass/etc.). Evitar PGS.
+        mapped_subs = 0
+        try:
+            probe_subs_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ]
+            probe_subs = subprocess.run(probe_subs_cmd, capture_output=True, text=True, timeout=SHORT_TIMEOUT)
+            subtitle_codecs = [l.strip() for l in probe_subs.stdout.splitlines() if l.strip()]
+        except Exception:
+            subtitle_codecs = []
+
+        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+
         if sub_indices:
             for idx in sub_indices:
-                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                    mapped_subs += 1
+                else:
+                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
         else:
-            ffmpeg_cmd.extend(["-map", "0:s:0?"])  # Primer subtítulo si existe
+            mapped = False
+            for i, codec in enumerate(subtitle_codecs):
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
+                    mapped_subs += 1
+                    mapped = True
+                    break
+            if not mapped:
+                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
 
         # Audio config
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
 
-        # Subtítulos config: convertir a mov_text para compatibilidad con MP4
-        ffmpeg_cmd.extend(["-c:s", "mov_text"])
+        # Subtítulos config: convertir a mov_text solo si se mapearon subtítulos textuales
+        if mapped_subs > 0:
+            ffmpeg_cmd.extend(["-c:s", "mov_text"])
 
         # Copiar metadatos principales
         ffmpeg_cmd.extend(["-map_metadata", "0"])
@@ -1887,14 +2109,17 @@ class MediaJellyProcessor:
         if audio_languages is None:
             audio_languages = {}
 
+        # Asegurarnos de que los códigos de idioma sean ISO 639-2 (tres letras) para MP4
+        audio_languages = self._ensure_three_letter_codes(audio_languages)
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-hide_banner",
             "-y",
             "-probesize",
-            "50M",  # Aumentar para análisis completo
+            "100M",
             "-analyzeduration",
-            "50M",  # Aumentar para análisis completo
+            "100M",
             "-i",
             str(file_path),
         ]
@@ -1904,6 +2129,9 @@ class MediaJellyProcessor:
 
         # Audio: mapear español si existe, sino el primero
         audio_map_count = 0
+        # Logging de idiomas que se aplicarán a metadatos
+        if audio_languages:
+            self.logger.debug(f"{EmojiGenerator.clipboard()} Fallback FFmpeg: idiomas de audio para metadata: {audio_languages}")
         if audio_indices:
             for idx in audio_indices:
                 ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
@@ -1915,25 +2143,122 @@ class MediaJellyProcessor:
             ffmpeg_cmd.extend(["-map", "0:a:0"])  # Primer audio
             # Aplicar etiqueta de idioma al primer audio si está disponible
             if 0 in audio_languages:
-                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={audio_languages[0]}"])
+                lang_code = audio_languages[0]
+                self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={lang_code}"])
+            else:
+                self.logger.warning(f"  No hay idioma disponible para audio stream 0")
 
-        # Subtítulos: mapear español si existe, sino el primero (? = opcional)
+        # Subtítulos: mapear solo subtítulos textuales (evitar PGS)
+        try:
+            probe_subs_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+                str(file_path),
+            ]
+            probe_subs = subprocess.run(probe_subs_cmd, capture_output=True, text=True, timeout=SHORT_TIMEOUT)
+            subtitle_codecs = [l.strip() for l in probe_subs.stdout.splitlines() if l.strip()]
+        except Exception:
+            subtitle_codecs = []
+
+        text_sub_codecs = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+        mapped_subs = 0
+
         if sub_indices:
             for idx in sub_indices:
-                ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                codec = subtitle_codecs[idx] if idx < len(subtitle_codecs) else None
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{idx}?"])
+                    mapped_subs += 1
+                else:
+                    self.logger.warning(f"Omitiendo subtítulo 0:s:{idx} (codec={codec}) - no apto para remux a mov_text")
         else:
-            ffmpeg_cmd.extend(["-map", "0:s:0?"])  # Primer subtítulo si existe
+            mapped = False
+            for i, codec in enumerate(subtitle_codecs):
+                if codec and codec.lower() in text_sub_codecs:
+                    ffmpeg_cmd.extend(["-map", f"0:s:{i}?"])
+                    mapped_subs += 1
+                    mapped = True
+                    break
+            if not mapped:
+                self.logger.debug("No se encontraron subtítulos textuales a mapear; omitiendo subtítulos")
 
         # Audio config
         ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
 
-        # Subtítulos config: convertir a mov_text para compatibilidad con MP4
-        ffmpeg_cmd.extend(["-c:s", "mov_text"])
+        # Subtítulos config: convertir a mov_text solo si se mapearon subtítulos textuales
+        if mapped_subs > 0:
+            ffmpeg_cmd.extend(["-c:s", "mov_text"])
 
         # Copiar metadatos principales
         ffmpeg_cmd.extend(["-map_metadata", "0"])
 
         # Final config
+        ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, "-avoid_negative_ts", "make_zero", str(temp_output)])
+
+        return ffmpeg_cmd
+
+    def _build_ffmpeg_command_no_subtitles(
+        self,
+        file_path: Path,
+        temp_output: Path,
+        audio_indices: List[int],
+        audio_languages: Optional[Dict[int, str]] = None,
+    ) -> List[str]:
+        """Construye comando ffmpeg sin subtítulos para archivos con subtítulos corruptos"""
+        if audio_languages is None:
+            audio_languages = {}
+
+        audio_languages = self._ensure_three_letter_codes(audio_languages)
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-probesize",
+            "100M",
+            "-analyzeduration",
+            "100M",
+            "-i",
+            str(file_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-map",
+            "0:v:0",
+        ]
+
+        audio_map_count = 0
+        if audio_languages:
+            self.logger.debug(f"{EmojiGenerator.clipboard()} No-subs FFmpeg: idiomas de audio para metadata: {audio_languages}")
+
+        if audio_indices:
+            for idx in audio_indices:
+                ffmpeg_cmd.extend(["-map", f"0:a:{idx}"])
+                if idx in audio_languages:
+                    ffmpeg_cmd.extend([f"-metadata:s:a:{audio_map_count}", f"language={audio_languages[idx]}"])
+                audio_map_count += 1
+        else:
+            ffmpeg_cmd.extend(["-map", "0:a:0"])
+            if 0 in audio_languages:
+                lang_code = audio_languages[0]
+                self.logger.info(f"  Aplicando metadata language={lang_code} al audio stream 0")
+                ffmpeg_cmd.extend(["-metadata:s:a:0", f"language={lang_code}"])
+            else:
+                self.logger.warning(f"  No hay idioma disponible para audio stream 0")
+
+        ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"])
+        ffmpeg_cmd.extend(["-map_metadata", "0"])
         ffmpeg_cmd.extend(["-movflags", MOVFLAGS_FASTSTART, "-avoid_negative_ts", "make_zero", str(temp_output)])
 
         return ffmpeg_cmd
@@ -2079,14 +2404,14 @@ class MediaJellyProcessor:
             Dict con el resultado de error.
         """
         self.logger.error(f"Archivo comprimido inválido para {file_path.name}: {validation_msg}")
-        
+
         if temp_output.exists():
             temp_output.unlink()
-            
+
         # Marcar como fallido para evitar reintentos
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        failed_files_path = self.failed_file
         self._add_to_failed_files(str(file_path), failed_files_path, f"Validación fallida: {validation_msg}")
-        
+
         return {
             "compressed": False,
             "renamed": False,
@@ -2101,37 +2426,72 @@ class MediaJellyProcessor:
     ) -> Dict:
         """
         Finaliza el proceso cuando el archivo comprimido es más grande que el original.
-        
+
         En este caso, se renombra a .mp4 (contenedor estándar) pero se mantiene la calidad/tamaño.
         """
-        method_str = "GPU" if used_gpu else "CPU"
-        self.logger.info(
-            f"Archivo comprimido es mayor, pero renombrando a MP4 con metadatos ({method_str}): {file_path.name}"
-        )
-        
-        # Renombrar a .mp4 con metadatos aplicados
-        final_name = file_path.with_suffix(".mp4")
-        temp_output.replace(final_name)
-        
-        if file_path != final_name and file_path.exists():
-            file_path.unlink()  # Eliminar el original si el nombre cambió
-            
-        # Actualizar pending si cambió extensión
-        self._update_pending_file(str(file_path), str(final_name))
-        
-        # Marcar como completado
-        self._mark_as_completed(final_name)
+        # Calcular la diferencia porcentual
+        size_difference_percent = ((compressed_size - original_size) / original_size) * 100
 
-        return {
-            "compressed": True, # Contar como procesado
-            "renamed": True,
-            "success": True,
-            "error": "",
-            "no_spanish": False,
-            "skipped": False,
-            "original_size": original_size,
-            "compressed_size": compressed_size
-        }
+        # Si la diferencia es mínima (< 2%), considerar como exitoso
+        if size_difference_percent < 2.0:
+            method_str = "GPU" if used_gpu else "CPU"
+            self.logger.info(
+                f"Compresión efectiva con diferencia mínima ({method_str}): {file_path.name} (+{size_difference_percent:.1f}%)"
+            )
+
+            # Renombrar a .mp4
+            final_name = file_path.with_suffix(".mp4")
+            temp_output.replace(final_name)
+
+            if file_path != final_name and file_path.exists():
+                file_path.unlink()
+
+            # Actualizar pending si cambió extensión
+            self._update_pending_file(str(file_path), str(final_name))
+
+            # Marcar como completado
+            self._mark_as_completed(final_name)
+
+            return {
+                "compressed": True,  # Considerar como comprimido exitosamente
+                "renamed": True,
+                "success": True,
+                "error": "",
+                "no_spanish": False,
+                "skipped": False,
+                "original_size": original_size,
+                "compressed_size": compressed_size
+            }
+        else:
+            # Diferencia significativa, proceder con lógica original
+            method_str = "GPU" if used_gpu else "CPU"
+            self.logger.info(
+                f"Archivo comprimido es mayor, pero renombrando a MP4 con metadatos ({method_str}): {file_path.name} (+{size_difference_percent:.1f}%)"
+            )
+
+            # Renombrar a .mp4 con metadatos aplicados
+            final_name = file_path.with_suffix(".mp4")
+            temp_output.replace(final_name)
+
+            if file_path != final_name and file_path.exists():
+                file_path.unlink()  # Eliminar el original si el nombre cambió
+
+            # Actualizar pending si cambió extensión
+            self._update_pending_file(str(file_path), str(final_name))
+
+            # Marcar como completado
+            self._mark_as_completed(final_name)
+
+            return {
+                "compressed": True, # Contar como procesado
+                "renamed": True,
+                "success": True,
+                "error": "",
+                "no_spanish": False,
+                "skipped": False,
+                "original_size": original_size,
+                "compressed_size": compressed_size
+            }
 
     def _finalize_compression_smaller(
         self, temp_output: Path, file_path: Path, used_gpu: bool, original_size: int, compressed_size: int, elapsed_time: float
@@ -2160,7 +2520,7 @@ class MediaJellyProcessor:
         # Si se comprimió exitosamente y cambió la extensión, actualizar pending-compression.txt
         if final_name != file_path:
             self._update_pending_file(str(file_path), str(final_name))
-            
+
         # Marcar como completado
         self._mark_as_completed(final_name)
 
@@ -2184,13 +2544,24 @@ class MediaJellyProcessor:
         except Exception as e:
             self.logger.error(f"Error eliminando archivo original {file_path}: {e}")
             # Marcar como fallido si no se puede eliminar el original
-            failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+            failed_files_path = self.failed_file
             self._add_to_failed_files(str(file_path), failed_files_path, f"Error eliminando original: {e}")
 
     def _mark_as_completed(self, final_name: Path):
-        """Marca el archivo como completado en el registro."""
+        """Marca el archivo como completado en el registro.
+
+        Se guarda además una etiqueta ligera (el sufijo) en la estructura de
+        `processed_files` para facilitar detecciones de cambios posteriores.
+        """
         with open(self.completed_file, "a") as f:
             f.write(f"{final_name}\n")
+
+        # Actualizar memoria si ya está cargada
+        self.processed_files[str(final_name)] = {
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "label": final_name.suffix.lower(),
+        }
 
     def _handle_failed_compression(
         self, process: subprocess.CompletedProcess, file_path: Path, temp_output: Path
@@ -2209,13 +2580,24 @@ class MediaJellyProcessor:
             Dict con detalles del error.
         """
         error_msg = self._generate_compression_error_message(process, file_path, temp_output)
-        
+
+        # Adjuntar un snippet del stderr de ffmpeg para diagnóstico
+        stderr_snippet = ""
+        try:
+            if process and getattr(process, "stderr", None):
+                stderr_snippet = process.stderr.strip().splitlines()
+                stderr_snippet = " | ".join(stderr_snippet[:10])
+                error_msg = f"{error_msg} | ffmpeg-stderr: {stderr_snippet}"
+                self.logger.debug(f"FFmpeg stderr completo para {file_path.name}:\n{process.stderr}")
+        except Exception:
+            pass
+
         if temp_output.exists():
             temp_output.unlink()
 
-        # Marcar como fallido para evitar reintentos infinitos
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
-        self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
+        # NOTA: No marcar como fallido aquí para permitir fallbacks (CPU / SAFE).
+        # El marcado persistente a failed-compression.txt se realiza sólo si
+        # todos los fallbacks fallan (_handle_fallback_logic se encarga de ello).
 
         return {
             "compressed": False,
@@ -2235,10 +2617,16 @@ class MediaJellyProcessor:
                 return f"Compresión aparentemente exitosa pero archivo muy pequeño o corrupto: {file_path} (tamaño: {temp_output.stat().st_size} bytes)"
             else:
                 return f"Compresión aparentemente exitosa pero archivo no creado: {file_path}"
-        
+
         if process.returncode == 124:
             return f"Timeout alcanzado ({FFMPEG_TIMEOUT/3600:.1f}h): {file_path}"
-            
+        # Detectar si el proceso fue terminado por una señal (retcode negativo)
+        if process.returncode < 0:
+            sig = -process.returncode
+            if sig == 9:
+                return f"Falló compresión (terminado por señal SIGKILL - posible OOM o kill): {file_path}"
+            return f"Falló compresión (terminado por señal {sig}): {file_path}"
+
         return f"Falló compresión (código {process.returncode}): {file_path}"
 
     def _handle_timeout_error(self, result: Dict, file_path: Path, temp_output: Optional[Path]) -> None:
@@ -2259,7 +2647,7 @@ class MediaJellyProcessor:
             temp_output.unlink()
 
         # Marcar como fallido
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        failed_files_path = self.failed_file
         self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
 
         self.logger.error(error_msg)
@@ -2282,7 +2670,7 @@ class MediaJellyProcessor:
             temp_output.unlink()
 
         # Marcar como fallido
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        failed_files_path = self.failed_file
         self._add_to_failed_files(str(file_path), failed_files_path, error_msg)
 
         self.logger.error(error_msg)
@@ -2333,6 +2721,9 @@ class MediaJellyProcessor:
                 self._prepare_compression(file_path)
             )
             if not is_prepared:
+                # Si se skippeó, considerarlo exitoso
+                if compression_info.get("skipped", False):
+                    result["success"] = True
                 return {**result, **compression_info}
 
             if temp_output is None:
@@ -2364,18 +2755,18 @@ class MediaJellyProcessor:
                 process, file_path, temp_output, elapsed_time, use_gpu
             )
 
-            # Lógica de fallback en caso de fallo con GPU (solo si NO es remux y usó GPU)
-            if not use_remux:
-                compression_result = self._handle_fallback_logic(
-                    compression_result,
-                    process,
-                    file_path,
-                    temp_output,
-                    use_gpu,
-                    audio_indices,
-                    sub_indices,
-                    audio_languages,
-                )
+            # Lógica de fallback: manejar GPU, remux y reintentos sin subtítulos según sea necesario
+            compression_result = self._handle_fallback_logic(
+                compression_result,
+                process,
+                file_path,
+                temp_output,
+                use_gpu,
+                audio_indices,
+                sub_indices,
+                audio_languages,
+                use_remux=use_remux,
+            )
 
             result.update(compression_result)
 
@@ -2389,6 +2780,50 @@ class MediaJellyProcessor:
             self._handle_unexpected_error(result, file_path, e, temp_output)
 
         return result
+
+    def _ensure_audio_tags(self, file_path: Path) -> bool:
+        """Remuxea el archivo para aplicar etiquetas de idioma en pistas de
+        audio que no las tuviesen.
+
+        Se ejecuta antes de saltar un archivo ya procesado si la configuración lo
+        permite. Devuelve `True` si se hizo una acción (re-muxeado), `False`
+        si no había nada que actualizar.
+        """
+        # obtener idiomas de cada pista (vacío en caso de desconocido)
+        _, audio_indices, _, audio_languages = self.detect_language_streams(file_path)
+        # comprobar si hay alguna pista sin etiqueta válida
+        needs_update = any(lang in ("", "und") for lang in audio_languages.values())
+        if not needs_update:
+            return False
+
+        # reconstruir el comando ffmpeg para copiar todo y escribir metadata
+        cmd = ["ffmpeg", "-hide_banner", "-y", "-i", str(file_path)]
+        for idx, lang in audio_languages.items():
+            if lang and lang != "und":
+                cmd.extend([f"-metadata:s:a:{idx}", f"language={lang}"])
+        cmd.extend(["-c", "copy"])
+        temp = file_path.with_suffix(file_path.suffix + ".tag")
+        cmd.append(str(temp))
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=LONG_TIMEOUT)
+            if proc.returncode == 0 and temp.exists():
+                temp.replace(file_path)
+                self.logger.info(f"Etiquetas de audio actualizadas en {file_path.name}")
+                return True
+            else:
+                self.logger.warning(
+                    f"No se pudo aplicar etiquetas de audio a {file_path.name}: {proc.stderr}"
+                )
+        except Exception as e:
+            self.logger.error(f"Error ejecutando ffmpeg para etiquetar audio: {e}")
+        finally:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except Exception:
+                    pass
+        return False
 
     def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Optional[Path], List[int], List[int], Dict[int, str]]:
         """
@@ -2406,6 +2841,15 @@ class MediaJellyProcessor:
             - List[int]: Índices de streams de subtítulos.
             - Dict[int, str]: Idiomas de streams de audio.
         """
+        # Verificar si el archivo ya falló anteriormente (evitar reintentos infinitos)
+        failed_files_path = self.failed_file
+        if failed_files_path.exists():
+            with open(failed_files_path, 'r', encoding='utf-8') as f:
+                failed_content = f.read()
+                if str(file_path) in failed_content:
+                    # No saltamos automáticamente; permitimos reintentos y registramos que ya falló antes
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Archivo previamente fallido (se intentará nuevamente): {file_path.name}")
+
         # Validación
         try:
             self._validate_file_for_compression(file_path)
@@ -2430,8 +2874,21 @@ class MediaJellyProcessor:
         video_codec = self._get_video_codec(file_path)
         is_av1 = video_codec == "av1"
 
-        # Método: si es AV1, usar remux; sino, compresión normal
-        if is_av1:
+        # Verificar si ya está en codec eficiente
+        efficient_codecs = {"h264", "hevc", "av1"}
+        if video_codec in efficient_codecs and not is_av1:  # AV1 usa remux, otros eficientes se procesan normalmente
+            # Para h264/hevc, verificar si el bitrate es razonable
+            bitrate_info = self._get_video_bitrate(file_path)
+            if bitrate_info and bitrate_info.get("bitrate_kbps", 0) < 9000:  # Menos de 9 Mbps (aumentado de 8)
+                self.logger.info(
+                    f"{EmojiGenerator.check()} Archivo ya optimizado ({video_codec}, {bitrate_info['bitrate_kbps']}kbps), usando remux para conversión de contenedor: {file_path.name}"
+                )
+                use_gpu = False
+                use_remux = True  # Usar remux en lugar de compresión
+            else:
+                use_gpu = self._should_use_gpu_compression(file_path)
+                use_remux = False
+        elif is_av1:
             use_gpu = False  # No usar GPU para remux
             use_remux = True
             self.logger.info(
@@ -2459,6 +2916,7 @@ class MediaJellyProcessor:
         sub_indices: List[int],
         use_remux: bool = False,
         audio_languages: Optional[Dict[int, str]] = None,
+        skip_subtitles: bool = False,
     ) -> Tuple[subprocess.CompletedProcess, float]:
         """
         Ejecuta un intento de compresión o remux usando ffmpeg.
@@ -2480,7 +2938,11 @@ class MediaJellyProcessor:
         if audio_languages is None:
             audio_languages = {}
 
-        if use_remux:
+        if skip_subtitles:
+            ffmpeg_cmd = self._build_ffmpeg_command_no_subtitles(file_path, temp_output, audio_indices, audio_languages)
+            cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [CPU/audio/no-subs]"
+            self.logger.info(f"Comando ffmpeg NO-SUBS: {cmd_str}")
+        elif use_remux:
             # Usar remux para archivos AV1 (sin recodificación)
             ffmpeg_cmd = self._build_remux_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [REMUX/copy/output]"
@@ -2500,11 +2962,16 @@ class MediaJellyProcessor:
         process = subprocess.run(
             ffmpeg_cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # No capturar stderr para evitar MemoryError
+            stderr=subprocess.PIPE,  # Capturar stderr para obtener errores de FFmpeg
             text=True,
             timeout=FFMPEG_TIMEOUT,
         )
         elapsed_time = time.time() - start_time
+
+        # Logear stderr corto en debug para facilitar diagnóstico sin llenar logs
+        if process.stderr:
+            short_err = process.stderr.strip().splitlines()[:6]
+            self.logger.debug(f"FFmpeg stderr (short): {' | '.join(short_err)}")
 
         return process, elapsed_time
 
@@ -2518,13 +2985,18 @@ class MediaJellyProcessor:
         audio_indices: List[int],
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
+        use_remux: bool = False,
     ) -> Dict:
         """Maneja la lógica de fallback CPU"""
         if audio_languages is None:
             audio_languages = {}
+        # Si hubo fallo y se intentó con GPU, intentar recodificar por CPU
+        if not compression_result.get("success", False) and use_gpu:
+            if "corrupto" in str(compression_result.get("error", "")):
+                self.logger.warning(f"Archivo corrupto con GPU, intentando fallback CPU: {file_path.name}")
+            else:
+                self.logger.warning(f"Compresión GPU falló, intentando fallback CPU: {file_path.name}")
 
-        if not compression_result["success"] and use_gpu and "corrupto" in str(compression_result.get("error", "")):
-            self.logger.warning(f"Archivo corrupto con GPU, intentando fallback CPU: {file_path.name}")
             if temp_output.exists():
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
@@ -2533,8 +3005,10 @@ class MediaJellyProcessor:
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
             )
-        elif process.returncode != 0 and use_gpu:
-            self.logger.warning(f"Compresión GPU falló, intentando fallback CPU: {file_path.name}")
+
+        # Si se intentó remux y falló, intentar una recodificación completa por CPU
+        if not compression_result.get("success", False) and use_remux:
+            self.logger.warning(f"Remux falló, intentando recodificación por CPU: {file_path.name}")
             if temp_output.exists():
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
@@ -2543,6 +3017,57 @@ class MediaJellyProcessor:
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
             )
+
+            # Si el fallo fue por subtítulos PGS/HDMV, reintentar sin subtítulos
+            if (
+                not compression_result.get("success", False)
+                and process is not None
+                and getattr(process, "stderr", "")
+                and "Could not find codec parameters" in process.stderr
+            ):
+                self.logger.warning(f"Remux->CPU reencode falló por subtítulos, reintentando sin subtítulos: {file_path.name}")
+                if temp_output.exists():
+                    temp_output.unlink()
+                process, new_elapsed_time = self._execute_compression_attempt(
+                    file_path, temp_output, False, audio_indices, [], False, audio_languages, skip_subtitles=True
+                )
+                compression_result = self._process_compression_result(
+                    process, file_path, temp_output, new_elapsed_time, False
+                )
+
+        # Error específico de subtítulos PGS / hdmv, intentar recodificar SIN subtítulos
+        if (
+            not compression_result.get("success", False)
+            and process is not None
+            and getattr(process, "stderr", "")
+            and "Could not find codec parameters" in process.stderr
+        ):
+            self.logger.warning(f"Error de subtítulos detectado, reintentando sin subtítulos: {file_path.name}")
+            if temp_output.exists():
+                temp_output.unlink()
+            process, new_elapsed_time = self._execute_compression_attempt(
+                file_path,
+                temp_output,
+                False,
+                audio_indices,
+                [],
+                False,
+                audio_languages,
+                skip_subtitles=True,
+            )
+            compression_result = self._process_compression_result(
+                process, file_path, temp_output, new_elapsed_time, False
+            )
+
+        # Si después de todos los fallbacks el resultado sigue siendo fallo, registrarlo persistentemente
+        if not compression_result.get("success", False):
+            try:
+                failed_files_path = self.failed_file
+                reason = compression_result.get("error", "Fallo en compresión sin mensaje")
+                self._add_to_failed_files(str(file_path), failed_files_path, reason)
+                self.logger.warning(f"Archivo marcado como fallido después de fallback: {file_path.name}")
+            except Exception as e:
+                self.logger.error(f"Error marcando archivo como fallido: {e}")
 
         return compression_result
 
@@ -2785,22 +3310,62 @@ class MediaJellyProcessor:
                         completed_files.add(file_path)
 
         self.processed_files = {
-            path: {"status": "success", "timestamp": datetime.now().isoformat()} for path in completed_files
+            path: {
+                "status": "success",
+                "timestamp": datetime.now().isoformat(),
+                "label": Path(path).suffix.lower(),
+            }
+            for path in completed_files
         }
         self.logger.info(f"Reconstruyendo processed_files de completed.txt: {len(self.processed_files)} archivos")
 
     def _filter_already_processed_files(self, files: List[Path]) -> List[Path]:
-        """Filtra archivos ya procesados exitosamente"""
+        """Filtra archivos ya procesados exitosamente.
+
+        - Si `reprocess_on_label_change` está habilitado y la etiqueta (sufijo)
+          del archivo actual difiere de la guardada, se volverá a procesar.
+        - Antes de descartar un archivo, si `apply_audio_tagging_on_skip` está
+          activado, se intentará etiquetar pistas de audio sin idioma.
+        """
         files_before_filter = len(files)
-        files = [
-            f
-            for f in files
-            if str(f) not in self.processed_files or self.processed_files[str(f)]["status"] != "success"
-        ]
-        files_filtered = files_before_filter - len(files)
+        remaining = []
+
+        for f in files:
+            key = str(f)
+            skip = False
+
+            if key in self.processed_files and self.processed_files[key]["status"] == "success":
+                # comprobar si debemos volver a procesar por cambio de etiqueta
+                if (
+                    self.config
+                    and self.config.processing.reprocess_on_label_change
+                ):
+                    prev_label = self.processed_files[key].get("label")
+                    if prev_label and f.suffix.lower() != prev_label:
+                        # etiqueta diferente -> no omitir
+                        skip = False
+                    else:
+                        # mismo sufijo, aplicar lógica normal
+                        if f.exists() and f.suffix.lower() == ".mp4":
+                            skip = True
+                else:
+                    if f.exists() and f.suffix.lower() == ".mp4":
+                        skip = True
+
+                # intentar etiquetar audio aunque se vaya a omitir
+                if skip and self.config and self.config.processing.apply_audio_tagging_on_skip:
+                    try:
+                        self._ensure_audio_tags(f)
+                    except Exception as e:
+                        self.logger.error(f"Error etiquetando audio de {f}: {e}")
+
+            if not skip:
+                remaining.append(f)
+
+        files_filtered = files_before_filter - len(remaining)
         if files_filtered > 0:
             self.logger.info(f"Archivos ya procesados exitosamente omitidos: {files_filtered}")
-        return files
+        return remaining
 
     def _process_files_with_executor(
         self, files: List[Path], total_files: int, current_file: int
@@ -2888,11 +3453,6 @@ class MediaJellyProcessor:
             f"Renombrados: {self.stats.files_renamed}, "
             f"Omitidos: {self.stats.files_skipped}"
         )
-
-        # Calcular y guardar métricas
-        execution_time = time.time() - start_time
-        metrics = self.metrics_collector.calculate_metrics(self.stats, execution_time)
-        self.metrics_collector.save_metrics(metrics)
 
         return self.stats
 
@@ -3164,7 +3724,7 @@ class MediaJellyProcessor:
         if file_path not in self.processed_files or self.processed_files[file_path].get("status") != "failed":
             return False
 
-        failed_files_path = self.scripts_dir / FAILED_COMPRESSION_FILE
+        failed_files_path = self.failed_file
 
         # Para archivos .ts fallidos, remover inmediatamente
         if pending_path_obj.suffix.lower() == ".ts":

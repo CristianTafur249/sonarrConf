@@ -12,10 +12,36 @@ from datetime import datetime
 from typing import List, Optional, Dict
 import logging
 
+# Cargar variables de entorno desde .env
+try:
+    from dotenv import load_dotenv
+    # Buscar .env en el directorio del proyecto
+    project_root = Path(__file__).parent.parent
+    env_paths = [project_root / '.env', project_root / '.env.telegram']
+    loaded = False
+    for env_path in env_paths:
+        if env_path.exists():
+            load_dotenv(env_path)
+            print(f"✅ Variables de entorno cargadas desde {env_path}")
+            loaded = True
+    if not loaded:
+        print(f"⚠️ Archivos .env o .env.telegram no encontrados en {project_root}")
+except ImportError:
+    print("⚠️ python-dotenv no está instalado, usando variables de entorno del sistema")
+
 from mediajelly_emoji import EmojiGenerator
 
 # Importar configuración centralizada
 from mediajelly_config import get_config
+
+# Validar disponibilidad de requests
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    requests = None
+    REQUESTS_AVAILABLE = False
+    print("⚠️ requests library no disponible - las notificaciones no funcionarán")
 
 # Constantes
 REQUEST_TIMEOUT = 30  # Timeout para requests HTTP (segundos)
@@ -57,17 +83,36 @@ class TelegramNotifier:
             sys.exit(1)
 
     def load_config(self) -> Dict[str, str]:
-        """Cargar configuración de Telegram desde YAML centralizado"""
+        """Cargar configuración de Telegram desde YAML centralizado o variables de entorno"""
         config = {}
 
         try:
             # Extraer configuración de telegram del objeto de configuración
-            config["TELEGRAM_BOT_TOKEN"] = self.config_obj.telegram.bot_token
-            config["TELEGRAM_CHAT_ID"] = self.config_obj.telegram.chat_id
+            bot_token = self.config_obj.telegram.bot_token
+            chat_id = self.config_obj.telegram.chat_id
+            
+            # CORRECCIÓN: Expandir variables de entorno correctamente
+            if isinstance(bot_token, str) and bot_token.startswith("${") and bot_token.endswith("}"):
+                # Extraer nombre de variable: ${VAR} -> VAR
+                var_name = bot_token[2:-1]
+                config["TELEGRAM_BOT_TOKEN"] = os.environ.get(var_name, "")
+                self.logger.info(f"Token cargado desde variable de entorno: {var_name}")
+            else:
+                config["TELEGRAM_BOT_TOKEN"] = bot_token
+                
+            if isinstance(chat_id, str) and chat_id.startswith("${") and chat_id.endswith("}"):
+                # Extraer nombre de variable: ${VAR} -> VAR
+                var_name = chat_id[2:-1]
+                config["TELEGRAM_CHAT_ID"] = os.environ.get(var_name, "")
+                self.logger.info(f"Chat ID cargado desde variable de entorno: {var_name}")
+            else:
+                config["TELEGRAM_CHAT_ID"] = chat_id
+                
         except AttributeError as e:
-            self.logger.error(f"Error accediendo a configuración de Telegram: {e}")
-            self.logger.error("Verifica que la configuración YAML tenga la sección 'telegram' con 'bot_token' y 'chat_id'")
-            raise ValueError(f"Configuración de Telegram inválida: {e}")
+            # Fallback: cargar directamente desde variables de entorno
+            self.logger.warning(f"YAML no tiene configuración de Telegram, usando variables de entorno: {e}")
+            config["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            config["TELEGRAM_CHAT_ID"] = os.environ.get("TELEGRAM_CHAT_ID", "")
 
         # Verifica configuración requerida
         required = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
@@ -135,13 +180,11 @@ class TelegramNotifier:
 
     def _send_message_immediate(self, message: str, parse_mode: Optional[str] = None) -> bool:
         """Enviar mensaje inmediatamente sin cola"""
-        try:
-            import requests  # type: ignore
-        except ImportError:
+        if not REQUESTS_AVAILABLE:
             self.logger.error("requests library no disponible")
             return False
 
-        if "TELEGRAM_BOT_TOKEN" not in self.config or "TELEGRAM_CHAT_ID" not in self.config:
+        if not hasattr(self, 'config') or "TELEGRAM_BOT_TOKEN" not in self.config or "TELEGRAM_CHAT_ID" not in self.config:
             self.logger.error("Credenciales de Telegram no configuradas")
             return False
 
@@ -164,7 +207,9 @@ class TelegramNotifier:
                 return False
 
         except requests.RequestException as e:
-            self.logger.error(f"Error enviando mensaje a Telegram: {e}")
+            # Censurar token en el log por seguridad
+            error_msg = str(e).replace(self.config['TELEGRAM_BOT_TOKEN'], '[TOKEN_CENSURADO]')
+            self.logger.error(f"Error enviando mensaje a Telegram: {error_msg}")
             return False
 
     def send_telegram_message(self, message: str, parse_mode: Optional[str] = None) -> bool:
@@ -385,6 +430,16 @@ class TelegramNotifier:
                 f.write(f"{current_last_log}\n")
         except PermissionError as e:
             self.logger.warning(f"No se pudo guardar el estado de notificación: {e}")
+            try:
+                # Intentar cambiar permisos y reintentar
+                os.chmod(self.state_file, 0o666)
+                with open(self.state_file, "w") as f:
+                    f.write(f"{current_pending}\n")
+                    f.write(f"{current_completed}\n")
+                    f.write(f"{current_last_log}\n")
+                self.logger.info("Estado de notificación guardado después de cambiar permisos")
+            except Exception as e2:
+                self.logger.error(f"No se pudo guardar el estado incluso después de chmod: {e2}")
 
         # Determina si hubo cambios
         has_changes = current_completed != previous_state["completed"] or current_last_log != previous_state["last_log"]
@@ -897,9 +952,7 @@ def _handle_subtitle_translation(notifier: TelegramNotifier, args: list) -> bool
         }
         return notifier.notify_subtitle_translation(stats)
     except (ValueError, IndexError) as e:
-        print(f"Error procesando argumentos: {e}")
-        return False
-        print(f"Error parsing subtitle_translation arguments: {e}")
+        print(f"Error procesando argumentos de subtitle_translation: {e}")
         return False
 
 

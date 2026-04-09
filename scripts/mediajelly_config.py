@@ -33,6 +33,15 @@ class ProcessingConfig:
     log_level: str = "INFO"
     enable_compression: bool = True
     compression_quality: str = "high"
+    # Si se habilita, volverá a procesar (recomprimir) un archivo aunque ya esté
+    # listado en completed.txt siempre que su sufijo/"etiqueta" (por ejemplo
+    # .mp4, .mkv, etc.) sea diferente al que se registró anteriormente. Esto
+    # permite actualizar compresiones cuando el tipo de contenedor cambia.
+    reprocess_on_label_change: bool = False
+    # Antes de descartar archivos ya procesados, intentar etiquetar pistas de
+    # audio que no tengan idioma. La detección se realiza con ffprobe/Whisper y
+    # si se descubre un idioma válido se aplica como metadata sin recodificar.
+    apply_audio_tagging_on_skip: bool = True
 
 
 @dataclass
@@ -157,7 +166,9 @@ class MediaJellyConfig:
                 temp_dir=processing_data.get('temp_dir', '/tmp/mediajelly'),
                 log_level=processing_data.get('log_level', 'INFO'),
                 enable_compression=processing_data.get('enable_compression', True),
-                compression_quality=processing_data.get('compression_quality', 'high')
+                compression_quality=processing_data.get('compression_quality', 'high'),
+                reprocess_on_label_change=processing_data.get('reprocess_on_label_change', False),
+                apply_audio_tagging_on_skip=processing_data.get('apply_audio_tagging_on_skip', True),
             )
 
         # Configuración de detección de idiomas
@@ -323,7 +334,7 @@ class MediaJellyConfig:
             errors.append("processing.max_cpu_cores debe ser al menos 1")
 
         # Validar modelo Whisper
-        valid_models = ['tiny', 'base', 'small', 'medium', 'large']
+        valid_models = ['tiny', 'tiny.en', 'base', 'small', 'medium', 'large']
         if self.language_detection.whisper_model not in valid_models:
             errors.append(f"language_detection.whisper_model debe ser uno de: {valid_models}")
 

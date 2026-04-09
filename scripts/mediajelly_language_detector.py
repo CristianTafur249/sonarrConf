@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import subprocess
+
 import tempfile
 import random
 import traceback
@@ -41,9 +42,54 @@ except Exception as e:
     print(f"Error cargando configuración: {e}")
     sys.exit(1)
 
+
+def _normalize_and_rename_if_needed(file_path: Union[str, Path]) -> Optional[Path]:
+    """Normaliza nombre y renombra si cambia; retorna nueva ruta o None"""
+    try:
+        validated = validate_file_path(file_path)
+    except Exception:
+        return None
+
+    is_movie = any(part.lower() in ["peliculas", "movies"] for part in validated.parts)
+    orig = validated.stem
+    ext = validated.suffix
+
+    new_name = orig
+    new_name = _remove_fansub_prefixes(new_name)
+    if not is_movie:
+        new_name = _normalize_season_episode_format(new_name)
+    new_name = _clean_filename_formatting(new_name)
+
+    if new_name != orig:
+        return _rename_file_safely(validated, new_name, ext)
+    return None
+
 # Extraer configuración específica del módulo
 MEDIA_PATHS = config.paths.media_paths
 CACHE_FILE_PATH = config.paths.cache_file_path
+# Mejorar robustez: calcular la ruta efectiva del cache y directorio tmp
+try:
+    _cache_path_candidate = Path(CACHE_FILE_PATH)
+    _cache_dir_candidate = _cache_path_candidate.parent
+    try:
+        _cache_dir_candidate.mkdir(parents=True, exist_ok=True)
+        _cache_path_effective = _cache_path_candidate
+    except Exception:
+        # No se puede crear en la ruta de config (perm/ausencia). Usar tmp local
+        _cache_path_effective = Path(__file__).parent / "tmp" / "language_cache.json"
+        _cache_path_effective.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    _cache_path_effective = Path(__file__).parent / "tmp" / "language_cache.json"
+
+CACHE_FILE_PATH = str(_cache_path_effective)
+TMP_DIR = Path(CACHE_FILE_PATH).parent
+try:
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    # Intentar configurar permisos razonables
+    os.chmod(str(TMP_DIR), 0o775)
+except Exception as _e:
+    # No fallar si no puede crear o cambiar permisos en el tmp
+    pass
 LOG_FILE_PATH = config.logging.language_detection_log
 
 # Configuración Redis para cache
@@ -151,7 +197,17 @@ def load_cache() -> Dict[str, Any]:
     if os.path.exists(CACHE_FILE_PATH):
         try:
             with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                try:
+                    return json.load(f)
+                except json.JSONDecodeError as e:
+                    # Corrupt cache: mover a backup
+                    backup_path = f"{CACHE_FILE_PATH}.corrupt"
+                    try:
+                        os.replace(CACHE_FILE_PATH, backup_path)
+                        log(f"Caché corrupto movido a {backup_path}", "WARNING")
+                    except Exception as _e:
+                        log(f"Error moviendo caché corrupto: {_e}", "WARNING")
+                    return {}
         except Exception as e:
             log(f"Error cargando caché: {e}", "ERROR")
     return {}
@@ -166,13 +222,195 @@ def save_cache(cache: Dict[str, Any]) -> None:
     """
     try:
         os.makedirs(os.path.dirname(CACHE_FILE_PATH), exist_ok=True)
-        with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+        # Guardado atómico: escribir en archivo temporal y renombrar
+        temp_path = f"{CACHE_FILE_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
-        # Asegurar permisos de escritura para todos los usuarios
-        os.chmod(CACHE_FILE_PATH, 0o666)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                # No es crítico si fsync falla en algunos sistemas
+                pass
+        os.replace(temp_path, CACHE_FILE_PATH)
+        # Asegurar permisos de escritura para todos los usuarios si es posible
+        try:
+            os.chmod(CACHE_FILE_PATH, 0o666)
+        except Exception:
+            pass
         log(f"Caché guardado: {len(cache)} archivos", "SUCCESS")
     except Exception as e:
         log(f"Error guardando caché: {e}", "ERROR")
+
+
+# ---------------------------------------------------------------------------
+# Normalización / renaming helpers (usados por el detector)
+# ---------------------------------------------------------------------------
+def _clean_filename_formatting(filename: str) -> str:
+    """Limpia espacios múltiples, guiones redundantes y formato del nombre"""
+    import re
+
+    # Limpiar espacios y guiones
+    filename = re.sub(r"\s*-\s*(S\d+E\d+)\s*-\s*", r" \1 ", filename)
+    filename = re.sub(r"\s+", " ", filename)
+    filename = re.sub(r"\s*-\s*-\s*", " - ", filename)
+    filename = re.sub(r"\s*-\s*$", "", filename)
+    filename = re.sub(r"^\s*-\s*", "", filename)
+    return filename.strip()
+
+
+def _remove_fansub_prefixes(filename: str) -> str:
+    """Elimina prefijos de grupos fansub del nombre del archivo"""
+    import re
+
+    fansub_patterns = [
+        r"^\[([^\]]+)\]\s*",  # [Grupo]
+        r"^\(([^\)]+)\)\s*",  # (Grupo)
+        r"^\{([^\}]+)\}\s*",  # {Grupo}
+    ]
+
+    for pattern in fansub_patterns:
+        match = re.match(pattern, filename)
+        if match:
+            group_name = match.group(1)
+            rest_of_name = filename[match.end() :]
+            if rest_of_name and not rest_of_name.lower().startswith(group_name.lower()):
+                return rest_of_name.strip()
+
+    return filename
+
+
+def _normalize_season_episode_format(filename: str) -> str:
+    """Normaliza el formato de temporada/episodio en nombres de series"""
+    import re
+
+    # Intentar diferentes patrones de normalización
+    match = re.search(r"S(\d{1,2})E(\d{1,2})", filename, re.IGNORECASE)
+    if match:
+        season = match.group(1).zfill(2)
+        episode = match.group(2).zfill(2)
+        before = filename[: match.start()].strip()
+        after = filename[match.end() :].strip()
+        if before and after:
+            return f"{before} S{season}E{episode} {after}"
+        elif before:
+            return f"{before} S{season}E{episode}"
+        else:
+            return f"S{season}E{episode} {after}" if after else f"S{season}E{episode}"
+
+    match = re.search(r"(\d{1,2})x(\d{1,2})", filename, re.IGNORECASE)
+    if match:
+        season = match.group(1).zfill(2)
+        episode = match.group(2).zfill(2)
+        before = filename[: match.start()].strip()
+        after = filename[match.end() :].strip()
+        if before and after:
+            return f"{before} S{season}E{episode} {after}"
+        elif before:
+            return f"{before} S{season}E{episode}"
+        else:
+            return f"S{season}E{episode} {after}" if after else f"S{season}E{episode}"
+
+    match = re.search(r"\b(\d{1})(\d{2})\b", filename)
+    if match:
+        season = match.group(1).zfill(2)
+        episode = match.group(2).zfill(2)
+        before = filename[: match.start()].strip()
+        after = filename[match.end() :].strip()
+        if before and after:
+            return f"{before} S{season}E{episode} {after}"
+        elif before:
+            return f"{before} S{season}E{episode}"
+        else:
+            return f"S{season}E{episode} {after}" if after else f"S{season}E{episode}"
+
+    return filename
+
+
+def _rename_file_safely(file_path: Path, new_name: str, extension: str) -> Optional[Path]:
+    """Renombra un archivo de forma segura verificando conflictos (versión para el detector).
+
+    Retorna la nueva ruta si la operación fue exitosa o None si falló.
+    """
+    new_path = file_path.parent / f"{new_name}{extension}"
+
+    if new_path.exists():
+        log(f"No se puede renombrar a '{new_path.name}': el archivo ya existe", "WARNING")
+        return None
+
+    try:
+        file_path.rename(new_path)
+        log(f"✓ Archivo renombrado: '{file_path.name}' -> '{new_path.name}'", "SUCCESS")
+        return new_path
+    except Exception as e:
+        log(f"Error renombrando archivo: {e}", "ERROR")
+        return None
+
+
+
+def _update_pending_and_completed(old_path: Path, new_path: Path) -> None:
+    """Reemplaza rutas antiguas en pending y completed si existen"""
+    try:
+        pending_file = Path(__file__).parent / "tmp" / "pending-compression.txt"
+        completed_file = Path(__file__).parent / "tmp" / "completed.txt"
+
+        # Update pending file
+        if pending_file.exists():
+            with open(pending_file, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines()]
+            updated = [str(new_path) if l == str(old_path) else l for l in lines]
+            with open(pending_file, "w", encoding="utf-8") as f:
+                for l in updated:
+                    if l:
+                        f.write(l + "\n")
+
+        # Update completed file
+        if completed_file.exists():
+            with open(completed_file, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines()]
+            updated = [str(new_path) if l == str(old_path) else l for l in lines]
+            with open(completed_file, "w", encoding="utf-8") as f:
+                for l in updated:
+                    if l:
+                        f.write(l + "\n")
+
+    except Exception as e:
+        log(f"Error actualizando pending/completed: {e}", "ERROR")
+
+
+def adjust_pending_names() -> None:
+    """Escanea pending-compression.txt y normaliza nombres de archivos si es necesario."""
+    pending_file = Path(__file__).parent / "tmp" / "pending-compression.txt"
+    if not pending_file.exists():
+        return
+
+    try:
+        with open(pending_file, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+
+        updated_lines = list(lines)
+        for i, line in enumerate(lines):
+            try:
+                original_path = Path(line)
+                if not original_path.exists():
+                    continue
+                new_path = _normalize_and_rename_if_needed(original_path)
+                if new_path:
+                    updated_lines[i] = str(new_path)
+                    _update_pending_and_completed(original_path, new_path)
+            except Exception as e:
+                log(f"Error procesando pending line {line}: {e}", "WARNING")
+
+        # Reescribir pending con nuevas rutas
+        with open(pending_file, "w", encoding="utf-8") as f:
+            for p in updated_lines:
+                f.write(p + "\n")
+
+    except Exception as e:
+        log(f"Error ajustando nombres en pending: {e}", "ERROR")
+
+
+
 
 
 def get_redis_client():
@@ -237,11 +475,30 @@ def get_cached_language(file_path: Union[str, Path], stream_index: int) -> Optio
     """
     redis_client = get_redis_client()
     if not redis_client:
-        # Fallback al cache de archivo
+        # Fallback al cache de archivo, admitir varias formas de llave
         cache = load_cache()
-        file_key = str(file_path)
-        if file_key in cache and str(stream_index) in cache[file_key]:
-            return cache[file_key][str(stream_index)]
+        file_path_str = str(file_path)
+        candidate_keys = [file_path_str]
+        # Agregar claves alternativas (relative, media vs mediajelly/media)
+        if "/mediajelly/media/" in file_path_str:
+            rel = file_path_str.split("/mediajelly/media/", 1)[1]
+            candidate_keys.append(rel)
+            candidate_keys.append(f"/media/{rel}")
+        elif "/media/" in file_path_str:
+            rel = file_path_str.split("/media/", 1)[1]
+            candidate_keys.append(rel)
+            candidate_keys.append(f"/mediajelly/media/{rel}")
+
+        # CORRECCIÓN: También buscar por nombre de archivo si todo lo demás falla
+        file_name = Path(file_path_str).name
+        candidate_keys.append(file_name)
+
+        for file_key in candidate_keys:
+            if file_key in cache:
+                stream_key = str(stream_index)
+                if stream_key in cache[file_key]:
+                    log(f"Cache hit (clave: {file_key[:50]}...) para stream {stream_index}", "SUCCESS")
+                    return cache[file_key][stream_key]
         return None
 
     # Usar Redis cache
@@ -274,11 +531,41 @@ def set_cached_language(file_path: Union[str, Path], stream_index: int, language
     if not redis_client:
         # Fallback al cache de archivo
         cache = load_cache()
-        file_key = str(file_path)
-        if file_key not in cache:
-            cache[file_key] = {}
-        cache[file_key][str(stream_index)] = language
+        file_path_str = str(file_path)
+        # Guardar tanto la ruta absoluta como forma relativa (para robustez across mounts)
+        keys_to_set = [file_path_str]
+        if "/mediajelly/media/" in file_path_str:
+            rel = file_path_str.split("/mediajelly/media/", 1)[1]
+            keys_to_set.append(rel)
+            keys_to_set.append(f"/media/{rel}")
+        elif "/media/" in file_path_str:
+            rel = file_path_str.split("/media/", 1)[1]
+            keys_to_set.append(rel)
+            keys_to_set.append(f"/mediajelly/media/{rel}")
+
+        # Intentar incluir claves normalizadas (sin modificar el archivo) para
+        # cubrir el caso en que el archivo sea renombrado por el flujo normalizador
+        try:
+            parent = Path(file_path_str).parent
+            stem = Path(file_path_str).stem
+            ext = Path(file_path_str).suffix
+            norm_stem = _clean_filename_formatting(_normalize_season_episode_format(_remove_fansub_prefixes(stem)))
+            norm_abs = str(parent / f"{norm_stem}{ext}")
+            keys_to_set.append(norm_abs)
+            if "/mediajelly/media/" in norm_abs:
+                rel_norm = norm_abs.split("/mediajelly/media/", 1)[1]
+                keys_to_set.append(rel_norm)
+                keys_to_set.append(f"/media/{rel_norm}")
+            keys_to_set.append(Path(norm_abs).name)
+        except Exception:
+            pass
+
+        for file_key in keys_to_set:
+            if file_key not in cache:
+                cache[file_key] = {}
+            cache[file_key][str(stream_index)] = language
         save_cache(cache)
+        log(f"Cacheado idioma en archivo para {file_path_str} (stream {stream_index}): {language}", "SUCCESS")
         return
 
     # Usar Redis cache
@@ -329,6 +616,11 @@ def get_streams_needing_detection(file_path: Union[str, Path]) -> List[Tuple[int
         if result.returncode != 0:
             log(f"Error en ffprobe: {result.stderr}", "ERROR")
             return []
+
+
+        # Normalización de nombres ahora definida a nivel módulo
+
+
 
         data = json.loads(result.stdout)
         streams = data.get("streams", [])
@@ -428,7 +720,7 @@ def load_whisper_model():
         return None
 
 
-def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_time: Union[int, float], duration: int = 60) -> Optional[str]:
+def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_time: Union[int, float], duration: int = 30) -> Optional[str]:
     """
     Extrae una muestra de audio de un archivo multimedia.
 
@@ -451,7 +743,13 @@ def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_t
         if not isinstance(duration, (int, float)) or duration <= 0:
             raise ValueError("Duración inválida")
 
-        temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="/mediajelly/scripts/tmp")
+        # Usar TMP_DIR configurado o fallback al directorio tmp relativo al script
+        try:
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(TMP_DIR))
+        except Exception:
+            fallback_dir = Path(__file__).parent / "tmp"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(fallback_dir))
         temp_path = temp_file.name
         temp_file.close()
 
@@ -474,7 +772,7 @@ def extract_audio_sample(file_path: Union[str, Path], stream_index: int, start_t
             temp_path,
         ]
 
-        result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=120)
+        result = safe_subprocess_run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode != 0:
             log(f"Error extrayendo muestra: {result.stderr}", "ERROR")
@@ -546,7 +844,7 @@ def detect_language_with_multiple_samples(model, file_path: Union[str, Path], st
     # Generar timestamps aleatorios (evitar primeros y últimos 15s)
     safe_start = 15
     safe_end = total_duration - 45  # -30s para la muestra, -15s de margen
-    
+
     if safe_end <= safe_start:
         safe_end = total_duration - 30 if total_duration > 30 else 0
 
@@ -573,9 +871,9 @@ def detect_language_with_multiple_samples(model, file_path: Union[str, Path], st
             if probs:
                 sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)[:3]
                 probs_str = ", ".join([f"{lang}: {prob*100:.1f}%" for lang, prob in sorted_probs])
-                log(f"  Muestra {i-1}/{num_samples} (min {timestamp//60}): {detected_lang} ({probs_str})", "INFO")
+                log(f"  Muestra {i-1}/{num_samples} (min {timestamp//30}): {detected_lang} ({probs_str})", "INFO")
             else:
-                log(f"  Muestra {i-1}/{num_samples} (min {timestamp//60}): {detected_lang}", "INFO")
+                log(f"  Muestra {i-1}/{num_samples} (min {timestamp//30}): {detected_lang}", "INFO")
 
     # Limpiar archivos temporales
     for temp_file in temp_files:
@@ -637,7 +935,7 @@ def detect_single_sample(model, file_path: Union[str, Path], stream_index: int, 
     """
     start_time = min(10, total_duration / 2) if total_duration > 15 else 0
 
-    temp_audio = extract_audio_sample(file_path, stream_index, start_time, min(60, total_duration))
+    temp_audio = extract_audio_sample(file_path, stream_index, start_time, min(30, total_duration))
 
     if not temp_audio:
         return "spa"
@@ -708,12 +1006,13 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
 
     # Detectar entorno y definir ruta del archivo pending
     if Path("/mediajelly").exists():
-        pending_file = Path("/mediajelly/scripts/tmp/pending-compression.txt")
+        pending_file = TMP_DIR / "pending-compression.txt"
     else:
-        pending_file = Path("/home/tafurc/mediaJelly/scripts/tmp/pending-compression.txt")
+        pending_file = TMP_DIR / "pending-compression.txt"
 
     if not pending_file.exists():
         log(f"Archivo pending no encontrado: {pending_file}", "WARNING")
+        log(f"Directorio TMP: {TMP_DIR} (existe: {TMP_DIR.exists()})", "INFO")
         return files_to_analyze
 
     log(f"Leyendo archivos pendientes de: {pending_file}", "INFO")
@@ -724,6 +1023,8 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
             pending_paths = [line.strip() for line in f if line.strip()]
     except Exception as e:
         log(f"Error leyendo archivo pending: {e}", "ERROR")
+        import traceback
+        log(f"Traceback: {traceback.format_exc()}", "ERROR")
         return files_to_analyze
 
     log(f"Encontrados {len(pending_paths)} archivos pendientes", "INFO")
@@ -742,12 +1043,13 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
             log(f"Archivo pendiente no es video: {file_path}", "WARNING")
             continue
 
+        # CORRECCIÓN: Usar ruta absoluta para get_streams_needing_detection
+        absolute_path = str(file_path.resolve())
+
         # Verificar si necesita detección de idioma
-        streams = get_streams_needing_detection(str(file_path))
+        streams = get_streams_needing_detection(absolute_path)
 
         if streams:
-            # Mantener ruta absoluta para acceso al archivo, pero usar relativa para cache
-            absolute_path = str(file_path.resolve())
             # Convertir a ruta relativa al directorio media para consistencia en cache
             if "/media/" in absolute_path:
                 relative_path = absolute_path.split("/media/", 1)[1]
@@ -837,6 +1139,12 @@ def main():
         log("MEDIAJELLY LANGUAGE DETECTOR", "INFO")
         log("=" * 80 + "\n", "INFO")
 
+        # Ajustar nombres en pending antes de analizar (normalizar nomenclatura)
+        try:
+            adjust_pending_names()
+        except Exception as _e:
+            log(f"Advertencia: fallo ajustando nombres en pending: {_e}", "WARNING")
+
         # Cargar caché existente
         cache = load_cache()
         log(f"Caché cargado: {len(cache)} archivos previamente analizados", "INFO")
@@ -882,6 +1190,57 @@ def main():
         log(f"Error fatal en la ejecución: {e}", "ERROR")
         traceback.print_exc()
         sys.exit(1)
+
+
+def detect_language_with_whisper_for_processor(file_path: Union[str, Path], stream_index: int) -> Optional[str]:
+    """
+    Función wrapper para que el procesador pueda detectar idiomas usando Whisper.
+    Retorna el código de idioma ISO 639-2 (3 letras) o None si falla.
+
+    Args:
+        file_path: Ruta al archivo multimedia
+        stream_index: Índice del stream de audio a analizar
+
+    Returns:
+        Optional[str]: Código ISO 639-2 del idioma detectado (ej: 'eng', 'spa', 'jpn') o None
+    """
+    try:
+        file_path_obj = validate_file_path(file_path)
+
+        # Verificar si ya está en caché
+        cached = get_cached_language(file_path_obj, stream_index)
+        if cached:
+            log(f"Idioma desde caché: {cached} para stream {stream_index}", "INFO")
+            return cached
+
+        # Obtener duración del archivo
+        duration = get_file_duration(file_path_obj)
+        if not duration or duration < 10:
+            log(f"Archivo muy corto o duración inválida: {duration}s", "WARNING")
+            return None
+
+        # Cargar modelo Whisper
+        model = load_whisper_model()
+        if not model:
+            log("No se pudo cargar el modelo Whisper", "ERROR")
+            return None
+
+        # Detectar idioma con múltiples muestras
+        detected_lang = detect_language_with_multiple_samples(model, file_path_obj, stream_index, duration)
+
+        if detected_lang:
+            # Guardar en caché
+            set_cached_language(file_path_obj, stream_index, detected_lang)
+            log(f"Idioma detectado y guardado en caché: {detected_lang} para stream {stream_index}", "SUCCESS")
+            return detected_lang
+        else:
+            log(f"No se pudo detectar idioma para stream {stream_index}", "WARNING")
+            return None
+
+    except Exception as e:
+        log(f"Error en detect_language_with_whisper_for_processor: {e}", "ERROR")
+        traceback.print_exc()
+        return None
 
 
 if __name__ == "__main__":

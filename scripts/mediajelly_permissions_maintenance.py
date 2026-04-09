@@ -43,6 +43,34 @@ def ensure_permissions(logger):
             else:
                 logger.debug(f"Permisos correctos en {directory}")
 
+            # También corregir permisos de archivos críticos en tmp
+            if directory.name == "tmp":
+                critical_files = ["progress.json", "processing_metrics.json", "language_cache.json"]
+                for filename in critical_files:
+                    file_path = directory / filename
+                    if file_path.exists():
+                        try:
+                            # Verificar propietario
+                            stat_info = file_path.stat()
+                            if stat_info.st_uid == 0:  # Pertenece a root
+                                logger.warning(f"Archivo con propietario incorrecto: {filename} (root -> mediauser)")
+                                try:
+                                    import pwd
+                                    mediauser_uid = pwd.getpwnam('mediauser').pw_uid
+                                    mediauser_gid = pwd.getpwnam('mediauser').pw_gid
+                                    os.chown(file_path, mediauser_uid, mediauser_gid)
+                                    logger.info(f"Propietario corregido: {filename}")
+                                except (KeyError, PermissionError) as e:
+                                    logger.error(f"No se pudo cambiar propietario de {filename}: {e}")
+
+                            # Cambiar permisos del archivo a 0o666 (rw-rw-rw-)
+                            current_file_perms = oct(file_path.stat().st_mode)[-3:]
+                            if current_file_perms != "666":
+                                logger.info(f"Corrigiendo permisos de archivo {filename}: {current_file_perms} -> 666")
+                                os.chmod(file_path, 0o666)
+                        except Exception as e:
+                            logger.error(f"Error al procesar archivo {filename}: {e}")
+
         except PermissionError as e:
             logger.error(f"Error de permisos en {directory}: {e}")
             logger.warning("Ejecuta este script con sudo si estás fuera del contenedor")
