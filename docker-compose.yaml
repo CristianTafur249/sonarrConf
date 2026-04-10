@@ -26,13 +26,12 @@ services:
     logging: *default-logging
     mem_limit: 512m
     mem_reservation: 256m
-    cpus: '1.0'
+    cpus: "1.0"
     healthcheck:
       test: ["CMD", "pgrep", "transmission-daemon"]
       interval: 30s
       timeout: 10s
       retries: 3
-
 
   samba:
     image: dperson/samba
@@ -55,7 +54,7 @@ services:
     logging: *default-logging
     mem_limit: 256m
     mem_reservation: 128m
-    cpus: '0.5'
+    cpus: "0.5"
 
   radarr:
     container_name: radarr
@@ -78,7 +77,7 @@ services:
     logging: *default-logging
     mem_limit: 1g
     mem_reservation: 512m
-    cpus: '1.5'
+    cpus: "1.5"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7878/ping"]
       interval: 30s
@@ -106,7 +105,7 @@ services:
     logging: *default-logging
     mem_limit: 1g
     mem_reservation: 512m
-    cpus: '1.5'
+    cpus: "1.5"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8989/ping"]
       interval: 30s
@@ -130,7 +129,7 @@ services:
     logging: *default-logging
     mem_limit: 512m
     mem_reservation: 256m
-    cpus: '1.0'
+    cpus: "1.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9696/ping"]
       interval: 30s
@@ -158,13 +157,12 @@ services:
     logging: *default-logging
     mem_limit: 512m
     mem_reservation: 256m
-    cpus: '1.0'
+    cpus: "1.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6767/ping"]
       interval: 30s
       timeout: 10s
       retries: 3
-
 
   jellyfin:
     image: jellyfin/jellyfin:latest
@@ -190,7 +188,7 @@ services:
     logging: *default-logging
     mem_limit: 4g
     mem_reservation: 2g
-    cpus: '3.0'
+    cpus: "3.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8096/health"]
       interval: 30s
@@ -214,9 +212,17 @@ services:
     logging: *default-logging
     mem_limit: 500m
     mem_reservation: 256m
-    cpus: '1.0'
+    cpus: "0.5"
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5055/api/v1/status"]
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:5055/api/v1/status",
+        ]
       interval: 60s
       timeout: 30s
       retries: 5
@@ -234,8 +240,6 @@ services:
       - PYTHONUNBUFFERED=1
       - PYTHONOPTIMIZE=2
       - OMP_NUM_THREADS=4
-      - MEDIAJELLY_API_PORT=8000
-      - MEDIAJELLY_METRICS_PORT=9090
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0
@@ -250,15 +254,12 @@ services:
       - ./media:/mediajelly/media:rw
       - ./config/1tb1/Bittorrent:/mediajelly/downloads:rw
     devices:
-      - /dev/dri:/dev/dri  # Hardware acceleration
-    ports:
-      - "8000:8000"  # API REST
-      - "9093:9090"  # Prometheus metrics
+      - /dev/dri:/dev/dri # Hardware acceleration
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 6g
     mem_reservation: 4g
-    cpus: '4.0'
+    cpus: "4.0"
     depends_on:
       - transmission
       - radarr
@@ -277,8 +278,29 @@ services:
     logging: *default-logging
     mem_limit: 256m
     mem_reservation: 128m
-    cpus: '0.5'
+    cpus: "0.5"
     command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+
+  telegram-transmission-bot:
+    image: kevinhalpin/transmission-telegram:latest
+    container_name: telegram-transmission-bot
+    networks:
+      - mynetwork
+    environment:
+      - TZ=${TZ}
+      - TELEGRAM_TRANSMISSION_BOT=${TELEGRAM_TRANSMISSION_BOT:-}
+      - TELEGRAM_MASTER_USERNAME=${TELEGRAM_MASTER_USERNAME:-}
+      - TRANSMISSION_URL=${TRANSMISSION_URL:-http://transmission:9091/transmission/rpc}
+      - TRANSMISSION_USERNAME=${TRANSMISSION_USERNAME:-}
+      - TRANSMISSION_PASSWORD=${TRANSMISSION_PASSWORD:-}
+    command: '-token=${TELEGRAM_TRANSMISSION_BOT} -master=${TELEGRAM_MASTER_USERNAME} -url=${TRANSMISSION_URL} -username=${TRANSMISSION_USERNAME} -password=${TRANSMISSION_PASSWORD}'
+    depends_on:
+      - transmission
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
+    mem_reservation: 128m
+    cpus: "0.5"
 
 networks:
   mynetwork:
@@ -291,4 +313,5 @@ networks:
       driver: default
       config:
         - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
           ip_range: 172.20.240.0/20

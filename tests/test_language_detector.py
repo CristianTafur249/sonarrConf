@@ -217,6 +217,80 @@ class TestLanguageDetector:
             # Whisper should not have been called
             mock_whisper.assert_not_called()
 
+        def test_load_cache_corrupt_file(self, detector, tmp_path):
+            """If cache file is corrupt, load_cache should return empty dict and not raise"""
+            cache_file = tmp_path / "scripts" / "tmp" / "language_cache.json"
+            cache_file.write_text("{ invalid json")
+
+            cache = detector.load_cache()
+
+            assert isinstance(cache, dict)
+            assert len(cache) == 0
+
+        def test_set_cached_language_writes_keys(self, detector, tmp_path):
+            """set_cached_language should write both absolute and relative keys to file cache"""
+            cache_file = tmp_path / "scripts" / "tmp" / "language_cache.json"
+            detector.cache_file = cache_file
+            detector.redis_available = False
+
+            test_file = tmp_path / "media" / "shows" / "ep1.mkv"
+            test_file.parent.mkdir(parents=True, exist_ok=True)
+            test_file.touch()
+
+            from mediajelly_language_detector import set_cached_language
+            set_cached_language(str(test_file), 1, "es")
+
+            cache_contents = json.loads(cache_file.read_text())
+            # Expect both abs and relative keys
+            assert str(test_file) in cache_contents or "media/shows/ep1.mkv" in cache_contents
+
+    def test_get_cached_language_multiple_formats(self, detector, tmp_path):
+        """Test that get_cached_language finds entries using various key formats"""
+        cache_file = tmp_path / "scripts" / "tmp" / "language_cache.json"
+
+        # Simular cache con diferentes formatos de claves
+        test_cache = {
+            "/home/user/media/anime/show.mkv": {"0": "jpn", "1": "spa"},
+            "anime/show.mkv": {"0": "jpn"},
+            "show.mkv": {"0": "eng"}
+        }
+        cache_file.write_text(json.dumps(test_cache))
+
+        from mediajelly_language_detector import get_cached_language
+
+        # Debe encontrar por ruta absoluta
+        result = get_cached_language("/home/user/media/anime/show.mkv", 0)
+        assert result == "jpn"
+
+        # Debe encontrar por ruta relativa como fallback
+        result = get_cached_language("/some/other/path/media/anime/show.mkv", 0)
+        assert result == "jpn"
+
+    def test_scan_files_uses_absolute_paths(self, detector, tmp_path):
+        """Test that scan_files_needing_detection uses absolute paths for file operations"""
+        pending_file = tmp_path / "scripts" / "tmp" / "pending-compression.txt"
+        pending_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Crear archivo de prueba
+        test_video = tmp_path / "media" / "test.mkv"
+        test_video.parent.mkdir(parents=True, exist_ok=True)
+        test_video.touch()
+
+        # Escribir ruta en pending
+        pending_file.write_text(str(test_video) + "\n")
+
+        from mediajelly_language_detector import scan_files_needing_detection
+
+        with patch("mediajelly_language_detector.get_streams_needing_detection") as mock_streams:
+            mock_streams.return_value = [(0, "aac", 3600.0)]
+
+            files = scan_files_needing_detection()
+
+            # Verificar que se llamó con ruta absoluta
+            assert len(files) > 0
+            assert files[0]["absolute_path"] == str(test_video.resolve())
+            mock_streams.assert_called_with(str(test_video.resolve()))
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

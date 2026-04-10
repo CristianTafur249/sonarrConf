@@ -159,7 +159,7 @@ class MediaScanner:
                 and not file_path.name.startswith(".")
                 and not file_path.name.endswith(".compressed.mp4")
             ):
-                found_files.append(file_path.resolve())
+                found_files.append(file_path)
 
         return found_files
 
@@ -185,7 +185,7 @@ class MediaScanner:
                         line_clean = line.strip()
                         if line_clean:
                             existing_pending_paths.append(line_clean)
-                            existing_pending_normalized.add(str(Path(line_clean).resolve()))
+                            existing_pending_normalized.add(line_clean)
             except Exception as e:
                 self.logger.error(f"Error cargando archivos pendientes: {e}")
         return existing_pending_paths, existing_pending_normalized
@@ -234,32 +234,33 @@ class MediaScanner:
     ) -> tuple[int, int]:
         """Procesa archivos nuevos y los agrega a pendientes"""
         # Filtrar archivos nuevos
-        new_files_candidates = [
-            file_path
-            for file_path in all_found_files
-            if str(file_path.resolve()) not in existing_pending_normalized
-            and str(file_path.resolve()) not in completed_files
-        ]
+        new_files_candidates = []
+        for file_path in all_found_files:
+            path_str = str(file_path)
+            if path_str in existing_pending_normalized:
+                self.logger.debug(f"Archivo ya en pendientes: {file_path.name}")
+                continue
+            elif path_str in completed_files:
+                # Si es MKV y no hay MP4 correspondiente, reprocesar
+                if file_path.suffix.lower() == '.mkv':
+                    mp4_path = file_path.with_suffix('.mp4')
+                    if not mp4_path.exists():
+                        self.logger.info(f"MKV completado sin MP4 correspondiente, reprocesando: {file_path.name}")
+                        new_files_candidates.append(file_path)
+                    else:
+                        self.logger.debug(f"Archivo ya completado con MP4: {file_path.name}")
+                else:
+                    self.logger.debug(f"Archivo ya completado: {file_path.name}")
+            else:
+                self.logger.debug(f"Archivo candidato nuevo: {file_path.name}")
+                new_files_candidates.append(file_path)
 
         if not new_files_candidates:
             self.logger.info("No hay archivos nuevos para agregar a pendientes")
             return len(all_found_files), 0
 
-        # Validar integridad de archivos nuevos
-        self.logger.info(f"Validando integridad de {len(new_files_candidates)} archivos nuevos...")
-        new_files_to_add = []
-        corrupted_count = 0
-
-        for file_path in new_files_candidates:
-            if self.validate_file_integrity(file_path):
-                new_files_to_add.append(str(file_path.resolve()))
-            else:
-                self.logger.warning(f"Archivo corrupto detectado: {file_path.name}")
-                if self.move_corrupted_file(file_path):
-                    corrupted_count += 1
-
-        if corrupted_count > 0:
-            self.logger.info(f"Archivos corruptos movidos a .delete: {corrupted_count}")
+        # No validar integridad aquí, dejarlo al processor
+        new_files_to_add = [str(file_path) for file_path in new_files_candidates]
 
         if not new_files_to_add:
             self.logger.info("No hay archivos válidos para agregar a pendientes")
@@ -509,8 +510,8 @@ class MediaScanner:
             # Comando ffprobe para validar archivo (más rápido que ffmpeg)
             cmd = ["ffprobe", "-v", "error", "-show_format", "-show_streams", str(file_path)]
 
-            # Ejecutar comando con timeout de 120 segundos
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, text=True)
+            # Ejecutar comando con timeout de 300 segundos
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, text=True)
 
             # Si hay errores en stderr, el archivo puede estar corrupto
             if result.stderr:
