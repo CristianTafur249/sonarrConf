@@ -16,7 +16,7 @@ Un servidor multimedia completamente automatizado con Docker, que incluye descar
 - **⏰ Ejecución programada**: Cron jobs para procesamiento automático cada 12 horas
 - **🗜️ Compresión inteligente**: Optimización basada en el tamaño del archivo con límites de recursos
 - **🔧 Recuperación de errores**: Manejo robusto de interrupciones y archivos corruptos
-- **📊 Monitoreo completo**: Prometheus + Grafana para métricas en tiempo real
+- **📊 Monitoreo completo**: Prometheus + Grafana para métricas en tiempo real - **ELIMINADO**
 - **🏗️ Infraestructura optimizada**: Docker Compose con healthchecks, límites de memoria y CPU
 - **🚀 Alto rendimiento**: Cache Redis para detección de idiomas, procesamiento paralelo
 
@@ -38,9 +38,7 @@ graph TB
         SUBTITLE[Subtitle Manager<br/>Limpieza automática]
     end
 
-    subgraph "📊 Monitoreo & Notificaciones"
-        PROMETHEUS[Prometheus<br/>Métricas]
-        GRAFANA[Grafana<br/>Dashboards]
+    subgraph "� Notificaciones"
         TELEGRAM[Telegram Bot<br/>Notificaciones]
     end
 
@@ -61,11 +59,6 @@ graph TB
     PROCESSOR --> SUBTITLE
     SUBTITLE --> JELLYFIN
 
-    SCANNER --> PROMETHEUS
-    LANGUAGE --> PROMETHEUS
-    PROCESSOR --> PROMETHEUS
-
-    PROMETHEUS --> GRAFANA
     SCANNER --> TELEGRAM
     LANGUAGE --> TELEGRAM
     PROCESSOR --> TELEGRAM
@@ -83,7 +76,7 @@ graph TB
 4. **Procesamiento** → Compresión inteligente basada en tamaño y calidad
 5. **Limpieza** → Eliminación automática de subtítulos duplicados/corruptos
 6. **Notificación** → Reportes por Telegram con emojis informativos
-7. **Monitoreo** → Métricas en tiempo real vía Prometheus/Grafana
+7. **Monitoreo** → Métricas en tiempo real vía Prometheus/Grafana - **ELIMINADO**
 
 ## 🐳 Servicios incluidos
 
@@ -97,9 +90,9 @@ graph TB
 | **Transmission** | 9091 | 512MB | 1.0 | Cliente BitTorrent | ✅ |
 | **Bazarr** | 6767 | 256MB | 0.5 | Gestión automática de subtítulos | ✅ |
 | **Portainer** | 9000 | 128MB | 0.2 | Gestión de contenedores Docker | ✅ |
-| **MediaJelly API** | 8000 | 4GB | 4.0 | API REST y procesamiento multimedia | ✅ |
-| **Prometheus** | 9092 | 512MB | 0.5 | Recolección de métricas | ✅ |
-| **Grafana** | 3000 | 512MB | 0.5 | Dashboards de monitoreo | ✅ |
+| **MediaJelly API** | 8000 | 4GB | 4.0 | API REST y procesamiento multimedia | ❌ |
+| **Prometheus** | 9092 | 512MB | 0.5 | Recolección de métricas | ❌ |
+| **Grafana** | 3000 | 512MB | 0.5 | Dashboards de monitoreo | ❌ |
 | **Redis** | 6379 | 256MB | 0.5 | Cache para detección de idiomas | ✅ |
 
 ### 📊 Métricas disponibles

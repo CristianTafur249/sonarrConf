@@ -105,6 +105,7 @@ class TelegramNotifier:
                 var_name = chat_id[2:-1]
                 config["TELEGRAM_CHAT_ID"] = os.environ.get(var_name, "")
                 self.logger.info(f"Chat ID cargado desde variable de entorno: {var_name}")
+
             else:
                 config["TELEGRAM_CHAT_ID"] = chat_id
                 

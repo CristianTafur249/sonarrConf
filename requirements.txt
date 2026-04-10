@@ -7,7 +7,11 @@ psutil>=5.9.0
 
 # Translation and language detection
 translatepy>=2.3
+# Translation and language detection
+translatepy>=2.3
 langdetect>=1.0.9
+PyYAML>=6.0
+
 
 # AI/ML - Whisper for language detection
 openai-whisper>=20231117
@@ -15,14 +19,14 @@ torch>=2.0.0,<2.2.0
 torchaudio>=2.0.0,<2.2.0
 numpy>=1.24.0,<2.0.0
 
-# Dashboard Web - FastAPI (Tarea 16)
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-python-multipart>=0.0.6
-jinja2>=3.1.2
+# Dashboard Web - FastAPI (Tarea 16) - Flask Web Interface eliminada - API REST eliminada
+# fastapi>=0.104.0 - eliminado
+# uvicorn[standard]>=0.24.0 - eliminado
+# python-multipart>=0.0.6 - eliminado
+# jinja2>=3.1.2 - eliminado
 
-# Monitoring - Prometheus client (Tarea 17)
-prometheus-client>=0.19.0
+# Monitoring - Prometheus client (Tarea 17) - métricas eliminadas
+# prometheus-client>=0.19.0 - eliminado
 
 # Caching - Redis for language detection cache (Tarea 18)
 redis>=5.0.0
