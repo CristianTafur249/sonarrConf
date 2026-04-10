@@ -84,14 +84,16 @@ class TestMediaJellyCron(unittest.TestCase):
         self.assertTrue(result)
         mock_main.assert_called_once()
 
+    @patch("mediajelly_cron_runner.MediaJellyCron.run_nfo_translator")
     @patch("mediajelly_cron_runner.MediaJellyCron.run_scanner")
     @patch("mediajelly_cron_runner.MediaJellyCron.run_language_detector")
     @patch("mediajelly_cron_runner.MediaJellyCron.run_processor")
     @patch("mediajelly_cron_runner.MediaJellyCron.run_subtitle_translator")
-    def test_run_cycle(self, mock_sub, mock_proc, mock_lang, mock_scan):
+    def test_run_cycle(self, mock_sub, mock_proc, mock_lang, mock_scan, mock_nfo):
         self.cron.run_cycle()
         
         mock_scan.assert_called_once()
+        mock_nfo.assert_called_once()
         mock_lang.assert_called_once()
         mock_proc.assert_called_once()
         mock_sub.assert_called_once()
