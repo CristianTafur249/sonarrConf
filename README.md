@@ -16,7 +16,7 @@ Un servidor multimedia completamente automatizado con Docker, que incluye descar
 - **⏰ Ejecución programada**: Cron jobs para procesamiento automático cada 12 horas
 - **🗜️ Compresión inteligente**: Optimización basada en el tamaño del archivo con límites de recursos
 - **🔧 Recuperación de errores**: Manejo robusto de interrupciones y archivos corruptos
-- **📊 Monitoreo completo**: Prometheus + Grafana para métricas en tiempo real - **ELIMINADO**
+- **📊 Monitorización:** opcional (Prometheus + Grafana)
 - **🏗️ Infraestructura optimizada**: Docker Compose con healthchecks, límites de memoria y CPU
 - **🚀 Alto rendimiento**: Cache Redis para detección de idiomas, procesamiento paralelo
 
@@ -38,7 +38,7 @@ graph TB
         SUBTITLE[Subtitle Manager<br/>Limpieza automática]
     end
 
-    subgraph "� Notificaciones"
+    subgraph "🔔 Notificaciones"
         TELEGRAM[Telegram Bot<br/>Notificaciones]
     end
 
@@ -76,24 +76,22 @@ graph TB
 4. **Procesamiento** → Compresión inteligente basada en tamaño y calidad
 5. **Limpieza** → Eliminación automática de subtítulos duplicados/corruptos
 6. **Notificación** → Reportes por Telegram con emojis informativos
-7. **Monitoreo** → Métricas en tiempo real vía Prometheus/Grafana - **ELIMINADO**
 
 ## 🐳 Servicios incluidos
 
 | Servicio | Puerto | Memoria | CPU | Descripción | Estado |
 |----------|--------|---------|-----|-------------|---------|
-| **Sonarr** | 8989 | 256MB | 0.5 | Descarga y organiza series automáticamente | ✅ |
-| **Radarr** | 7878 | 256MB | 0.5 | Descarga y organiza películas automáticamente | ✅ |
-| **Prowlarr** | 9696 | 256MB | 0.5 | Gestor de indexadores torrent | ✅ |
-| **Jellyfin** | 8096 | 1GB | 2.0 | Servidor de streaming multimedia | ✅ |
-| **Jellyseerr** | 5055 | 256MB | 0.5 | Interface de solicitudes de contenido | ⚠️ |
+| **Sonarr** | 8989 | 1g | 1.5 | Descarga y organiza series automáticamente | ✅ |
+| **Radarr** | 7878 | 1g | 1.5 | Descarga y organiza películas automáticamente | ✅ |
+| **Prowlarr** | 9696 | 512MB | 1.0 | Gestor de indexadores torrent | ✅ |
 | **Transmission** | 9091 | 512MB | 1.0 | Cliente BitTorrent | ✅ |
-| **Bazarr** | 6767 | 256MB | 0.5 | Gestión automática de subtítulos | ✅ |
-| **Portainer** | 9000 | 128MB | 0.2 | Gestión de contenedores Docker | ✅ |
-| **MediaJelly API** | 8000 | 4GB | 4.0 | API REST y procesamiento multimedia | ❌ |
-| **Prometheus** | 9092 | 512MB | 0.5 | Recolección de métricas | ❌ |
-| **Grafana** | 3000 | 512MB | 0.5 | Dashboards de monitoreo | ❌ |
+| **Bazarr** | 6767 | 512MB | 1.0 | Gestión automática de subtítulos | ✅ |
+| **Jellyfin** | 8096 | 4g | 3.0 | Servidor de streaming multimedia | ✅ |
+| **Jellyseerr** | 5055 | 500MB | 0.5 | Interface de solicitudes de contenido | ⚠️ |
+| **mediajelly-cron** | - | 6g | 4.0 | Orquestador y procesamiento multimedia (container interno) | ⚠️ |
 | **Redis** | 6379 | 256MB | 0.5 | Cache para detección de idiomas | ✅ |
+| **Samba** | 139/445 | 256MB | 0.5 | Compartición SMB (acceso a media/ y scripts/) | ✅ |
+| **telegram-transmission-bot** | - | 256MB | 0.5 | Bot Telegram para Transmission | ✅ |
 
 ### 📊 Métricas disponibles
 
@@ -627,7 +625,7 @@ Los siguientes archivos se excluyen del control de versiones:
 - `scripts/logs/*` - Logs del sistema
 - `scripts/tmp/*` - Archivos temporales
 
-## � Scripts Python del Sistema
+## 🐍 Scripts Python del Sistema
 
 ### Core Scripts
 
@@ -655,7 +653,7 @@ Los siguientes archivos se excluyen del control de versiones:
 - **🔄 Recuperación de Errores**: Reintentos automáticos y manejo robusto de fallos
 - **⚡ Optimización de Recursos**: Límites de memoria, CPU y healthchecks en Docker
 
-## �🐛 Solución de problemas
+## 🐛 Solución de problemas
 
 ### Error de permisos en archivos de lock
 
