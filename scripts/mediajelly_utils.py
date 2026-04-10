@@ -79,7 +79,7 @@ class MediaJellyPaths:
         """
         if MediaJellyPaths.is_container():
             return Path("/mediajelly")
-        return Path("/home/tafurc/mediaJelly")
+        return Path("/home/tafur/mediaJelly")
 
     @staticmethod
     def get_scripts_dir() -> Path:

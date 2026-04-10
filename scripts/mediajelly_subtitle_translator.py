@@ -290,80 +290,6 @@ class TranslationStats:
     files_processed: int = 0
 
 
-@dataclass
-class TranslationMetrics:
-    """Métricas de traducción para Prometheus"""
-    subtitles_extracted: int
-    subtitles_translated: int
-    translation_errors: int
-    avg_translation_time: float
-    timestamp: str
-
-
-class TranslationMetricsCollector:
-    """Colector de métricas de traducción de subtítulos"""
-
-    def __init__(self, logs_dir: Path):
-        self.logs_dir = logs_dir
-        self.tmp_dir = logs_dir.parent / "tmp"  # Cambiar a tmp_dir
-        self.metrics_file = self.tmp_dir / "translation_metrics.json"
-
-    def calculate_metrics(self, stats: TranslationStats, execution_time: float) -> TranslationMetrics:
-        """
-        Calcula métricas detalladas desde estadísticas de traducción.
-
-        Args:
-            stats: Estadísticas de traducción.
-            execution_time: Tiempo de ejecución en segundos.
-
-        Returns:
-            TranslationMetrics: Métricas calculadas.
-        """
-
-        # Calcular tiempo promedio de traducción
-        avg_translation_time = 0.0
-        if stats.subtitles_translated > 0:
-            avg_translation_time = stats.total_translation_time / stats.subtitles_translated
-
-        return TranslationMetrics(
-            subtitles_extracted=stats.subtitles_extracted,
-            subtitles_translated=stats.subtitles_translated,
-            translation_errors=stats.translation_errors,
-            avg_translation_time=round(avg_translation_time, 2),
-            timestamp=datetime.now().isoformat()
-        )
-
-    def save_metrics(self, metrics: TranslationMetrics) -> None:
-        """
-        Guarda métricas en archivo JSON.
-
-        Args:
-            metrics: Métricas a guardar.
-        """
-        try:
-            # Leer métricas existentes
-            existing_metrics = []
-            if self.metrics_file.exists():
-                with open(self.metrics_file, 'r', encoding='utf-8') as f:
-                    existing_metrics = json.load(f)
-                    if not isinstance(existing_metrics, list):
-                        existing_metrics = [existing_metrics]
-
-            # Agregar nuevas métricas
-            existing_metrics.append(asdict(metrics))
-
-            # Mantener solo las últimas 100 entradas
-            if len(existing_metrics) > 100:
-                existing_metrics = existing_metrics[-100:]
-
-            # Guardar archivo
-            with open(self.metrics_file, 'w', encoding='utf-8') as f:
-                json.dump(existing_metrics, f, indent=2, ensure_ascii=False)
-
-        except Exception as e:
-            print(f"Error guardando métricas de traducción: {e}")
-
-
 class SubtitleTranslator:
     """Gestor de extracción y traducción de subtítulos con soporte de Whisper"""
 
@@ -413,9 +339,6 @@ class SubtitleTranslator:
 
         # Inicializar mejora de calidad de subtítulos
         self.quality_improver = SubtitleQualityImprover(self.logger)
-
-        # Inicializar sistema de métricas
-        self.metrics_collector = TranslationMetricsCollector(self.tmp_dir)
 
         # Inicializar estadísticas de traducción
         self.translation_stats = TranslationStats()
@@ -3460,15 +3383,6 @@ def main():
         if isinstance(stats, dict) and "error" in stats:
             print(f"Error: {stats['error']}")
             return
-
-        # Guardar métricas de traducción
-        try:
-            execution_time = time.time()  # Usar tiempo total de ejecución
-            metrics = translator.metrics_collector.calculate_metrics(translator.translation_stats, execution_time)
-            translator.metrics_collector.save_metrics(metrics)
-            translator.logger.info(f"{EmojiGenerator.success()} Métricas de traducción guardadas")
-        except Exception as e:
-            translator.logger.error(f"Error guardando métricas de traducción: {e}")
 
         # Enviar notificaciones y mostrar resumen
         _send_notifications_and_summary(env_config, translator, stats)
