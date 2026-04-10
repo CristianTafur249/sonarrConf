@@ -71,16 +71,5 @@ else
     echo "$(get_warning) Hardware acceleration no disponible"
 fi
 
-# Iniciar API REST (Tarea #16)
-echo "$(get_rocket) Iniciando API REST en puerto ${MEDIAJELLY_API_PORT:-8000}..."
-cd /mediajelly/scripts
-nohup python3 mediajelly_api.py > /mediajelly/scripts/logs/api.log 2>&1 &
-echo "$(get_check_mark) API REST iniciada"
-
-# Iniciar exportador de métricas Prometheus (Tarea #17)
-echo "$(get_rocket) Iniciando exportador de métricas en puerto ${MEDIAJELLY_METRICS_PORT:-9090}..."
-nohup python3 mediajelly_metrics_exporter.py > /mediajelly/scripts/logs/metrics.log 2>&1 &
-echo "$(get_check_mark) Exportador de métricas iniciado"
-
 echo "$(get_alarm_clock) Iniciando servicio cron..."
 exec cron -f
