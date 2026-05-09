@@ -511,13 +511,6 @@ class MediaJellyCron:
                 # Liberar lock después de que el processor termine
                 self._release_lock()
 
-            # Paso 2: Ejecutar detector de idiomas ANTES del procesador para que el processor pueda usar la cache
-            self.logger.info(f"{EmojiGenerator.audio()} Ejecutando análisis de idiomas antes del procesamiento...")
-            if not self.run_language_detector():
-                self.logger.warning(
-                    f"{EmojiGenerator.warning_msg()} Advertencia en detector de idiomas, continuando con procesamiento"
-                )
-
             self.logger.info("Ciclo completado exitosamente")
             return True
         finally:

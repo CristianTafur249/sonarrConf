@@ -33,3 +33,5 @@ redis>=5.0.0
 
 # Optional: For better performance
 # numba>=0.57.0  # Uncomment if needed for audio processing optimization
+webrtcvad>=2.0.10
+soundfile>=0.12.1

@@ -46,6 +46,8 @@ graph TB
         JELLYFIN[Jellyfin<br/>Servidor multimedia]
         JELLYSEERR[Jellyseerr<br/>Solicitudes]
         BAZARR[Bazarr<br/>Subtítulos]
+        LINGARR[Lingarr<br/>Traducción de subtítulos]
+        LIBRETRANSLATE[LibreTranslate<br/>Motor local de traducción]
     end
 
     SONARR --> TRANSMISSION
@@ -66,6 +68,7 @@ graph TB
     JELLYSEERR --> SONARR
     JELLYSEERR --> RADARR
     BAZARR --> JELLYFIN
+    LINGARR --> LIBRETRANSLATE
 ```
 
 ### 🔄 Flujo de procesamiento
@@ -86,6 +89,8 @@ graph TB
 | **Prowlarr** | 9696 | 512MB | 1.0 | Gestor de indexadores torrent | ✅ |
 | **Transmission** | 9091 | 512MB | 1.0 | Cliente BitTorrent | ✅ |
 | **Bazarr** | 6767 | 512MB | 1.0 | Gestión automática de subtítulos | ✅ |
+| **Lingarr** | 9876 | 1GB | 1.0 | Traducción automática de subtítulos | ✅ |
+| **LibreTranslate** | 5001 | 1GB | 1.0 | Motor local de traducción | ✅ |
 | **Jellyfin** | 8096 | 4g | 3.0 | Servidor de streaming multimedia | ✅ |
 | **Jellyseerr** | 5055 | 500MB | 0.5 | Interface de solicitudes de contenido | ⚠️ |
 | **mediajelly-cron** | - | 6g | 4.0 | Orquestador y procesamiento multimedia (container interno) | ⚠️ |

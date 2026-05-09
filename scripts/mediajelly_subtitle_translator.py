@@ -56,6 +56,22 @@ except ImportError:
     YandexTranslate = None
     YANDEX_AVAILABLE = False
 
+try:
+    import webrtcvad  # type: ignore
+    import soundfile as sf  # type: ignore
+
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtcvad = None
+    sf = None
+    WEBRTC_AVAILABLE = False
+
+# Path to whisper.cpp binary if compiled in the image
+WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
+# Buscar por defecto el modelo en la carpeta montada persistente del proyecto
+# Permite sobrescribir vía env WHISPER_CPP_MODEL
+WHISPER_CPP_DEFAULT_MODEL = Path(os.environ.get("WHISPER_CPP_MODEL", "/mediajelly/media/models/ggml-small.bin"))
+
 # Lock global para Whisper (solo un proceso a la vez)
 whisper_lock = threading.Lock()
 
@@ -82,6 +98,14 @@ class SubtitleQualityImprover:
 
     def __init__(self, logger=None):
         self.logger = logger
+        # Compilar patrones regex frecuentes para mejorar rendimiento
+        self.re_spaces = re.compile(r"\s+")
+        self.re_space_before_punct = re.compile(r"\s+([,.!?;:])")
+        self.re_multi_punct = re.compile(r"([,.!?;:])\s*([,.!?;:])")
+        self.re_quote_open = re.compile(r'"\s+')
+        self.re_quote_close = re.compile(r'\s+"')
+        self.re_paren_open = re.compile(r"\(\s+")
+        self.re_paren_close = re.compile(r"\s+\)")
 
     def improve_subtitle_quality(self, srt_content: str, source_language: str = "auto") -> str:
         """
@@ -239,17 +263,17 @@ class SubtitleQualityImprover:
     def _apply_general_improvements(self, text: str) -> str:
         """Mejoras generales aplicables a cualquier idioma"""
         # Eliminar espacios múltiples
-        text = re.sub(r"\s+", " ", text)
+        text = self.re_spaces.sub(" ", text)
 
         # Corregir puntuación
-        text = re.sub(r"\s+([,.!?;:])", r"\1", text)  # Quitar espacios antes de puntuación
-        text = re.sub(r"([,.!?;:])\s*([,.!?;:])", r"\1\2", text)  # Corregir puntuación duplicada
+        text = self.re_space_before_punct.sub(r"\1", text)  # Quitar espacios antes de puntuación
+        text = self.re_multi_punct.sub(r"\1\2", text)  # Corregir puntuación duplicada
 
         # Corregir comillas y paréntesis
-        text = re.sub(r'"\s+', '"', text)  # Quitar espacios después de comillas de apertura
-        text = re.sub(r'\s+"', '"', text)  # Quitar espacios antes de comillas de cierre
-        text = re.sub(r"\(\s+", "(", text)  # Quitar espacios después de paréntesis de apertura
-        text = re.sub(r"\s+\)", ")", text)  # Quitar espacios antes de paréntesis de cierre
+        text = self.re_quote_open.sub('"', text)  # Quitar espacios después de comillas de apertura
+        text = self.re_quote_close.sub('"', text)  # Quitar espacios antes de comillas de cierre
+        text = self.re_paren_open.sub("(", text)  # Quitar espacios después de paréntesis de apertura
+        text = self.re_paren_close.sub(")", text)  # Quitar espacios antes de paréntesis de cierre
 
         # Capitalizar primera letra de oraciones
         sentences = re.split(r"([.!?]+\s*)", text)
@@ -295,7 +319,7 @@ class SubtitleTranslator:
 
     PROGRESS_FILE_NAME = "progress.json"
 
-    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None) -> None:
+    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None, force_language: Optional[str] = None) -> None:
         # Configurar rutas desde configuración
         self.is_container = Path("/mediajelly").exists()
         self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
@@ -349,6 +373,8 @@ class SubtitleTranslator:
         self.max_workers = max_workers  # Procesamiento concurrente
         self.use_whisper = use_whisper
         self.allow_retranslate = allow_retranslate  # Permitir re-traducción de archivos .es.srt existentes
+        # Forzar idioma de transcripción si se indica (ej: 'ja', 'en', 'es')
+        self.force_language = force_language
         self.progress_lock = threading.Lock()  # Lock para sincronizar progreso y estadísticas
         self.lock_file = lock_file  # Archivo de lock para sincronización
 
@@ -357,6 +383,14 @@ class SubtitleTranslator:
         if self.use_whisper and not self.whisper_available:
             self.logger.warning("Whisper solicitado pero no disponible, se usarán solo subtítulos embebidos")
             self.use_whisper = False
+
+        # Inicializar traductor Yandex (reutilizable) para batching
+        self.yandex_translator = None
+        if YANDEX_AVAILABLE:
+            try:
+                self.yandex_translator = YandexTranslate()
+            except Exception:
+                self.yandex_translator = None
 
     def setup_logging(self) -> None:
         """Configura el sistema de logging."""
@@ -1100,17 +1134,140 @@ class SubtitleTranslator:
         self.logger.info(f"Audio extraído ({audio_file.stat().st_size} bytes), transcribiendo con Whisper...")
         return True
 
+    def _detect_language_with_whisper_cpp(self, audio_file: Path, timeout: int = 600) -> Optional[str]:
+        """
+        Detecta el idioma de un archivo de audio usando `whisper-cli --detect-language`.
+
+        Returns:
+            Optional[str]: Código ISO de dos letras (ej: 'ja', 'en') o None.
+        """
+        try:
+            if not WHISPER_CPP_BIN.exists() or not WHISPER_CPP_DEFAULT_MODEL.exists():
+                return None
+
+            cmd = [str(WHISPER_CPP_BIN), "-m", str(WHISPER_CPP_DEFAULT_MODEL), "--detect-language", "-f", str(audio_file)]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+            # Buscar patrón como: "auto-detected language: ja (p = 0.999300)"
+            m = re.search(r"auto-detected language:\s*([a-z]{2})", out, flags=re.IGNORECASE)
+            if m:
+                return m.group(1).lower()
+
+            m2 = re.search(r"Detected language:\s*([a-z]{2})", out, flags=re.IGNORECASE)
+            if m2:
+                return m2.group(1).lower()
+
+            return None
+        except Exception as e:
+            self.logger.debug(f"Error detectando idioma con whisper-cli: {e}")
+            return None
+
     def _transcribe_audio_with_whisper(self, audio_file: Path) -> Optional[dict]:
         """
-        Transcribe audio usando Whisper con lock global.
+        Transcribe audio usando whisper.cpp (si está disponible) o cae al modelo Python.
+
+        - Detecta idioma con `whisper-cli --detect-language` (a menos que se haya forzado con `force_language`).
+        - Ejecuta `whisper-cli` para generar un archivo SRT temporal y lo parsea a segmentos.
 
         Args:
             audio_file: Ruta del archivo de audio.
 
         Returns:
-            Optional[dict]: Resultado de la transcripción o None.
+            Optional[dict]: Resultado de la transcripción con claves `segments` y `language`.
         """
-        # LOCK GLOBAL: Solo un proceso puede usar Whisper a la vez
+        # Intentar usar whisper.cpp binario si está disponible (PoC CPU)
+        try:
+            if WHISPER_CPP_BIN.exists() and WHISPER_CPP_DEFAULT_MODEL.exists():
+                # Determinar idioma: forzado o detectado
+                language = None
+                if getattr(self, "force_language", None):
+                    language = self.force_language
+                    self.logger.info(f"Idioma forzado por parámetro: {language}")
+                else:
+                    detected = self._detect_language_with_whisper_cpp(audio_file)
+                    if detected:
+                        language = detected
+                        self.logger.info(f"Idioma detectado por whisper-cli: {language}")
+                    else:
+                        language = "auto"
+
+                # Preparar path base de salida (sin extensión)
+                suffix = audio_file.suffix or ""
+                base = str(audio_file)
+                if suffix:
+                    base = str(audio_file)[: -len(suffix)]
+
+                cmd = [
+                    str(WHISPER_CPP_BIN),
+                    "-m",
+                    str(WHISPER_CPP_DEFAULT_MODEL),
+                    "-f",
+                    str(audio_file),
+                    "-l",
+                    language,
+                    "-osrt",
+                    "-of",
+                    base,
+                ]
+
+                self.logger.info(f"Ejecutando whisper-cli: {' '.join(cmd[:6])} ...")
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
+
+                if proc.returncode != 0:
+                    self.logger.warning(
+                        "whisper-cli devolvió error (returncode=%s): %s",
+                        proc.returncode,
+                        (proc.stderr or proc.stdout)[:1000],
+                    )
+                else:
+                    srt_path = Path(base + ".srt")
+                    if srt_path.exists() and srt_path.stat().st_size > 0:
+                        # Parsear SRT a segmentos
+                        segments: List[Dict[str, Union[float, str]]] = []
+                        try:
+                            with open(srt_path, "r", encoding="utf-8", errors="ignore") as sf:
+                                content = sf.read()
+
+                            # Separar bloques por doble salto de línea
+                            blocks = [b.strip() for b in re.split(r"\n\s*\n", content) if b.strip()]
+                            for block in blocks:
+                                parts = block.splitlines()
+                                if len(parts) >= 2:
+                                    # parts[0] = index, parts[1] = times, rest = text
+                                    times = parts[1].strip()
+                                    m = re.match(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})", times)
+                                    if not m:
+                                        continue
+
+                                    def _to_seconds(ts: str) -> float:
+                                        hh, mm, ss_ms = ts.split(":")
+                                        ss, ms = ss_ms.split(",")
+                                        return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+                                    start = _to_seconds(m.group(1))
+                                    end = _to_seconds(m.group(2))
+                                    text = " ".join([line.strip() for line in parts[2:]]).strip()
+                                    segments.append({"start": start, "end": end, "text": text})
+
+                            # Si obtuvimos segmentos, retornar
+                            if segments:
+                                # Intentar eliminar el archivo SRT temporal (no crítico)
+                                try:
+                                    srt_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                return {"segments": segments, "language": language}
+                        except Exception as e:
+                            self.logger.warning(f"Error parseando SRT generado por whisper-cli: {e}")
+
+                    else:
+                        self.logger.warning("whisper-cli no generó SRT válido o archivo vacío: %s", str(srt_path))
+
+        except Exception as e:
+            self.logger.warning("Error ejecutando whisper.cpp PoC: %s", e)
+
+        # LOCK GLOBAL: Solo un proceso puede usar Whisper (fallback Python)
         with whisper_lock:
             self.logger.info(f"{EmojiGenerator.lock()} Adquiriendo lock global de Whisper...")
 
@@ -1120,11 +1277,11 @@ class SubtitleTranslator:
             if self.whisper_model is None:
                 raise RuntimeError("No se pudo cargar el modelo Whisper")
 
-            # Transcribir con Whisper con manejo específico de errores
+            # Transcribir con Whisper (Python) con manejo específico de errores
             try:
                 result = self.whisper_model.transcribe(
                     str(audio_file),
-                    language=None,  # Auto-detectar idioma
+                    language=(self.force_language if getattr(self, "force_language", None) else None),
                     task="transcribe",
                     fp16=False,  # CPU mode
                     verbose=False,
@@ -1136,7 +1293,7 @@ class SubtitleTranslator:
 
         # Verificar que tenemos segmentos
         if not result.get("segments"):
-            self.logger.warning("Whisper no generó segmentos de transcripción")
+            self.logger.warning("Whisper no generó segmentos de transcripción (fallback)")
             return None
 
         return result
@@ -1341,7 +1498,7 @@ class SubtitleTranslator:
         try:
             import time
 
-            translator = YandexTranslate()
+            translator = self.yandex_translator if getattr(self, 'yandex_translator', None) is not None else (YandexTranslate() if YANDEX_AVAILABLE else None)
 
             # Primera traducción
             with open(srt_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1395,13 +1552,51 @@ class SubtitleTranslator:
         Returns:
             tuple[List[str], int]: (Líneas traducidas, Número de traducciones realizadas).
         """
-        translated_lines = []
+        translated_lines: List[str] = []
         translations_made = 0
 
-        for line in lines:
-            translated_line, made_translation = self._translate_single_line(line, translator, force_translate)
-            translated_lines.append(translated_line)
-            translations_made += made_translation
+        if translator is None:
+            # No translator available: return original lines
+            return [line if line.endswith("\n") else line + "\n" for line in lines], 0
+
+        i = 0
+        N = len(lines)
+        while i < N:
+            line = lines[i]
+            if self._should_skip_translation(line.strip()):
+                translated_lines.append(line)
+                i += 1
+                continue
+
+            # Agrupar un bloque contiguo de líneas traducibles
+            block_lines = []
+            j = i
+            char_count = 0
+            while j < N and not self._should_skip_translation(lines[j].strip()) and char_count < 3000:
+                block_lines.append(lines[j].strip())
+                char_count += len(lines[j])
+                j += 1
+
+            # Traducir el bloque en batch
+            joined = " ||| ".join(block_lines)
+            try:
+                translated_obj = translator.translate(joined, "es")
+                translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
+                parts = translated_text.split(" ||| ")
+                if len(parts) != len(block_lines):
+                    # Fallback: split por nueva línea
+                    parts = translated_text.split("\n")
+            except Exception as e:
+                self.logger.debug(f"Batch translation failed: {e}")
+                parts = [b + "\n" for b in block_lines]
+
+            # Añadir resultados preservando saltos
+            for p in parts:
+                translated_lines.append(p if p.endswith("\n") else p + "\n")
+                if p.strip():
+                    translations_made += 1
+
+            i = j
 
         return translated_lines, translations_made
 
@@ -1536,7 +1731,9 @@ class SubtitleTranslator:
         self._improve_translated_subtitles_quality(output_file)
 
         # Eliminar archivo original si fue extraído (no tiene _ES)
-        self._cleanup_original_file(srt_file)
+        # Conservar el archivo original; no eliminarlo para mantener ambas versiones (.srt y .es.srt)
+        # Anteriormente se borraba aquí, pero ahora preferimos mantener ambos archivos.
+        # self._cleanup_original_file(srt_file)
 
         return output_file
 
@@ -1572,9 +1769,12 @@ class SubtitleTranslator:
             except Exception:
                 pass
 
+            # Mantener comportamiento no destructivo: no eliminar el archivo original por defecto.
+            self.logger.debug(f"_cleanup_original_file: conservar {srt_file.name} (no se elimina)")
+
     def process_video(self, video_file: Path) -> dict:
         """
-        Procesa un archivo de video para subtítulos en español.
+        Procesa un único archivo de video: extrae o traduce subtítulos, y devuelve un resumen.
 
         Args:
             video_file: Ruta del archivo de video.
@@ -3498,6 +3698,13 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
     parser.add_argument(
         "--retranslate", action="store_true", help="Permitir re-traducción de archivos .es.srt existentes"
     )
+    parser.add_argument(
+        "--force-language",
+        dest="force_language",
+        type=str,
+        default=None,
+        help="Forzar idioma de transcripción (ej: 'ja', 'en', 'es'). Si no se indica, se detecta automáticamente.",
+    )
 
     args = parser.parse_args()
 
@@ -3508,7 +3715,11 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
 
     # Crear traductor con parámetros
     translator = SubtitleTranslator(
-        max_workers=args.max_workers, use_whisper=not args.no_whisper, allow_retranslate=args.retranslate, lock_file=env_config["subtitle_lock_file"]
+        max_workers=args.max_workers,
+        use_whisper=not args.no_whisper,
+        allow_retranslate=args.retranslate,
+        lock_file=env_config["subtitle_lock_file"],
+        force_language=args.force_language,
     )
 
     return args, translator

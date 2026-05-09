@@ -15,6 +15,13 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     tzdata \
     vainfo \
+    git \
+    build-essential \
+    cmake \
+    libsndfile1-dev \
+    pkg-config \
+    libffi-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/"$TZ" /etc/localtime && echo "$TZ" > /etc/timezone \
     && groupadd -g 992 render \
@@ -34,6 +41,11 @@ COPY config/crontab-python /etc/cron.d/mediajelly-python
 COPY scripts/*.py /mediajelly/scripts/
 COPY scripts/*.sh /mediajelly/scripts/
 COPY docker-entrypoint-hybrid.sh /usr/local/bin/
+
+# Compilar whisper.cpp (opcional) para PoC CPU optimized transcription
+RUN git clone --depth 1 https://github.com/ggerganov/whisper.cpp /opt/whisper.cpp \
+ && cd /opt/whisper.cpp && make -j"$(nproc)" || true \
+ && if [ -f /opt/whisper.cpp/main/whisper ]; then cp /opt/whisper.cpp/main/whisper /usr/local/bin/whisper_cpp || true; fi
 
 # Configurar permisos finales
 RUN chmod 0644 /etc/cron.d/mediajelly* \
