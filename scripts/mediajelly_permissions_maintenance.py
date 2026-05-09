@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 import logging
+from mediajelly_utils import MediaJellyPaths
 
 
 def setup_logging():
@@ -21,9 +22,8 @@ def setup_logging():
 def ensure_permissions(logger):
     """Asegura que los directorios críticos tengan los permisos correctos"""
 
-    # Detectar el entorno
-    is_container = Path("/mediajelly").exists()
-    base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+    # Detectar el entorno con rutas centralizadas
+    base_dir = MediaJellyPaths.get_base_path()
 
     critical_dirs = [base_dir / "scripts" / "tmp", base_dir / "scripts" / "logs"]
 
@@ -52,22 +52,43 @@ def ensure_permissions(logger):
                         try:
                             # Verificar propietario
                             stat_info = file_path.stat()
+                            current_file_perms = oct(stat_info.st_mode)[-3:]
+                            
+                            # Primero intentar cambiar permisos a 0o666 (rw-rw-rw-) - esto usualmente funciona
+                            if current_file_perms != "666":
+                                try:
+                                    os.chmod(file_path, 0o666)
+                                    logger.info(f"Permisos corregidos de archivo {filename}: {current_file_perms} -> 666")
+                                except PermissionError as e:
+                                    logger.warning(f"No se pueden cambiar permisos de {filename}: {e}")
+                                    # Si no se pueden cambiar permisos, intentar con permisos más permisivos (0o777)
+                                    try:
+                                        os.chmod(file_path, 0o777)
+                                        logger.info(f"Permisos ampliados de archivo {filename} a 777")
+                                    except PermissionError:
+                                        logger.warning(f"Tampoco se pueden establecer permisos 777 para {filename}")
+                            
+                            # Intentar cambiar propietario solo si es root y se tiene permisos
                             if stat_info.st_uid == 0:  # Pertenece a root
                                 logger.warning(f"Archivo con propietario incorrecto: {filename} (root -> mediauser)")
                                 try:
                                     import pwd
-                                    mediauser_uid = pwd.getpwnam('mediauser').pw_uid
-                                    mediauser_gid = pwd.getpwnam('mediauser').pw_gid
-                                    os.chown(file_path, mediauser_uid, mediauser_gid)
-                                    logger.info(f"Propietario corregido: {filename}")
-                                except (KeyError, PermissionError) as e:
-                                    logger.error(f"No se pudo cambiar propietario de {filename}: {e}")
-
-                            # Cambiar permisos del archivo a 0o666 (rw-rw-rw-)
-                            current_file_perms = oct(file_path.stat().st_mode)[-3:]
-                            if current_file_perms != "666":
-                                logger.info(f"Corrigiendo permisos de archivo {filename}: {current_file_perms} -> 666")
-                                os.chmod(file_path, 0o666)
+                                    try:
+                                        mediauser_uid = pwd.getpwnam('mediauser').pw_uid
+                                        mediauser_gid = pwd.getpwnam('mediauser').pw_gid
+                                        os.chown(file_path, mediauser_uid, mediauser_gid)
+                                        logger.info(f"Propietario corregido: {filename}")
+                                    except KeyError:
+                                        logger.debug("Usuario 'mediauser' no existe en este sistema, saltando cambio de propietario")
+                                except PermissionError as e:
+                                    # Si no se puede cambiar propietario, asegurar que sea escribible por todos
+                                    logger.warning(f"No se pudo cambiar propietario de {filename} a mediauser: {e}")
+                                    logger.info(f"Intentando asegurar permisos de escritura global para {filename}...")
+                                    try:
+                                        os.chmod(file_path, 0o777)
+                                        logger.info(f"Permisos globales (777) establecidos para {filename}")
+                                    except Exception as inner_e:
+                                        logger.error(f"No se pudo establecer permisos globales para {filename}: {inner_e}")
                         except Exception as e:
                             logger.error(f"Error al procesar archivo {filename}: {e}")
 
@@ -85,8 +106,7 @@ def ensure_permissions(logger):
 def cleanup_old_locks(logger):
     """Elimina archivos de lock antiguos que puedan estar causando problemas"""
 
-    is_container = Path("/mediajelly").exists()
-    base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+    base_dir = MediaJellyPaths.get_base_path()
     tmp_dir = base_dir / "scripts" / "tmp"
 
     if not tmp_dir.exists():

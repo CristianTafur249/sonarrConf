@@ -17,7 +17,7 @@ echo "Directorio base: $BASE_DIR"
 # Directorios críticos que necesitan permisos amplios
 CRITICAL_DIRS=(
     "$BASE_DIR/scripts/tmp"
-    "$BASE_DIR/scripts/logs"
+    "$BASE_DIR/scripts/tmp/logs"
 )
 
 echo ""

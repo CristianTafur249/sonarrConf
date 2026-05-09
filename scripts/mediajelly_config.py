@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Union, List
 from dataclasses import dataclass, field
 from datetime import datetime
+from mediajelly_utils import MediaJellyPaths
 
 
 @dataclass
@@ -83,10 +84,10 @@ class PathsConfig:
 class LoggingConfig:
     """Configuración de logging"""
     level: str = "INFO"
-    main_log: str = "/mediajelly/scripts/logs/mediajelly.log"
-    language_detection_log: str = "/mediajelly/scripts/logs/language-detection.log"
-    subtitle_translator_log: str = "/mediajelly/scripts/logs/subtitle_translator.log"
-    processor_log: str = "/mediajelly/scripts/logs/processor.log"
+    main_log: str = "/mediajelly/scripts/tmp/logs/mediajelly.log"
+    language_detection_log: str = "/mediajelly/scripts/tmp/logs/language-detection.log"
+    subtitle_translator_log: str = "/mediajelly/scripts/tmp/logs/subtitle_translator.log"
+    processor_log: str = "/mediajelly/scripts/tmp/logs/processor.log"
 
 
 @dataclass
@@ -226,10 +227,10 @@ class MediaJellyConfig:
             logging_data = data['logging']
             config.logging = LoggingConfig(
                 level=logging_data.get('level', 'INFO'),
-                main_log=logging_data.get('main_log', '/mediajelly/scripts/logs/mediajelly.log'),
-                language_detection_log=logging_data.get('language_detection_log', '/mediajelly/scripts/logs/language-detection.log'),
-                subtitle_translator_log=logging_data.get('subtitle_translator_log', '/mediajelly/scripts/logs/subtitle_translator.log'),
-                processor_log=logging_data.get('processor_log', '/mediajelly/scripts/logs/processor.log')
+                main_log=logging_data.get('main_log', '/mediajelly/scripts/tmp/logs/mediajelly.log'),
+                language_detection_log=logging_data.get('language_detection_log', '/mediajelly/scripts/tmp/logs/language-detection.log'),
+                subtitle_translator_log=logging_data.get('subtitle_translator_log', '/mediajelly/scripts/tmp/logs/subtitle_translator.log'),
+                processor_log=logging_data.get('processor_log', '/mediajelly/scripts/tmp/logs/processor.log')
             )
 
         return config
@@ -351,10 +352,9 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> MediaJellyCon
     if config_path is None:
         # Buscar en ubicaciones estándar
         search_paths = [
-            Path("/mediajelly/config/mediajelly.yaml"),
-            Path("/home/tafurc/mediaJelly/config/mediajelly.yaml"),
+            MediaJellyPaths.get_config_dir() / "mediajelly.yaml",
             Path("config/mediajelly.yaml"),
-            Path("mediajelly.yaml")
+            Path("mediajelly.yaml"),
         ]
 
         for path in search_paths:

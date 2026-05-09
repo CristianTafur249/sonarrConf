@@ -4,23 +4,23 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ## [v3.2.4] - 2025-11-10
 
-### 🚀 Nuevas Características
+### Nuevas Características
 
-- **🗣️ Sistema de Detección Inteligente de Idiomas**:
+- **Sistema de Detección Inteligente de Idiomas**:
   - Nuevo script `mediajelly_language_detector.py` con integración de Whisper AI
   - Análisis automático de streams de audio para detectar idiomas precisos
   - Validación segura de comandos subprocess con lista blanca (solo ffprobe/ffmpeg)
   - Detección de idiomas embebidos y externos con prioridades inteligentes
   - Optimización de recursos con modelo Whisper 'tiny' para mejor rendimiento
 
-- **🧹 Limpieza Automática de Subtítulos Duplicados**:
+- **Limpieza Automática de Subtítulos Duplicados**:
   - Nuevo script `clean_duplicate_subtitles.py` para gestión de subtítulos
   - Eliminación automática de archivos .hi.srt (hindú) y .es-MX.srt duplicados
   - Priorización de subtítulos .es.srt sobre variantes regionales
   - Agrupación inteligente por nombre base de archivo para detectar duplicados
   - Compatibilidad con contenedor Docker y sistema host
 
-- **🏗️ Infraestructura Docker Optimizada**:
+- **Infraestructura Docker Optimizada**:
   - Reorganización completa de `docker-compose.yaml` con mejores prácticas
   - Límites de recursos (CPU, memoria) para todos los servicios
   - Healthchecks automáticos para servicios críticos
@@ -28,7 +28,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Optimización de volúmenes con permisos específicos (ro/rw)
   - Red personalizada con configuración de bridge optimizada
 
-### 🔧 Mejoras del Sistema
+### Mejoras del Sistema
 
 - **📊 Refactorización Completa del Cron Runner**:
   - Nuevo sistema de ejecución cíclica con detección de idiomas integrada
@@ -50,7 +50,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Mejora en el manejo de memoria y CPU en contenedores
   - Optimización de timeouts y reintentos en operaciones críticas
 
-### 🐛 Correcciones
+### Correcciones
 
 - **Sintaxis y Linting**:
   - Corrección de errores de sintaxis en scripts Python
@@ -62,7 +62,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Logging mejorado con emojis informativos
   - Recuperación automática de estados corruptos
 
-### 📚 Documentación
+### Documentación
 
 - **README.md Actualizado**:
   - Nueva sección detallada de scripts Python del sistema
@@ -149,7 +149,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 ## [v3.2.0] - 2025-01-26
 
-### 🚀 Nuevas Funcionalidades Mayores
+### Nuevas Funcionalidades Mayores
 
 - **Procesamiento concurrente de subtítulos**:
   - Uso de `ThreadPoolExecutor` para procesar múltiples archivos simultáneamente
@@ -174,7 +174,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
   - Lock threading para operaciones thread-safe
   - Logs mejorados con indicadores visuales (✓, ✗)
   - Tracking de uso de Whisper en progress.json
-  
+
 - **Dockerfile.hybrid**:
   - Agregadas dependencias `openai-whisper`, `torch`, `torchaudio`
   - Optimización de instalación con `--no-cache-dir`

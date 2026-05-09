@@ -15,6 +15,7 @@ from typing import Optional, List, Tuple
 
 # Importar módulo de emojis
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths, archive_legacy_log_file, create_compressed_rotating_file_handler
 
 # Agregar scripts al path para imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -60,7 +61,7 @@ except ImportError:
 class MediaJellyCron:
     """
     Orquestador principal del sistema MediaJelly.
-    
+
     Coordina la ejecución de todos los componentes: scanner, detector de idiomas,
     processor y traductor de subtítulos.
     """
@@ -68,16 +69,13 @@ class MediaJellyCron:
     def __init__(self, base_path: Optional[str] = None) -> None:
         """
         Inicializa el cron runner.
-        
+
         Args:
             base_path: Ruta base de MediaJelly. Si es None, se detecta automáticamente.
         """
         if base_path is None:
-            # Detectar automáticamente el entorno
-            if Path("/mediajelly").exists():
-                base_path = "/mediajelly"
-            else:
-                base_path = "/home/tafurc/mediaJelly"
+            # Detectar automáticamente el entorno usando rutas centralizadas
+            base_path = str(MediaJellyPaths.get_base_path())
         self.base_path: Path = Path(base_path)
         self.scripts_path: Path = self.base_path / "scripts"
         self.tmp_path: Path = self.scripts_path / "tmp"
@@ -165,13 +163,15 @@ class MediaJellyCron:
                 sys.exit(1)
 
         # Setup logging
-        log_path = self.scripts_path / "logs"
-        log_path.mkdir(exist_ok=True)
+        log_path = self.tmp_path / "logs"
+        log_path.mkdir(parents=True, exist_ok=True)
+
+        legacy_log = self.scripts_path / "logs" / "cron.log"
+        archive_legacy_log_file(legacy_log, log_path, archive_name="cron.log", backup_count=5)
 
         try:
-            from logging.handlers import RotatingFileHandler
-            file_handler = RotatingFileHandler(
-                log_path / "cron_runner.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            file_handler = create_compressed_rotating_file_handler(
+                log_path / "cron_runner.log", max_bytes=10 * 1024 * 1024, backup_count=5
             )
             logging.basicConfig(
                 level=logging.INFO,
@@ -510,13 +510,6 @@ class MediaJellyCron:
                 processor_executed = True
                 # Liberar lock después de que el processor termine
                 self._release_lock()
-
-            # Paso 2: Ejecutar detector de idiomas ANTES del procesador para que el processor pueda usar la cache
-            self.logger.info(f"{EmojiGenerator.audio()} Ejecutando análisis de idiomas antes del procesamiento...")
-            if not self.run_language_detector():
-                self.logger.warning(
-                    f"{EmojiGenerator.warning_msg()} Advertencia en detector de idiomas, continuando con procesamiento"
-                )
 
             self.logger.info("Ciclo completado exitosamente")
             return True
