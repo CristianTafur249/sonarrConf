@@ -45,7 +45,17 @@ if [ "$MODE" = "python" ]; then
     chmod +x /mediajelly/scripts/*.py
     echo "$(get_test_tube) Probando imports Python..."
     python3 -c "import requests, psutil; print('$(get_check_mark) Dependencias Python OK')"
-    
+
+    # Bot interactivo de Telegram (long-polling, proceso de fondo de larga duración).
+    # Es independiente del cron: solo responde consultas de estado, no procesa videos.
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+        echo "$(get_rocket) Iniciando bot interactivo de Telegram en segundo plano..."
+        cd /mediajelly/scripts
+        su -s /bin/bash -c "python3 mediajelly_telegram_bot.py >> /mediajelly/scripts/tmp/logs/telegram_bot.log 2>&1 &" mediauser
+    else
+        echo "$(get_warning) TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no configurados: bot interactivo deshabilitado"
+    fi
+
 else
     echo "$(get_scroll) Configurando modo Bash (por defecto)..."
     
