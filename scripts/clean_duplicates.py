@@ -6,6 +6,7 @@ Script para limpiar duplicados del archivo pending-compression.txt
 from pathlib import Path
 import sys
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths
 
 
 def process_file_line(line: str, seen: set) -> tuple[str | None, bool]:
@@ -28,9 +29,8 @@ def process_file_line(line: str, seen: set) -> tuple[str | None, bool]:
 
 def clean_pending_duplicates():
     """Limpia duplicados del archivo pending-compression.txt"""
-    # Detecta el entorno
-    is_container = Path("/mediajelly").exists()
-    base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+    # Usar MediaJellyPaths para resolver rutas
+    base_dir = MediaJellyPaths.get_base_path()
     scripts_dir = base_dir / "scripts"
     pending_file = scripts_dir / "pending-compression.txt"
 

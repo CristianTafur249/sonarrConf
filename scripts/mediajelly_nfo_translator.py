@@ -80,6 +80,8 @@ class NFOTranslator:
     def detect_language(self, text: str) -> str:
         """Detecta el idioma del texto"""
         try:
+            if not LANGDETECT_AVAILABLE:
+                return 'unknown'
             # Limpiar texto para mejor detección
             text = text.strip()
             if len(text) < 3:  # Texto demasiado corto

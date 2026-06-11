@@ -10,16 +10,15 @@ from pathlib import Path
 from collections import defaultdict
 
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths
 
-# Detectar si estamos en contenedor o host
-if Path("/mediajelly").exists():
-    MEDIA_PATHS = ["/mediajelly/media/anime", "/mediajelly/media/series", "/mediajelly/media/Peliculas"]
-else:
-    MEDIA_PATHS = [
-        "/home/tafurc/mediaJelly/media/anime",
-        "/home/tafurc/mediaJelly/media/series",
-        "/home/tafurc/mediaJelly/media/Peliculas",
-    ]
+# Rutas de media centralizadas usando MediaJellyPaths
+base_media = MediaJellyPaths.get_base_path() / "media"
+MEDIA_PATHS = [
+    base_media / "anime",
+    base_media / "series",
+    base_media / "Peliculas",
+]
 
 
 def find_subtitle_groups():
