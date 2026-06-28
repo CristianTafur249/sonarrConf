@@ -43,12 +43,12 @@ See Also:
 import sys
 import time
 import logging
-from logging.handlers import RotatingFileHandler
 import subprocess
 from pathlib import Path
 from typing import List
 
-from mediajelly_utils import MediaJellyPaths
+from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
+from mediajelly_db import add_pending, get_pending_files, get_all_completed_files
 
 
 class MediaScanner:
@@ -86,11 +86,11 @@ class MediaScanner:
 
     def __init__(self):
         # Detecta el entorno
-        self.is_container = Path("/mediajelly").exists()
-        self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
+        self.is_container = MediaJellyPaths.is_container()
+        self.base_dir = MediaJellyPaths.get_base_path()
         self.scripts_dir = self.base_dir / "scripts"
         self.tmp_dir = self.scripts_dir / "tmp"
-        self.logs_dir = self.scripts_dir / "logs"
+        self.logs_dir = self.scripts_dir / "tmp" / "logs"
 
         # Archivos
         self.pending_file = self.tmp_dir / "pending-compression.txt"
@@ -111,9 +111,7 @@ class MediaScanner:
     def setup_logging(self):
         """Configurar logging con rotación de archivos"""
         # Crear handler con rotación (máx 10MB, mantener 5 backups)
-        file_handler = RotatingFileHandler(
-            self.log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"  # 10MB
-        )
+        file_handler = create_compressed_rotating_file_handler(self.log_file, max_bytes=10 * 1024 * 1024, backup_count=5)
         file_handler.setLevel(logging.INFO)
 
         # Handler para consola
@@ -128,6 +126,7 @@ class MediaScanner:
         # Configurar logger
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
+        self.logger.handlers.clear()
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
 
@@ -164,30 +163,25 @@ class MediaScanner:
         return found_files
 
     def _load_completed_files(self) -> set:
-        """Carga archivos completados de forma eficiente"""
-        completed_files = set()
-        if self.completed_file.exists():
-            try:
-                with open(self.completed_file, "r") as f:
-                    completed_files = {line.strip() for line in f if line.strip()}
-            except Exception as e:
-                self.logger.error(f"Error cargando archivos completados: {e}")
-        return completed_files
+        """Carga archivos completados desde la DB (compatibilidad con completed.txt)."""
+        try:
+            files = get_all_completed_files()
+            return {str(p) for p in files}
+        except Exception:
+            return set()
 
     def _load_existing_pending(self) -> tuple[List[str], set]:
         """Carga archivos pendientes existentes"""
         existing_pending_paths = []
         existing_pending_normalized = set()
-        if self.pending_file.exists():
-            try:
-                with open(self.pending_file, "r") as f:
-                    for line in f:
-                        line_clean = line.strip()
-                        if line_clean:
-                            existing_pending_paths.append(line_clean)
-                            existing_pending_normalized.add(line_clean)
-            except Exception as e:
-                self.logger.error(f"Error cargando archivos pendientes: {e}")
+        try:
+            db_pending = get_pending_files()
+            for p in db_pending:
+                s = str(p)
+                existing_pending_paths.append(s)
+                existing_pending_normalized.add(s)
+        except Exception:
+            pass
         return existing_pending_paths, existing_pending_normalized
 
     def scan_media_directories(self, media_dirs: List[Path]) -> tuple[int, int]:
@@ -279,12 +273,11 @@ class MediaScanner:
 
     def _append_to_pending_file(self, new_files: List[str]):
         """Agrega archivos nuevos al archivo de pendientes"""
-        try:
-            with open(self.pending_file, "a") as f:
-                for file_path in new_files:
-                    f.write(f"{file_path}\n")
-        except Exception as e:
-            self.logger.error(f"Error agregando archivos a pendientes: {e}")
+        for fp in new_files:
+            try:
+                add_pending(fp)
+            except Exception as e:
+                self.logger.error(f"Error agregando archivo a pendientes (DB): {e}")
 
     def _log_new_files_added(self, new_files: List[str]):
         """Registra archivos nuevos agregados"""
