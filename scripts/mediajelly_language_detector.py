@@ -26,6 +26,14 @@ except ImportError:
 
 # Importar módulo de emojis
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths
+from mediajelly_db import (
+    get_pending_files,
+    get_all_completed_files,
+    add_pending,
+    remove_pending,
+    mark_completed,
+)
 
 # Importar configuración centralizada
 from mediajelly_config import MediaJellyConfig
@@ -216,31 +224,71 @@ def load_cache() -> Dict[str, Any]:
 def save_cache(cache: Dict[str, Any]) -> None:
     """
     Guarda el caché de idiomas detectados en el archivo JSON.
+    Maneja robustamente errores de permisos y conflictos de escritura.
 
     Args:
         cache: Diccionario con los datos a guardar.
     """
     try:
         os.makedirs(os.path.dirname(CACHE_FILE_PATH), exist_ok=True)
+
+        # Si el archivo existe, intentar cambiar sus permisos primero
+        if Path(CACHE_FILE_PATH).exists():
+            try:
+                os.chmod(CACHE_FILE_PATH, 0o666)
+            except Exception as chmod_err:
+                log(f"Aviso: No se pudieron cambiar permisos del caché existente: {chmod_err}", "WARNING")
+
         # Guardado atómico: escribir en archivo temporal y renombrar
         temp_path = f"{CACHE_FILE_PATH}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                # No es crítico si fsync falla en algunos sistemas
-                pass
-        os.replace(temp_path, CACHE_FILE_PATH)
-        # Asegurar permisos de escritura para todos los usuarios si es posible
         try:
-            os.chmod(CACHE_FILE_PATH, 0o666)
-        except Exception:
-            pass
-        log(f"Caché guardado: {len(cache)} archivos", "SUCCESS")
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    # No es crítico si fsync falla en algunos sistemas
+                    pass
+
+            # Establecer permisos del archivo temporal antes de reemplazar
+            try:
+                os.chmod(temp_path, 0o666)
+            except Exception:
+                # No es crítico si no se pueden cambiar permisos del temporal
+                pass
+
+            # Reemplazar archivo existente
+            try:
+                os.replace(temp_path, CACHE_FILE_PATH)
+            except OSError as replace_err:
+                # Si replace falla, intentar con remove + rename
+                try:
+                    if Path(CACHE_FILE_PATH).exists():
+                        os.chmod(CACHE_FILE_PATH, 0o666)  # Intentar permisos primero
+                        os.remove(CACHE_FILE_PATH)
+                    os.rename(temp_path, CACHE_FILE_PATH)
+                except Exception as fallback_err:
+                    log(f"Error guardando caché (fallback falló): {fallback_err}", "ERROR")
+                    raise
+
+            # Asegurar permisos finales de escritura para todos los usuarios
+            try:
+                os.chmod(CACHE_FILE_PATH, 0o666)
+            except Exception:
+                pass
+
+            log(f"Caché guardado: {len(cache)} archivos", "SUCCESS")
+        except Exception as e:
+            # Limpiar archivo temporal si quedó
+            try:
+                if Path(temp_path).exists():
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            log(f"Error guardando caché: {e}", "ERROR")
     except Exception as e:
-        log(f"Error guardando caché: {e}", "ERROR")
+        log(f"Error guardando caché (outer): {e}", "ERROR")
 
 
 # ---------------------------------------------------------------------------
@@ -349,62 +397,38 @@ def _rename_file_safely(file_path: Path, new_name: str, extension: str) -> Optio
 
 
 def _update_pending_and_completed(old_path: Path, new_path: Path) -> None:
-    """Reemplaza rutas antiguas en pending y completed si existen"""
+    """Reemplaza rutas antiguas en pending y completed usando la DB."""
     try:
-        pending_file = Path(__file__).parent / "tmp" / "pending-compression.txt"
-        completed_file = Path(__file__).parent / "tmp" / "completed.txt"
+        old_str = str(old_path)
+        new_str = str(new_path)
 
-        # Update pending file
-        if pending_file.exists():
-            with open(pending_file, "r", encoding="utf-8") as f:
-                lines = [l.strip() for l in f.readlines()]
-            updated = [str(new_path) if l == str(old_path) else l for l in lines]
-            with open(pending_file, "w", encoding="utf-8") as f:
-                for l in updated:
-                    if l:
-                        f.write(l + "\n")
+        if old_str in set(get_pending_files()):
+            remove_pending(old_str)
+            add_pending(new_str)
 
-        # Update completed file
-        if completed_file.exists():
-            with open(completed_file, "r", encoding="utf-8") as f:
-                lines = [l.strip() for l in f.readlines()]
-            updated = [str(new_path) if l == str(old_path) else l for l in lines]
-            with open(completed_file, "w", encoding="utf-8") as f:
-                for l in updated:
-                    if l:
-                        f.write(l + "\n")
+        if old_str in set(get_all_completed_files()):
+            mark_completed(new_str)
 
     except Exception as e:
         log(f"Error actualizando pending/completed: {e}", "ERROR")
 
 
 def adjust_pending_names() -> None:
-    """Escanea pending-compression.txt y normaliza nombres de archivos si es necesario."""
-    pending_file = Path(__file__).parent / "tmp" / "pending-compression.txt"
-    if not pending_file.exists():
-        return
+    """Escanea pendientes en DB y normaliza nombres de archivos si es necesario."""
 
     try:
-        with open(pending_file, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
-
-        updated_lines = list(lines)
-        for i, line in enumerate(lines):
+        # get_pending_files() retorna objetos Path, convertir a strings
+        lines = [str(l).strip() for l in get_pending_files() if l and str(l).strip()]
+        for line in lines:
             try:
                 original_path = Path(line)
                 if not original_path.exists():
                     continue
                 new_path = _normalize_and_rename_if_needed(original_path)
                 if new_path:
-                    updated_lines[i] = str(new_path)
                     _update_pending_and_completed(original_path, new_path)
             except Exception as e:
                 log(f"Error procesando pending line {line}: {e}", "WARNING")
-
-        # Reescribir pending con nuevas rutas
-        with open(pending_file, "w", encoding="utf-8") as f:
-            for p in updated_lines:
-                f.write(p + "\n")
 
     except Exception as e:
         log(f"Error ajustando nombres en pending: {e}", "ERROR")
@@ -701,19 +725,36 @@ def get_file_duration(file_path: Union[str, Path]) -> float:
 
 def load_whisper_model():
     """
-    Carga el modelo Whisper configurado.
+    Carga el modelo Whisper con optimizaciones de memoria.
 
     Returns:
         whisper.model: Modelo cargado o None si hay error.
     """
     try:
-        import whisper
+        import os
+        try:
+            import whisper as _whisper
+        except Exception as e:
+            log(f"whisper no disponible: {e}", "ERROR")
+            return None
 
         model_name = config.language_detection.whisper_model
         log(f"{EmojiGenerator.refresh()} Cargando modelo Whisper ({model_name})...", "INFO")
-        model = whisper.load_model(model_name)
+
+        # Optimizaciones de memoria:
+        # 1. Usar CPU en lugar de GPU para evitar OOM en GPU
+        # 2. Reducir fragmentación de memoria
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256'
+        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+
+        # Cargar modelo en CPU con fp16 para reducir consumo
+        model = _whisper.load_model(model_name, device="cpu", in_memory=False)
         log(f"{EmojiGenerator.success()} Modelo Whisper cargado exitosamente", "SUCCESS")
         return model
+    except MemoryError as e:
+        log(f"Error de memoria cargando Whisper: {e} - Sistema sin RAM disponible", "ERROR")
+        log(f"Intenta: liberar memoria, reducir workers, o usar modelo más pequeño", "WARNING")
+        return None
     except Exception as e:
         log(f"Error cargando modelo Whisper: {e}", "ERROR")
         traceback.print_exc()
@@ -1004,25 +1045,14 @@ def scan_files_needing_detection() -> List[Dict[str, Any]]:
 
     files_to_analyze = []
 
-    # Detectar entorno y definir ruta del archivo pending
-    if Path("/mediajelly").exists():
-        pending_file = TMP_DIR / "pending-compression.txt"
-    else:
-        pending_file = TMP_DIR / "pending-compression.txt"
-
-    if not pending_file.exists():
-        log(f"Archivo pending no encontrado: {pending_file}", "WARNING")
-        log(f"Directorio TMP: {TMP_DIR} (existe: {TMP_DIR.exists()})", "INFO")
-        return files_to_analyze
-
-    log(f"Leyendo archivos pendientes de: {pending_file}", "INFO")
+    log(f"Leyendo archivos pendientes desde DB en: {MediaJellyPaths.get_tmp_dir() / 'mediajelly.db'}", "INFO")
 
     # Leer archivos pendientes
     try:
-        with open(pending_file, "r", encoding="utf-8") as f:
-            pending_paths = [line.strip() for line in f if line.strip()]
+        # get_pending_files() retorna objetos Path, convertir a strings
+        pending_paths = [str(line).strip() for line in get_pending_files() if line and str(line).strip()]
     except Exception as e:
-        log(f"Error leyendo archivo pending: {e}", "ERROR")
+        log(f"Error leyendo pendientes desde DB: {e}", "ERROR")
         import traceback
         log(f"Traceback: {traceback.format_exc()}", "ERROR")
         return files_to_analyze
