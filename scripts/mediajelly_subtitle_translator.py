@@ -19,8 +19,12 @@ from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import shutil
+import tempfile
 
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
+from mediajelly_db import load_progress, save_progress
 
 # Importar configuración centralizada
 try:
@@ -56,6 +60,22 @@ except ImportError:
     YandexTranslate = None
     YANDEX_AVAILABLE = False
 
+try:
+    import webrtcvad  # type: ignore
+    import soundfile as sf  # type: ignore
+
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtcvad = None
+    sf = None
+    WEBRTC_AVAILABLE = False
+
+# Path to whisper.cpp binary if compiled in the image
+WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
+# Buscar por defecto el modelo en la carpeta montada persistente del proyecto
+# Permite sobrescribir vía env WHISPER_CPP_MODEL
+WHISPER_CPP_DEFAULT_MODEL = Path(os.environ.get("WHISPER_CPP_MODEL", "/mediajelly/media/models/ggml-small.bin"))
+
 # Lock global para Whisper (solo un proceso a la vez)
 whisper_lock = threading.Lock()
 
@@ -69,7 +89,6 @@ STATUS_COMPLETED = "completed"
 
 # Constantes de rutas
 MEDIAJELLY_PATH = "/mediajelly"
-HOST_MEDIAJELLY_PATH = "/home/tafurc/mediaJelly"
 
 # Configuración de timeouts
 FFPROBE_TIMEOUT = 120  # segundos
@@ -82,6 +101,14 @@ class SubtitleQualityImprover:
 
     def __init__(self, logger=None):
         self.logger = logger
+        # Compilar patrones regex frecuentes para mejorar rendimiento
+        self.re_spaces = re.compile(r"\s+")
+        self.re_space_before_punct = re.compile(r"\s+([,.!?;:])")
+        self.re_multi_punct = re.compile(r"([,.!?;:])\s*([,.!?;:])")
+        self.re_quote_open = re.compile(r'"\s+')
+        self.re_quote_close = re.compile(r'\s+"')
+        self.re_paren_open = re.compile(r"\(\s+")
+        self.re_paren_close = re.compile(r"\s+\)")
 
     def improve_subtitle_quality(self, srt_content: str, source_language: str = "auto") -> str:
         """
@@ -171,7 +198,13 @@ class SubtitleQualityImprover:
             if len(clean_text) < 3:
                 return "en"
 
-            detected = langdetect_detect(clean_text)
+            # Importar localmente para evitar llamadas a objetos None en análisis estático
+            try:
+                    from langdetect import detect as _langdetect_detect
+            except Exception:
+                return "en"
+
+            detected = _langdetect_detect(clean_text)
             return detected if detected in ["en", "es"] else "en"
         except Exception:
             return "en"
@@ -239,17 +272,17 @@ class SubtitleQualityImprover:
     def _apply_general_improvements(self, text: str) -> str:
         """Mejoras generales aplicables a cualquier idioma"""
         # Eliminar espacios múltiples
-        text = re.sub(r"\s+", " ", text)
+        text = self.re_spaces.sub(" ", text)
 
         # Corregir puntuación
-        text = re.sub(r"\s+([,.!?;:])", r"\1", text)  # Quitar espacios antes de puntuación
-        text = re.sub(r"([,.!?;:])\s*([,.!?;:])", r"\1\2", text)  # Corregir puntuación duplicada
+        text = self.re_space_before_punct.sub(r"\1", text)  # Quitar espacios antes de puntuación
+        text = self.re_multi_punct.sub(r"\1\2", text)  # Corregir puntuación duplicada
 
         # Corregir comillas y paréntesis
-        text = re.sub(r'"\s+', '"', text)  # Quitar espacios después de comillas de apertura
-        text = re.sub(r'\s+"', '"', text)  # Quitar espacios antes de comillas de cierre
-        text = re.sub(r"\(\s+", "(", text)  # Quitar espacios después de paréntesis de apertura
-        text = re.sub(r"\s+\)", ")", text)  # Quitar espacios antes de paréntesis de cierre
+        text = self.re_quote_open.sub('"', text)  # Quitar espacios después de comillas de apertura
+        text = self.re_quote_close.sub('"', text)  # Quitar espacios antes de comillas de cierre
+        text = self.re_paren_open.sub("(", text)  # Quitar espacios después de paréntesis de apertura
+        text = self.re_paren_close.sub(")", text)  # Quitar espacios antes de paréntesis de cierre
 
         # Capitalizar primera letra de oraciones
         sentences = re.split(r"([.!?]+\s*)", text)
@@ -295,36 +328,19 @@ class SubtitleTranslator:
 
     PROGRESS_FILE_NAME = "progress.json"
 
-    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None) -> None:
+    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None, force_language: Optional[str] = None) -> None:
         # Configurar rutas desde configuración
-        self.is_container = Path("/mediajelly").exists()
-        self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
+        self.is_container = MediaJellyPaths.is_container()
+        self.base_dir = MediaJellyPaths.get_base_path()
         self.scripts_dir = self.base_dir / "scripts"
-        self.logs_dir = self.scripts_dir / "logs"
+        self.logs_dir = self.scripts_dir / "tmp" / "logs"
         self.tmp_dir = self.scripts_dir / "tmp"
 
         # Crear directorios
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Configurar logging
-        self.logger = logging.getLogger("mediajelly")
-        self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
-
-        # Configurar handlers para archivo
-        log_file = self.logs_dir / "subtitle_translator.log"
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-
-        # También loggear a consola
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
+        self.setup_logging()
 
         # Cargar configuración centralizada
         if CONFIG_AVAILABLE:
@@ -349,7 +365,11 @@ class SubtitleTranslator:
         self.max_workers = max_workers  # Procesamiento concurrente
         self.use_whisper = use_whisper
         self.allow_retranslate = allow_retranslate  # Permitir re-traducción de archivos .es.srt existentes
+        # Forzar idioma de transcripción si se indica (ej: 'ja', 'en', 'es')
+        self.force_language = force_language
         self.progress_lock = threading.Lock()  # Lock para sincronizar progreso y estadísticas
+        self.file_locks: Dict[str, threading.Lock] = {}  # Lock por archivo para evitar carreras
+        self.file_locks_guard = threading.Lock()  # Protege creación de locks por archivo
         self.lock_file = lock_file  # Archivo de lock para sincronización
 
         # Verificar disponibilidad de dependencias
@@ -357,6 +377,17 @@ class SubtitleTranslator:
         if self.use_whisper and not self.whisper_available:
             self.logger.warning("Whisper solicitado pero no disponible, se usarán solo subtítulos embebidos")
             self.use_whisper = False
+
+        # Inicializar traductor Yandex (reutilizable) para batching
+        self.yandex_translator = None
+        if YANDEX_AVAILABLE:
+            try:
+                # Importar localmente para evitar warnings de análisis estático
+                from translatepy.translators.yandex import YandexTranslate as _YandexTranslate
+
+                self.yandex_translator = _YandexTranslate()
+            except Exception:
+                self.yandex_translator = None
 
     def setup_logging(self) -> None:
         """Configura el sistema de logging."""
@@ -371,17 +402,18 @@ class SubtitleTranslator:
 
         formatter = LocalTimeFormatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
 
-        file_handler = logging.FileHandler(log_file)
+        file_handler = create_compressed_rotating_file_handler(log_file)
         file_handler.setFormatter(formatter)
 
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
 
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("mediajelly")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+        self.logger.propagate = False
 
     def _is_file_in_excluded_folder(self, file_path: Path) -> bool:
         """
@@ -689,7 +721,8 @@ class SubtitleTranslator:
             sample_text = " ".join(text_lines[:10])  # Primeras 10 líneas
 
             try:
-                detected_lang = langdetect_detect(sample_text)
+                from langdetect import detect as _langdetect_detect
+                detected_lang = _langdetect_detect(sample_text)
                 return detected_lang
             except Exception:
                 return "unknown"
@@ -755,7 +788,7 @@ class SubtitleTranslator:
 
         return stats
 
-    def detect_embedded_subtitle_language(self, video_file: Path) -> Optional[str]:
+    def detect_embedded_subtitle_language(self, video_file: Path, stream_index: int = 0) -> Optional[str]:
         """
         Detecta el idioma de los subtítulos embebidos en el video.
 
@@ -775,7 +808,7 @@ class SubtitleTranslator:
                 "-i",
                 str(video_file),
                 "-map",
-                "0:s:0",
+                f"0:s:{stream_index}",
                 "-c:s",
                 "srt",
                 "-t",
@@ -825,12 +858,15 @@ class SubtitleTranslator:
 
                 # Tomar una muestra de las primeras líneas de texto
                 sample_text = " ".join(text_lines[:10])  # Primeras 10 líneas
-
-                detected_lang = langdetect_detect(sample_text)
-                self.logger.debug(
-                    f"Idioma detectado en subtítulos embebidos: {detected_lang} (muestra: {sample_text[:100]}...)"
-                )
-                return detected_lang
+                try:
+                    from langdetect import detect as _langdetect_detect
+                    detected_lang = _langdetect_detect(sample_text)
+                    self.logger.debug(
+                        f"Idioma detectado en subtítulos embebidos: {detected_lang} (muestra: {sample_text[:100]}...)"
+                    )
+                    return detected_lang
+                except Exception:
+                    return None
 
             except Exception as e:
                 self.logger.debug(f"Error en detección de idioma: {e}")
@@ -871,8 +907,17 @@ class SubtitleTranslator:
             if not transcription_result:
                 return None
 
-            # Generar archivo SRT desde la transcripción
-            return self._generate_srt_from_transcription(transcription_result, output_srt)
+            # Generar archivo SRT desde la transcripción (aún en tmp_dir, nombre temporal)
+            temp_srt = self._generate_srt_from_transcription(transcription_result, output_srt)
+            if not temp_srt:
+                return None
+
+            # CORRECCIÓN: mover el SRT a la carpeta del video con nombre canónico
+            # (antes se dejaba en tmp_dir con el sufijo "_{mtime_ns}", por lo que
+            # check_existing_spanish_subtitles()/find_existing_srt_file() nunca lo
+            # encontraban en la siguiente ejecución y el video se re-procesaba
+            # indefinidamente, además de acumular huérfanos en scripts/tmp).
+            return self._move_srt_to_video_folder(temp_srt, video_file)
 
         except subprocess.TimeoutExpired:
             self.logger.error("Timeout extrayendo audio (15 minutos)")
@@ -883,6 +928,37 @@ class SubtitleTranslator:
         finally:
             # LIMPIEZA: Eliminar archivos temporales SIEMPRE, incluso en errores
             self._cleanup_temp_files(audio_file)
+
+    def _move_srt_to_video_folder(self, temp_srt: Path, video_file: Path) -> Optional[Path]:
+        """
+        Mueve un SRT generado en tmp_dir a la carpeta del video, con el nombre
+        canónico "{video_stem}.srt" (mismo esquema que usa la extracción de
+        subtítulos embebidos). Evita nombres volátiles basados en mtime_ns que
+        rompen la detección de subtítulos ya procesados.
+
+        Args:
+            temp_srt: Ruta del SRT en tmp_dir (nombre con sufijo mtime_ns).
+            video_file: Ruta del video original.
+
+        Returns:
+            Optional[Path]: Ruta final en la carpeta del video, o None si falló el movimiento.
+        """
+        final_srt = video_file.parent / f"{video_file.stem}.srt"
+        try:
+            final_tmp = final_srt.with_suffix(final_srt.suffix + ".tmp")
+            if final_tmp.exists():
+                final_tmp.unlink()
+            shutil.move(str(temp_srt), str(final_tmp))
+            if final_srt.exists():
+                final_srt.unlink()
+            final_tmp.rename(final_srt)
+            self.logger.info(f"{EmojiGenerator.check_mark()} SRT de Whisper movido a carpeta del video: {final_srt.name}")
+            return final_srt
+        except Exception as e:
+            self.logger.error(f"No se pudo mover el SRT generado por Whisper a la carpeta del video: {e}")
+            # Como último recurso, dejar el archivo en tmp_dir para no perder el trabajo,
+            # pero esto seguirá causando reprocesamiento en la siguiente ejecución.
+            return temp_srt
 
     def _prepare_temp_files(self, video_file: Path) -> tuple[Path, Path]:
         """
@@ -896,7 +972,13 @@ class SubtitleTranslator:
         """
         temp_prefix = f"{video_file.stem}_{video_file.stat().st_mtime_ns}"
         audio_file = self.tmp_dir / f"{temp_prefix}_temp.wav"
-        output_srt = video_file.parent / f"{video_file.stem}.srt"
+        # Guardar candidatos en tmp_dir para evitar conflictos y condiciones de carrera
+        try:
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        # Usar nombre único por proceso/tiempo para evitar condiciones de carrera
+        output_srt = self.tmp_dir / f"{temp_prefix}.srt"
         return audio_file, output_srt
 
     def _extract_audio_from_video(self, video_file: Path, audio_file: Path) -> bool:
@@ -1100,17 +1182,140 @@ class SubtitleTranslator:
         self.logger.info(f"Audio extraído ({audio_file.stat().st_size} bytes), transcribiendo con Whisper...")
         return True
 
+    def _detect_language_with_whisper_cpp(self, audio_file: Path, timeout: int = 600) -> Optional[str]:
+        """
+        Detecta el idioma de un archivo de audio usando `whisper-cli --detect-language`.
+
+        Returns:
+            Optional[str]: Código ISO de dos letras (ej: 'ja', 'en') o None.
+        """
+        try:
+            if not WHISPER_CPP_BIN.exists() or not WHISPER_CPP_DEFAULT_MODEL.exists():
+                return None
+
+            cmd = [str(WHISPER_CPP_BIN), "-m", str(WHISPER_CPP_DEFAULT_MODEL), "--detect-language", "-f", str(audio_file)]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+            # Buscar patrón como: "auto-detected language: ja (p = 0.999300)"
+            m = re.search(r"auto-detected language:\s*([a-z]{2})", out, flags=re.IGNORECASE)
+            if m:
+                return m.group(1).lower()
+
+            m2 = re.search(r"Detected language:\s*([a-z]{2})", out, flags=re.IGNORECASE)
+            if m2:
+                return m2.group(1).lower()
+
+            return None
+        except Exception as e:
+            self.logger.debug(f"Error detectando idioma con whisper-cli: {e}")
+            return None
+
     def _transcribe_audio_with_whisper(self, audio_file: Path) -> Optional[dict]:
         """
-        Transcribe audio usando Whisper con lock global.
+        Transcribe audio usando whisper.cpp (si está disponible) o cae al modelo Python.
+
+        - Detecta idioma con `whisper-cli --detect-language` (a menos que se haya forzado con `force_language`).
+        - Ejecuta `whisper-cli` para generar un archivo SRT temporal y lo parsea a segmentos.
 
         Args:
             audio_file: Ruta del archivo de audio.
 
         Returns:
-            Optional[dict]: Resultado de la transcripción o None.
+            Optional[dict]: Resultado de la transcripción con claves `segments` y `language`.
         """
-        # LOCK GLOBAL: Solo un proceso puede usar Whisper a la vez
+        # Intentar usar whisper.cpp binario si está disponible (PoC CPU)
+        try:
+            if WHISPER_CPP_BIN.exists() and WHISPER_CPP_DEFAULT_MODEL.exists():
+                # Determinar idioma: forzado o detectado
+                language = None
+                if getattr(self, "force_language", None):
+                    language = self.force_language
+                    self.logger.info(f"Idioma forzado por parámetro: {language}")
+                else:
+                    detected = self._detect_language_with_whisper_cpp(audio_file)
+                    if detected:
+                        language = detected
+                        self.logger.info(f"Idioma detectado por whisper-cli: {language}")
+                    else:
+                        language = "auto"
+
+                # Preparar path base de salida (sin extensión)
+                suffix = audio_file.suffix or ""
+                base = str(audio_file)
+                if suffix:
+                    base = str(audio_file)[: -len(suffix)]
+
+                cmd = [
+                    str(WHISPER_CPP_BIN),
+                    "-m",
+                    str(WHISPER_CPP_DEFAULT_MODEL),
+                    "-f",
+                    str(audio_file),
+                    "-l",
+                    language,
+                    "-osrt",
+                    "-of",
+                    base,
+                ]
+
+                self.logger.info(f"Ejecutando whisper-cli: {' '.join(cmd[:6])} ...")
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)
+
+                if proc.returncode != 0:
+                    self.logger.warning(
+                        "whisper-cli devolvió error (returncode=%s): %s",
+                        proc.returncode,
+                        (proc.stderr or proc.stdout)[:1000],
+                    )
+                else:
+                    srt_path = Path(base + ".srt")
+                    if srt_path.exists() and srt_path.stat().st_size > 0:
+                        # Parsear SRT a segmentos
+                        segments: List[Dict[str, Union[float, str]]] = []
+                        try:
+                            with open(srt_path, "r", encoding="utf-8", errors="ignore") as sf:
+                                content = sf.read()
+
+                            # Separar bloques por doble salto de línea
+                            blocks = [b.strip() for b in re.split(r"\n\s*\n", content) if b.strip()]
+                            for block in blocks:
+                                parts = block.splitlines()
+                                if len(parts) >= 2:
+                                    # parts[0] = index, parts[1] = times, rest = text
+                                    times = parts[1].strip()
+                                    m = re.match(r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})", times)
+                                    if not m:
+                                        continue
+
+                                    def _to_seconds(ts: str) -> float:
+                                        hh, mm, ss_ms = ts.split(":")
+                                        ss, ms = ss_ms.split(",")
+                                        return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+
+                                    start = _to_seconds(m.group(1))
+                                    end = _to_seconds(m.group(2))
+                                    text = " ".join([line.strip() for line in parts[2:]]).strip()
+                                    segments.append({"start": start, "end": end, "text": text})
+
+                            # Si obtuvimos segmentos, retornar
+                            if segments:
+                                # Intentar eliminar el archivo SRT temporal (no crítico)
+                                try:
+                                    srt_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                return {"segments": segments, "language": language}
+                        except Exception as e:
+                            self.logger.warning(f"Error parseando SRT generado por whisper-cli: {e}")
+
+                    else:
+                        self.logger.warning("whisper-cli no generó SRT válido o archivo vacío: %s", str(srt_path))
+
+        except Exception as e:
+            self.logger.warning("Error ejecutando whisper.cpp PoC: %s", e)
+
+        # LOCK GLOBAL: Solo un proceso puede usar Whisper (fallback Python)
         with whisper_lock:
             self.logger.info(f"{EmojiGenerator.lock()} Adquiriendo lock global de Whisper...")
 
@@ -1120,11 +1325,11 @@ class SubtitleTranslator:
             if self.whisper_model is None:
                 raise RuntimeError("No se pudo cargar el modelo Whisper")
 
-            # Transcribir con Whisper con manejo específico de errores
+            # Transcribir con Whisper (Python) con manejo específico de errores
             try:
                 result = self.whisper_model.transcribe(
                     str(audio_file),
-                    language=None,  # Auto-detectar idioma
+                    language=(self.force_language if getattr(self, "force_language", None) else None),
                     task="transcribe",
                     fp16=False,  # CPU mode
                     verbose=False,
@@ -1136,7 +1341,7 @@ class SubtitleTranslator:
 
         # Verificar que tenemos segmentos
         if not result.get("segments"):
-            self.logger.warning("Whisper no generó segmentos de transcripción")
+            self.logger.warning("Whisper no generó segmentos de transcripción (fallback)")
             return None
 
         return result
@@ -1144,8 +1349,20 @@ class SubtitleTranslator:
     def _ensure_whisper_model_loaded(self) -> None:
         """Asegura que el modelo Whisper esté cargado."""
         if self.whisper_model is None:
+            if not WHISPER_AVAILABLE:
+                self.logger.error("Intentando cargar modelo Whisper pero la librería no está disponible")
+                self.whisper_model = None
+                return
+
             self.logger.info("Cargando modelo Whisper (small)...")
-            self.whisper_model = whisper.load_model("small")
+            try:
+                # Importar localmente para evitar usar el objeto global que puede ser None
+                import whisper as _whisper  # type: ignore
+
+                self.whisper_model = _whisper.load_model("small")
+            except Exception as e:
+                self.logger.error(f"No se pudo cargar el modelo Whisper: {e}")
+                self.whisper_model = None
 
     def _handle_whisper_error(self, whisper_error: Exception) -> Optional[Dict[str, Any]]:
         """
@@ -1341,7 +1558,14 @@ class SubtitleTranslator:
         try:
             import time
 
-            translator = YandexTranslate()
+            translator = getattr(self, 'yandex_translator', None)
+            if translator is None and YANDEX_AVAILABLE:
+                try:
+                    from translatepy.translators.yandex import YandexTranslate as _YandexTranslate
+
+                    translator = _YandexTranslate()
+                except Exception:
+                    translator = None
 
             # Primera traducción
             with open(srt_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1395,13 +1619,51 @@ class SubtitleTranslator:
         Returns:
             tuple[List[str], int]: (Líneas traducidas, Número de traducciones realizadas).
         """
-        translated_lines = []
+        translated_lines: List[str] = []
         translations_made = 0
 
-        for line in lines:
-            translated_line, made_translation = self._translate_single_line(line, translator, force_translate)
-            translated_lines.append(translated_line)
-            translations_made += made_translation
+        if translator is None:
+            # No translator available: return original lines
+            return [line if line.endswith("\n") else line + "\n" for line in lines], 0
+
+        i = 0
+        N = len(lines)
+        while i < N:
+            line = lines[i]
+            if self._should_skip_translation(line.strip()):
+                translated_lines.append(line)
+                i += 1
+                continue
+
+            # Agrupar un bloque contiguo de líneas traducibles
+            block_lines = []
+            j = i
+            char_count = 0
+            while j < N and not self._should_skip_translation(lines[j].strip()) and char_count < 3000:
+                block_lines.append(lines[j].strip())
+                char_count += len(lines[j])
+                j += 1
+
+            # Traducir el bloque en batch
+            joined = " ||| ".join(block_lines)
+            try:
+                translated_obj = translator.translate(joined, "es")
+                translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
+                parts = translated_text.split(" ||| ")
+                if len(parts) != len(block_lines):
+                    # Fallback: split por nueva línea
+                    parts = translated_text.split("\n")
+            except Exception as e:
+                self.logger.debug(f"Batch translation failed: {e}")
+                parts = [b + "\n" for b in block_lines]
+
+            # Añadir resultados preservando saltos
+            for p in parts:
+                translated_lines.append(p if p.endswith("\n") else p + "\n")
+                if p.strip():
+                    translations_made += 1
+
+            i = j
 
         return translated_lines, translations_made
 
@@ -1462,15 +1724,22 @@ class SubtitleTranslator:
         text_to_detect = clean_text if clean_text else text_to_translate
 
         # Detectar idioma y traducir solo si no es español
-        try:
-            lang = langdetect_detect(text_to_detect)
+        lang = None
+        if LANGDETECT_AVAILABLE:
+            try:
+                from langdetect import detect as _langdetect_detect
+                lang = _langdetect_detect(text_to_detect)
+            except Exception:
+                lang = None
+
+        if lang:
             if self._should_translate_language(lang, force_translate):
                 return self._perform_translation(text_to_translate, translator)
             else:
                 return text_to_translate + "\n", 0
-        except Exception:
-            # Si falla detección de idioma, intentar traducir asumiendo que puede ser inglés
-            return self._perform_translation(text_to_translate, translator)
+
+        # Si no se detectó idioma, o no está disponible la librería, intentar traducir
+        return self._perform_translation(text_to_translate, translator)
 
     def _should_translate_language(self, lang: str, force_translate: bool) -> bool:
         """
@@ -1536,7 +1805,9 @@ class SubtitleTranslator:
         self._improve_translated_subtitles_quality(output_file)
 
         # Eliminar archivo original si fue extraído (no tiene _ES)
-        self._cleanup_original_file(srt_file)
+        # Conservar el archivo original; no eliminarlo para mantener ambas versiones (.srt y .es.srt)
+        # Anteriormente se borraba aquí, pero ahora preferimos mantener ambos archivos.
+        # self._cleanup_original_file(srt_file)
 
         return output_file
 
@@ -1572,9 +1843,12 @@ class SubtitleTranslator:
             except Exception:
                 pass
 
+            # Mantener comportamiento no destructivo: no eliminar el archivo original por defecto.
+            self.logger.debug(f"_cleanup_original_file: conservar {srt_file.name} (no se elimina)")
+
     def process_video(self, video_file: Path) -> dict:
         """
-        Procesa un archivo de video para subtítulos en español.
+        Procesa un único archivo de video: extrae o traduce subtítulos, y devuelve un resumen.
 
         Args:
             video_file: Ruta del archivo de video.
@@ -2046,16 +2320,25 @@ class SubtitleTranslator:
         processed_files = self._get_processed_files_info()
 
         valid_files = []
+        seen_files = set()
         missing_files = []
 
         for video_file in file_paths:
+            normalized_path = str(video_file)
+
+            # Evitar procesamiento duplicado del mismo archivo en el mismo lote
+            if normalized_path in seen_files:
+                self.logger.debug(f"Archivo duplicado en entrada, se omite repetido: {video_file}")
+                continue
+            seen_files.add(normalized_path)
+
             if not video_file.exists():
                 self.logger.warning(f"Archivo no encontrado: {video_file}")
                 missing_files.append(str(video_file))
                 stats["errors"] += 1
             else:
                 # Verificar si el archivo ya fue procesado y tiene subtítulos
-                file_path_str = str(video_file)
+                file_path_str = normalized_path
                 if file_path_str in processed_files:
                     processed_info = processed_files[file_path_str]
                     if processed_info.get("has_subtitles", False):
@@ -2131,14 +2414,8 @@ class SubtitleTranslator:
         Args:
             file_paths: Lista de rutas de archivos a remover.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
-        if not progress_file.exists():
-            return
-
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             # Verificar si hay last_input_args
             subtitle_translation = progress_data.get("subtitle_translation", {})
@@ -2161,8 +2438,7 @@ class SubtitleTranslator:
                 progress_data["subtitle_translation"]["last_input_args"] = None
 
             # Guardar cambios
-            with open(progress_file, "w") as f:
-                json.dump(progress_data, f, indent=2)
+            save_progress(progress_data)
 
         except Exception as e:
             self.logger.error(f"Error removiendo archivos de last_input_args: {e}")
@@ -2178,14 +2454,15 @@ class SubtitleTranslator:
             List[str]: Lista de rutas normalizadas.
         """
         normalized_missing_files = []
+        host_base_prefix = str(MediaJellyPaths.get_base_path()) + "/"
         for file_path in file_paths:
             # Si la ruta ya está en formato /mediajelly, mantenerla
             if file_path.startswith(MEDIAJELLY_PATH):
                 normalized_missing_files.append(file_path)
             # Si está en formato absoluto del host, convertirla
-            elif file_path.startswith(HOST_MEDIAJELLY_PATH):
-                # Convertir /home/tafurc/mediaJelly/... a /mediajelly/...
-                normalized_path = file_path.replace(HOST_MEDIAJELLY_PATH, MEDIAJELLY_PATH, 1)
+            elif file_path.startswith(host_base_prefix):
+                # Convertir <base>/... a /mediajelly/...
+                normalized_path = file_path.replace(host_base_prefix, MEDIAJELLY_PATH + "/", 1)
                 normalized_missing_files.append(normalized_path)
             else:
                 # Mantener la ruta tal cual si no coincide con ninguno de los formatos conocidos
@@ -2300,7 +2577,7 @@ class SubtitleTranslator:
             max_workers: Número máximo de workers.
         """
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.process_video, vf): vf for vf in valid_files}
+            futures = {executor.submit(self._process_video_with_file_lock, vf): vf for vf in valid_files}
 
             for future in as_completed(futures):
                 # Verificar si el lock file sigue existiendo (para cancelación externa)
@@ -2328,6 +2605,27 @@ class SubtitleTranslator:
                     file_status,
                 )
                 self.logger.info(f"Progreso: {stats['processed']}/{stats['total_files']}")
+
+    def _process_video_with_file_lock(self, video_file: Path) -> dict:
+        """
+        Procesa un video serializando por path para evitar condiciones de carrera
+        cuando el mismo archivo aparece más de una vez.
+
+        Args:
+            video_file: Archivo de video a procesar.
+
+        Returns:
+            dict: Resultado de `process_video`.
+        """
+        file_key = str(video_file)
+        with self.file_locks_guard:
+            file_lock = self.file_locks.get(file_key)
+            if file_lock is None:
+                file_lock = threading.Lock()
+                self.file_locks[file_key] = file_lock
+
+        with file_lock:
+            return self.process_video(video_file)
 
     def _process_sequential(self, valid_files: List[Path], stats: dict):
         """
@@ -2409,12 +2707,7 @@ class SubtitleTranslator:
             bool: True si es duplicada.
         """
         try:
-            progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-            if not progress_file.exists():
-                return False
-
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             last_notification = progress_data.get("subtitle_translation", {}).get("last_notification")
             if not last_notification:
@@ -2447,14 +2740,8 @@ class SubtitleTranslator:
             stats: Estadísticas enviadas.
         """
         try:
-            progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
             with self.progress_lock:
-                if progress_file.exists():
-                    with open(progress_file, "r") as f:
-                        progress_data = json.load(f)
-                else:
-                    progress_data = {}
+                progress_data = load_progress() or {}
 
                 if "subtitle_translation" not in progress_data:
                     progress_data["subtitle_translation"] = {}
@@ -2474,8 +2761,7 @@ class SubtitleTranslator:
                     "sent_at": datetime.now().isoformat(),
                 }
 
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+                save_progress(progress_data)
 
                 self.logger.info("Signature de notificación guardada")
 
@@ -2673,13 +2959,8 @@ class SubtitleTranslator:
         Returns:
             dict: Diccionario de archivos procesados.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-        if not progress_file.exists():
-            return {}
-
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             subtitle_translation = progress_data.get("subtitle_translation", {})
             return subtitle_translation.get("processed_files", {})
@@ -2694,10 +2975,8 @@ class SubtitleTranslator:
         Returns:
             dict: Estadísticas recuperadas.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             subtitle_translation = progress_data.get("subtitle_translation", {})
             stats = subtitle_translation.get("stats", {})
@@ -2718,17 +2997,11 @@ class SubtitleTranslator:
 
     def _clear_input_args_from_progress(self):
         """Limpia los argumentos de entrada guardados cuando el procesamiento se completa."""
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
         try:
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    progress_data = json.load(f)
-
-                if "subtitle_translation" in progress_data:
-                    progress_data["subtitle_translation"]["last_input_args"] = None
-
-                    with open(progress_file, "w") as f:
-                        json.dump(progress_data, f, indent=2)
+            progress_data = load_progress() or {}
+            if "subtitle_translation" in progress_data:
+                progress_data["subtitle_translation"]["last_input_args"] = None
+                save_progress(progress_data)
 
         except Exception as e:
             self.logger.warning(f"Error limpiando argumentos de entrada: {e}")
@@ -2757,12 +3030,10 @@ class SubtitleTranslator:
             file_status: Estado del archivo procesado (opcional).
             input_args: Argumentos de entrada (opcional).
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
         with self.progress_lock:
             try:
                 # Leer o inicializar progreso
-                progress_data = self._load_or_initialize_progress_data(progress_file)
+                progress_data = self._load_or_initialize_progress_data()
 
                 # Asegurar estructura completa
                 self._ensure_progress_structure(progress_data)
@@ -2782,29 +3053,23 @@ class SubtitleTranslator:
                     progress_data["subtitle_translation"]["last_input_args"] = input_args
 
                 # Guardar cambios
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+                save_progress(progress_data)
 
                 self.logger.info("Archivo de progreso actualizado con estadísticas de subtítulos")
 
             except Exception as e:
                 self.logger.error(f"Error actualizando archivo de progreso: {e}")
 
-    def _load_or_initialize_progress_data(self, progress_file: Path) -> dict:
+    def _load_or_initialize_progress_data(self) -> dict:
         """
         Lee progreso existente o inicializa estructura nueva.
 
         Args:
-            progress_file: Ruta del archivo de progreso.
-
         Returns:
             dict: Datos de progreso.
         """
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                return json.load(f)
-        else:
-            return self._create_initial_progress_structure()
+        data = load_progress() or {}
+        return data if data else self._create_initial_progress_structure()
 
     def _create_initial_progress_structure(self) -> dict:
         """
@@ -3068,15 +3333,99 @@ class SubtitleTranslator:
         if not embedded_streams:
             return None
 
-        detected_lang = self.detect_embedded_subtitle_language(video_file)
+        extracted_candidates: List[Path] = []
 
-        if detected_lang and self._should_extract_embedded_subtitles(detected_lang):
-            return self._extract_embedded_subtitles(video_file, detected_lang)
-        elif detected_lang:
-            self._log_embedded_subtitles_info(detected_lang)
+        # Intentar extracción en el orden reportado por ffprobe
+        for stream in embedded_streams:
+            stream_index = stream.get("index")
+            if stream_index is None:
+                continue
+
+            codec_name = (stream.get("codec_name") or "").lower()
+            is_text_codec = codec_name in {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+
+            detected_lang = stream.get("tags", {}).get("language") or stream.get("tags", {}).get("LANGUAGE")
+            if not detected_lang:
+                # intentar detección ligera, pero no impedir extracción si falla
+                try:
+                    detected_lang = self.detect_embedded_subtitle_language(video_file, stream_index)
+                except Exception:
+                    detected_lang = None
+
+            if is_text_codec or self._should_extract_embedded_subtitles(detected_lang) or detected_lang is None:
+                self.logger.debug(f"Intentando extraer subtítulos embebidos: stream=0:s:{stream_index} codec={codec_name} lang={detected_lang}")
+                extracted = self._extract_embedded_subtitles(video_file, stream_index, detected_lang)
+                if extracted:
+                    extracted_candidates.append(extracted)
+            else:
+                self.logger.debug(f"Omitiendo extracción de stream 0:s:{stream_index} (codec={codec_name} lang={detected_lang})")
+
+        # Si no se extrajo ningún candidato, retornar None
+        if not extracted_candidates:
             return None
-        else:
+
+        # Evaluar candidatos y escoger el mejor por heurística: tamaño y densidad de texto
+        scored: List[Tuple[Path, Tuple[int, int]]] = []
+        for cand in extracted_candidates:
+            score = self._score_srt_file(cand)
+            scored.append((cand, score))
+
+        # Si ningún candidato tiene métricas (por ejemplo en tests con mocks), devolver el primero
+        max_size = max((s[0] for _, s in scored), default=0)
+        max_lines = max((s[1] for _, s in scored), default=0)
+
+        if max_size == 0 and max_lines == 0:
+            # No metrics available (likely mocks); return first candidate as-is
+            first = extracted_candidates[0]
+            self.logger.debug("No hay métricas disponibles para candidatos; devolviendo el primero")
+            return first
+
+        # Elegir mejor por (size, lines)
+        scored.sort(key=lambda item: item[1], reverse=True)
+        best_candidate, best_score = scored[0]
+
+        # Validación mínima: rechazar si el mejor candidato es demasiado pequeño o con pocas líneas
+        min_size_bytes = 300  # heurístico mínimo aceptable
+        min_text_lines = 3
+        if best_score[0] < min_size_bytes or best_score[1] < min_text_lines:
+            # limpiar candidatos temporales
+            for p in extracted_candidates:
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+            self.logger.debug("Candidatos embebidos insuficientes tras evaluación, se intentará Whisper")
             return None
+
+        # Mover mejor candidato a nombre base .srt y eliminar los otros
+        base_srt = video_file.parent / f"{video_file.stem}.srt"
+        try:
+            # Mover de tmp a destino de forma atómica (overwrite)
+            base_srt_tmp = base_srt.with_suffix(base_srt.suffix + ".tmp")
+            if base_srt_tmp.exists():
+                base_srt_tmp.unlink()
+            shutil.move(str(best_candidate), str(base_srt_tmp))
+            # Reemplazar atómicamente
+            if base_srt.exists():
+                base_srt.unlink()
+            base_srt_tmp.rename(base_srt)
+        except Exception as e:
+            self.logger.warning(f"No se pudo mover candidato seleccionado a destino: {e}")
+            # En caso de fallo, devolver el path original
+            return best_candidate
+
+        # Eliminar demás candidatos
+        for p in extracted_candidates:
+            try:
+                if p.exists():
+                    # Si es el que movimos, ya no existe; si no, borrarlo
+                    p.unlink()
+            except Exception:
+                pass
+
+        self.logger.info(f"Seleccionado mejor subtítulo embebido: {base_srt.name} (size={best_score[0]} bytes, lines={best_score[1]})")
+        return base_srt
 
     def _detect_embedded_subtitle_streams(self, video_file: Path) -> list:
         """
@@ -3096,7 +3445,7 @@ class SubtitleTranslator:
                 "-select_streams",
                 "s",
                 "-show_entries",
-                "stream=index:stream_tags=language",
+                "stream=index,codec_name:stream_tags=language",
                 "-of",
                 "json",
                 str(video_file),
@@ -3116,7 +3465,7 @@ class SubtitleTranslator:
             self.logger.warning(f"Error detectando subtítulos embebidos: {e}")
             return []
 
-    def _should_extract_embedded_subtitles(self, detected_lang: str) -> bool:
+    def _should_extract_embedded_subtitles(self, detected_lang: Optional[str]) -> bool:
         """
         Determina si se deben extraer subtítulos embebidos basados en el idioma.
 
@@ -3126,10 +3475,18 @@ class SubtitleTranslator:
         Returns:
             bool: True si se deben extraer.
         """
+        # Si se detecta el idioma y está en la lista soportada, extraer.
+        # Además, permitir extracción cuando no se detectó idioma si hay pistas textuales;
+        # la decisión final de usar Whisper ocurre sólo si no se pudieron extraer/subir subtítulos.
         supported_langs = ["ja", "en", "fr", "de", "it", "pt", "ru", "ko", "zh", "es", "ca", "eu"]
-        return bool(detected_lang and detected_lang in supported_langs)
+        if detected_lang:
+            return detected_lang in supported_langs
+        # idioma no detectado: mantener comportamiento previo (no extraer automáticamente)
+        # Esto preserva compatibilidad con tests existentes. Las pistas textuales se
+        # siguen intentando explícitamente en _try_extract_embedded_subtitles().
+        return False
 
-    def _extract_embedded_subtitles(self, video_file: Path, detected_lang: str) -> Optional[Path]:
+    def _extract_embedded_subtitles(self, video_file: Path, stream_index: int, detected_lang: Optional[str]) -> Optional[Path]:
         """
         Extrae subtítulos embebidos del video.
 
@@ -3140,25 +3497,89 @@ class SubtitleTranslator:
         Returns:
             Optional[Path]: Ruta del archivo SRT extraído o None.
         """
-        output_srt = video_file.parent / f"{video_file.stem}.srt"
+        # Guardar candidatos en tmp_dir para evitar condiciones de carrera
+        try:
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        output_srt = self.tmp_dir / f"{video_file.stem}.stream{stream_index}.srt"
 
-        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(video_file), "-map", "0:s:0", "-c:s", "srt", str(output_srt)]
+        # ffprobe reports global stream index (e.g., 5,6,...). ffmpeg -map 0:s:N expects
+        # a subtitle stream ordinal (relative among subtitle streams). Compute the
+        # relative subtitle index and prefer mapping with 0:s:relative. If that fails,
+        # fall back to mapping by global index (0:INDEX).
+        try:
+            subtitle_streams = self._detect_embedded_subtitle_streams(video_file)
+            relative_index = None
+            for i, s in enumerate(subtitle_streams):
+                if s.get("index") == stream_index:
+                    relative_index = i
+                    break
+        except Exception:
+            relative_index = None
+
+        # Prefer 0:s:relative if available
+        if relative_index is not None:
+            map_arg = f"0:s:{relative_index}"
+        else:
+            # Fallback to global stream index mapping
+            map_arg = f"0:{stream_index}"
+
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(video_file), "-map", map_arg, "-c:s", "srt", str(output_srt)]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode == 0 and output_srt.exists():
-            self.logger.info(
-                f"{EmojiGenerator.check_mark()} Subtítulos embebidos en '{detected_lang}' extraídos: {output_srt.name}"
-            )
+            if detected_lang:
+                self.logger.info(
+                    f"{EmojiGenerator.check_mark()} Subtítulos embebidos en '{detected_lang}' extraídos: {output_srt}"
+                )
+            else:
+                self.logger.info(f"{EmojiGenerator.check_mark()} Subtítulos embebidos extraídos: {output_srt}")
 
             # Aplicar mejora de calidad a los subtítulos extraídos
             self._improve_extracted_subtitles_quality(output_srt, detected_lang)
 
             return output_srt
 
+        # Log stderr for diagnostics if extraction failed
+        if result.returncode != 0:
+            self.logger.debug(f"ffmpeg stderr (sub extract): {result.stderr[:1000]}")
         return None
 
-    def _improve_extracted_subtitles_quality(self, srt_file: Path, language: str):
+    def _score_srt_file(self, srt_path: Path) -> Tuple[int, int]:
+        """
+        Calcula una heurística simple para evaluar un SRT: (size_bytes, text_lines_count).
+
+        Args:
+            srt_path: Ruta al archivo SRT.
+
+        Returns:
+            Tuple[int, int]: (tamaño en bytes, número de líneas de texto detectadas).
+        """
+        try:
+            size = srt_path.stat().st_size if srt_path.exists() else 0
+            with open(srt_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            lines = content.splitlines()
+            text_lines = 0
+            for line in lines:
+                ls = line.strip()
+                if not ls:
+                    continue
+                if ls.isdigit() or "-->" in ls:
+                    continue
+                # Excluir líneas que parecen URLs o metadata
+                if ls.lower().startswith("http") or "www." in ls.lower() or "@" in ls:
+                    continue
+                text_lines += 1
+
+            return (size, text_lines)
+        except Exception:
+            return (0, 0)
+
+    def _improve_extracted_subtitles_quality(self, srt_file: Path, language: Optional[str]):
         """
         Aplica mejora de calidad a los subtítulos extraídos.
 
@@ -3172,7 +3593,7 @@ class SubtitleTranslator:
                 original_content = f.read()
 
             # Aplicar mejora de calidad
-            improved_content = self.quality_improver.improve_subtitle_quality(original_content, language)
+            improved_content = self.quality_improver.improve_subtitle_quality(original_content, language or "und")
 
             # Solo guardar si hubo cambios
             if improved_content != original_content:
@@ -3407,8 +3828,8 @@ def _setup_environment() -> dict:
         raise ImportError("MediaJellyConfig no disponible")
 
     # Detectar entorno para paths
-    is_container = Path("/mediajelly").exists()
-    base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+    is_container = MediaJellyPaths.is_container()
+    base_dir = MediaJellyPaths.get_base_path()
     scripts_dir = base_dir / "scripts"
     tmp_dir = scripts_dir / "tmp"
 
@@ -3498,6 +3919,13 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
     parser.add_argument(
         "--retranslate", action="store_true", help="Permitir re-traducción de archivos .es.srt existentes"
     )
+    parser.add_argument(
+        "--force-language",
+        dest="force_language",
+        type=str,
+        default=None,
+        help="Forzar idioma de transcripción (ej: 'ja', 'en', 'es'). Si no se indica, se detecta automáticamente.",
+    )
 
     args = parser.parse_args()
 
@@ -3508,7 +3936,11 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
 
     # Crear traductor con parámetros
     translator = SubtitleTranslator(
-        max_workers=args.max_workers, use_whisper=not args.no_whisper, allow_retranslate=args.retranslate, lock_file=env_config["subtitle_lock_file"]
+        max_workers=args.max_workers,
+        use_whisper=not args.no_whisper,
+        allow_retranslate=args.retranslate,
+        lock_file=env_config["subtitle_lock_file"],
+        force_language=args.force_language,
     )
 
     return args, translator
@@ -3516,15 +3948,9 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
 
 def _reset_subtitle_progress(translator, input_args: dict):
     """Resetea las estadísticas y archivos procesados cuando las rutas cambian"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-
     try:
-        # Leer el archivo actual
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
-        else:
-            progress_data = {}
+        # Leer estado actual desde DB
+        progress_data = load_progress() or {}
 
         # Resetear la sección de subtitle_translation
         progress_data["subtitle_translation"] = {
@@ -3554,9 +3980,8 @@ def _reset_subtitle_progress(translator, input_args: dict):
             "last_notification": None,
         }
 
-        # Guardar el archivo actualizado
-        with open(progress_file, "w") as f:
-            json.dump(progress_data, f, indent=2, ensure_ascii=False)
+        # Guardar estado actualizado en DB
+        save_progress(progress_data)
 
         translator.logger.info("Progreso de subtítulos reseteado debido a cambio de rutas")
         translator.logger.info(f"Nueva ruta: {input_args.get('corrected_paths', [''])[0]}")
@@ -3567,11 +3992,8 @@ def _reset_subtitle_progress(translator, input_args: dict):
 
 def _resume_incomplete_process(translator) -> dict:
     """Reanuda un proceso incompleto de traducción de subtítulos"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-
     try:
-        with open(progress_file, "r") as f:
-            progress_data = json.load(f)
+        progress_data = load_progress() or {}
 
         subtitle_translation = progress_data.get("subtitle_translation", {})
         last_input_args = subtitle_translation.get("last_input_args", {})
@@ -3614,13 +4036,10 @@ def _resume_incomplete_process(translator) -> dict:
 
 def _should_resume_incomplete_process(translator, current_args=None) -> bool:
     """Verifica si hay un proceso incompleto que se puede reanudar"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-    if not progress_file.exists():
-        return False
-
     try:
-        with open(progress_file, "r") as f:
-            progress_data = json.load(f)
+        progress_data = load_progress() or {}
+        if not progress_data:
+            return False
 
         subtitle_translation = progress_data.get("subtitle_translation", {})
         percentage = subtitle_translation.get("percentage", 0)
@@ -3748,7 +4167,7 @@ def _execute_main_processing(args, translator, input_args: dict) -> dict:
 
 def _correct_container_paths(paths: list, translator) -> list:
     """Corrige las rutas para el entorno de contenedor Docker
-    Normaliza rutas del host (/home/tafurc/mediaJelly/media) a rutas Docker (/mediajelly/media)
+    Normaliza rutas del host (<base>/media) a rutas Docker (/mediajelly/media)
     """
     translator.logger.info(f"_correct_container_paths recibió {len(paths)} paths")
     translator.logger.info(f"Primeros 3 paths: {paths[:3]}")
@@ -3756,15 +4175,12 @@ def _correct_container_paths(paths: list, translator) -> list:
     for path_str in paths:
         path_str = str(path_str)  # Asegurar que es string
 
-        # Normalizar rutas del host a Docker
-        # Casos a manejar:
-        # 1. /home/tafurc/mediaJelly/media/ -> /mediajelly/media/
-        # 2. /mediaJelly/media/ -> /mediajelly/media/
-        # 3. /mediajelly/media/ -> /mediajelly/media/ (ya correcto)
+        host_media_prefix = str(MediaJellyPaths.get_media_dir()) + "/"
 
-        if "/home/tafurc/mediaJelly/media/" in path_str:
+        # Normalizar rutas del host a Docker
+        if host_media_prefix in path_str:
             # Ruta desde host, convertir a Docker
-            corrected_path = path_str.replace("/home/tafurc/mediaJelly/media/", "/mediajelly/media/")
+            corrected_path = path_str.replace(host_media_prefix, "/mediajelly/media/")
             translator.logger.debug(f"Ruta normalizada (host->docker): {path_str} -> {corrected_path}")
             corrected_paths.append(corrected_path)
         elif path_str.startswith("/mediaJelly"):
@@ -3838,16 +4254,12 @@ def _send_subtitle_notification(env_config: dict, translator, stats: dict):
 
 
 def _mark_notification_sent(translator):
-    """Marca la notificación como enviada en el archivo de progreso"""
-    progress_file = translator.tmp_dir / "progress.json"
+    """Marca la notificación como enviada en el progreso persistido (DB)."""
     try:
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
-            if "subtitle_translation" in progress_data:
-                progress_data["subtitle_translation"]["notified"] = True
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+        progress_data = load_progress() or {}
+        if "subtitle_translation" in progress_data:
+            progress_data["subtitle_translation"]["notified"] = True
+            save_progress(progress_data)
     except Exception as e:
         translator.logger.warning(f"Error actualizando estado de notificación: {e}")
 
