@@ -8,29 +8,34 @@ validación de archivos y sanitización de entradas.
 
 Example:
     >>> from mediajelly_utils import MediaJellyPaths, sanitize_path
-    >>> 
+    >>>
     >>> # Obtener directorio base
     >>> base = MediaJellyPaths.get_base_path()
     >>> print(base)
     /mediajelly
-    >>> 
+    >>>
     >>> # Validar path seguro
     >>> safe_path = sanitize_path("/media/anime/../../etc/passwd")
     ValueError: Path outside allowed directory
 """
 
+import gzip
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from pathlib import Path
 from typing import Set, Optional
 import os
+import shutil
 
 
 class MediaJellyPaths:
     """
     Gestión centralizada de rutas del sistema MediaJelly.
-    
+
     Esta clase proporciona métodos estáticos para obtener rutas consistentes
     en todo el sistema, con detección automática de entorno (contenedor vs host).
-    
+
     Attributes:
         EXCLUDED_FOLDERS (Set[str]): Carpetas que deben ser excluidas del procesamiento
         EXTENSIONS (Set[str]): Extensiones de video soportadas
@@ -54,10 +59,10 @@ class MediaJellyPaths:
     def is_container() -> bool:
         """
         Detecta si el código está corriendo dentro de un contenedor Docker.
-        
+
         Returns:
             bool: True si está en contenedor, False en caso contrario
-        
+
         Example:
             >>> MediaJellyPaths.is_container()
             True
@@ -68,18 +73,35 @@ class MediaJellyPaths:
     def get_base_path() -> Path:
         """
         Obtiene el directorio base de MediaJelly según el entorno.
-        
         Returns:
-            Path: /mediajelly si está en contenedor, /home/tafurc/mediaJelly en host
-        
+            Path: Prioridad: env `MEDIAJELLY_BASE` -> /mediajelly (contenedor) -> proyecto (pyproject.toml/README.md/.git) -> CWD
+
         Example:
             >>> base = MediaJellyPaths.get_base_path()
             >>> print(base)
             /mediajelly
         """
+        # 1) Variable de entorno tiene prioridad (permite ejecutar local o en CI)
+        env_base = os.environ.get("MEDIAJELLY_BASE")
+        if env_base:
+            return Path(env_base)
+
+        # 2) Si estamos en contenedor (ruta estándar montada), usarla
         if MediaJellyPaths.is_container():
             return Path("/mediajelly")
-        return Path("/home/tafur/mediaJelly")
+
+        # 3) Intentar detectar la raíz del proyecto buscando indicadores
+        try:
+            this_file = Path(__file__).resolve()
+            for ancestor in [this_file.parent] + list(this_file.parents):
+                for marker in ("pyproject.toml", "README.md", ".git"):
+                    if (ancestor / marker).exists():
+                        return ancestor
+        except Exception:
+            pass
+
+        # 4) Fallback: directorio de trabajo actual
+        return Path.cwd()
 
     @staticmethod
     def get_scripts_dir() -> Path:
@@ -110,18 +132,18 @@ class MediaJellyPaths:
     def is_excluded_folder(file_path: Path) -> bool:
         """
         Verifica si una ruta está dentro de una carpeta excluida.
-        
+
         Args:
             file_path: Ruta del archivo a verificar
-        
+
         Returns:
             bool: True si está en carpeta excluida, False en caso contrario
-        
+
         Example:
             >>> path = Path("/media/anime/.delete/corrupted.mkv")
             >>> MediaJellyPaths.is_excluded_folder(path)
             True
-            >>> 
+            >>>
             >>> path = Path("/media/anime/show.mkv")
             >>> MediaJellyPaths.is_excluded_folder(path)
             False
@@ -132,13 +154,13 @@ class MediaJellyPaths:
     def is_video_file(file_path: Path) -> bool:
         """
         Verifica si un archivo es un video soportado.
-        
+
         Args:
             file_path: Ruta del archivo a verificar
-        
+
         Returns:
             bool: True si es un video soportado, False en caso contrario
-        
+
         Example:
             >>> MediaJellyPaths.is_video_file(Path("/media/video.mkv"))
             True
@@ -151,31 +173,31 @@ class MediaJellyPaths:
 def sanitize_path(path: str, base_path: Optional[Path] = None) -> Path:
     """
     Sanitiza y valida una ruta para prevenir path traversal attacks.
-    
+
     Esta función resuelve la ruta completa y verifica que esté dentro del
     directorio base permitido, previniendo ataques de path traversal.
-    
+
     Args:
         path: Ruta a sanitizar (puede contener .., ~, symlinks, etc.)
         base_path: Directorio base permitido. Si es None, usa get_base_path()
-    
+
     Returns:
         Path: Ruta resuelta y validada
-    
+
     Raises:
         ValueError: Si la ruta está fuera del directorio permitido
         FileNotFoundError: Si la ruta no existe
-    
+
     Example:
         >>> # Intento de path traversal
         >>> sanitize_path("/media/../../etc/passwd")
         ValueError: Path outside allowed directory
-        
+
         >>> # Ruta válida
         >>> safe = sanitize_path("/mediajelly/media/anime")
         >>> print(safe)
         /mediajelly/media/anime
-    
+
     Security:
         Esta función es crítica para la seguridad. Siempre úsala cuando
         proceses rutas de archivos que vengan de entrada externa.
@@ -203,14 +225,14 @@ def sanitize_path(path: str, base_path: Optional[Path] = None) -> Path:
 def ensure_directory(directory: Path, create: bool = True) -> bool:
     """
     Asegura que un directorio existe, opcionalmente creándolo.
-    
+
     Args:
         directory: Directorio a verificar/crear
         create: Si True, crea el directorio si no existe
-    
+
     Returns:
         bool: True si el directorio existe o fue creado, False si no existe y create=False
-    
+
     Example:
         >>> logs_dir = Path("/mediajelly/scripts/logs")
         >>> ensure_directory(logs_dir)
@@ -234,13 +256,13 @@ def ensure_directory(directory: Path, create: bool = True) -> bool:
 def get_file_size_mb(file_path: Path) -> float:
     """
     Obtiene el tamaño de un archivo en MB.
-    
+
     Args:
         file_path: Ruta del archivo
-    
+
     Returns:
         float: Tamaño en megabytes
-    
+
     Example:
         >>> size = get_file_size_mb(Path("/media/video.mkv"))
         >>> print(f"{size:.2f} MB")
@@ -252,16 +274,98 @@ def get_file_size_mb(file_path: Path) -> float:
         return 0.0
 
 
+def create_compressed_rotating_file_handler(
+    log_file: Path,
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 5,
+    encoding: str = "utf-8",
+) -> RotatingFileHandler:
+    """Crea un handler de logs con rotación comprimida."""
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding=encoding)
+
+    def namer(name: str) -> str:
+        return f"{name}.gz"
+
+    def rotator(source: str, destination: str) -> None:
+        with open(source, "rb") as source_file, gzip.open(destination, "wb") as destination_file:
+            shutil.copyfileobj(source_file, destination_file)
+        os.remove(source)
+
+    handler.namer = namer
+    handler.rotator = rotator
+
+    if log_file.exists() and log_file.stat().st_size >= max_bytes:
+        try:
+            handler.doRollover()
+        except Exception:
+            pass
+
+    def cleanup_old_archives() -> None:
+        archive_files = sorted(
+            [path for path in log_file.parent.glob(f"{log_file.name}.*.gz") if path.is_file()],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for old_archive in archive_files[backup_count:]:
+            try:
+                old_archive.unlink()
+            except Exception:
+                pass
+
+    cleanup_old_archives()
+    return handler
+
+
+def archive_legacy_log_file(
+    legacy_log_file: Path,
+    archive_dir: Path,
+    archive_name: Optional[str] = None,
+    backup_count: int = 5,
+) -> Optional[Path]:
+    """Comprime un log legado en una carpeta de archivo y limpia excedentes."""
+
+    if not legacy_log_file.exists() or not legacy_log_file.is_file():
+        return None
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    base_name = archive_name or legacy_log_file.name
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    archive_file = archive_dir / f"{base_name}.{stamp}.gz"
+
+    try:
+        with open(legacy_log_file, "rb") as source_file, gzip.open(archive_file, "wb") as destination_file:
+            shutil.copyfileobj(source_file, destination_file)
+        legacy_log_file.unlink()
+    except Exception:
+        return None
+
+    archive_files = sorted(
+        [path for path in archive_dir.glob(f"{base_name}.*.gz") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for old_archive in archive_files[backup_count:]:
+        try:
+            old_archive.unlink()
+        except Exception:
+            pass
+
+    return archive_file
+
+
 def get_file_size_gb(file_path: Path) -> float:
     """
     Obtiene el tamaño de un archivo en GB.
-    
+
     Args:
         file_path: Ruta del archivo
-    
+
     Returns:
         float: Tamaño en gigabytes
-    
+
     Example:
         >>> size = get_file_size_gb(Path("/media/video.mkv"))
         >>> print(f"{size:.2f} GB")
@@ -273,7 +377,7 @@ def get_file_size_gb(file_path: Path) -> float:
 class MediaJellyConfig:
     """
     Gestión de configuración de MediaJelly.
-    
+
     Esta clase proporciona métodos para cargar y validar la configuración
     del sistema desde archivos y variables de entorno.
     """
@@ -282,18 +386,18 @@ class MediaJellyConfig:
     def get_env_var(key: str, default: Optional[str] = None, required: bool = False) -> Optional[str]:
         """
         Obtiene una variable de entorno con manejo de valores por defecto.
-        
+
         Args:
             key: Nombre de la variable de entorno
             default: Valor por defecto si no existe
             required: Si True, lanza excepción si no existe
-        
+
         Returns:
             str: Valor de la variable o default
-        
+
         Raises:
             ValueError: Si required=True y la variable no existe
-        
+
         Example:
             >>> tz = MediaJellyConfig.get_env_var("TZ", "UTC")
             >>> print(tz)
@@ -310,14 +414,14 @@ class MediaJellyConfig:
     def get_env_int(key: str, default: int = 0) -> int:
         """
         Obtiene una variable de entorno como entero.
-        
+
         Args:
             key: Nombre de la variable
             default: Valor por defecto
-        
+
         Returns:
             int: Valor entero
-        
+
         Example:
             >>> max_mem = MediaJellyConfig.get_env_int("MAX_MEMORY_GB", 4)
             >>> print(max_mem)
@@ -332,14 +436,14 @@ class MediaJellyConfig:
     def get_env_bool(key: str, default: bool = False) -> bool:
         """
         Obtiene una variable de entorno como booleano.
-        
+
         Args:
             key: Nombre de la variable
             default: Valor por defecto
-        
+
         Returns:
             bool: Valor booleano
-        
+
         Example:
             >>> debug = MediaJellyConfig.get_env_bool("DEBUG", False)
             >>> print(debug)
