@@ -30,6 +30,8 @@ except ImportError:
     print("⚠️ python-dotenv no está instalado, usando variables de entorno del sistema")
 
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths
+from mediajelly_db import load_progress, get_pending_files, get_all_completed_files
 
 # Importar configuración centralizada
 from mediajelly_config import get_config
@@ -55,7 +57,7 @@ class TelegramNotifier:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         self.logger.info("Inicializando TelegramNotifier...")
-        
+
         # Cargar configuración centralizada
         try:
             self.config_obj = get_config()
@@ -65,8 +67,8 @@ class TelegramNotifier:
             sys.exit(1)
 
         # Detecta el entorno
-        self.is_container = Path("/mediajelly").exists()
-        self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
+        self.is_container = MediaJellyPaths.is_container()
+        self.base_dir = MediaJellyPaths.get_base_path()
         self.scripts_dir = self.base_dir / "scripts"
         self.state_file = self.scripts_dir / "tmp" / "last_notification_state"
         self.queue_file = self.scripts_dir / "tmp" / "notification_queue.json"
@@ -90,7 +92,7 @@ class TelegramNotifier:
             # Extraer configuración de telegram del objeto de configuración
             bot_token = self.config_obj.telegram.bot_token
             chat_id = self.config_obj.telegram.chat_id
-            
+
             # CORRECCIÓN: Expandir variables de entorno correctamente
             if isinstance(bot_token, str) and bot_token.startswith("${") and bot_token.endswith("}"):
                 # Extraer nombre de variable: ${VAR} -> VAR
@@ -99,7 +101,7 @@ class TelegramNotifier:
                 self.logger.info(f"Token cargado desde variable de entorno: {var_name}")
             else:
                 config["TELEGRAM_BOT_TOKEN"] = bot_token
-                
+
             if isinstance(chat_id, str) and chat_id.startswith("${") and chat_id.endswith("}"):
                 # Extraer nombre de variable: ${VAR} -> VAR
                 var_name = chat_id[2:-1]
@@ -108,7 +110,7 @@ class TelegramNotifier:
 
             else:
                 config["TELEGRAM_CHAT_ID"] = chat_id
-                
+
         except AttributeError as e:
             # Fallback: cargar directamente desde variables de entorno
             self.logger.warning(f"YAML no tiene configuración de Telegram, usando variables de entorno: {e}")
@@ -262,27 +264,20 @@ class TelegramNotifier:
         return True
 
     def _get_progress_info(self) -> Dict:
-        """Obtener información del progreso desde progress.json"""
-        progress_file = self.scripts_dir / "tmp" / "progress.json"
+        """Obtener información del progreso desde la DB"""
         try:
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    data = json.load(f)
-
-                    # Si existe la sección processing, devolver esa información
-                    if "processing" in data:
-                        processing_data = data["processing"].copy()
-                        # Asegura que tenga el campo status
-                        if "status" not in processing_data:
-                            processing_data["status"] = "unknown"
-                        return processing_data
-                    else:
-                        # Fallback para compatibilidad con estructura antigua
-                        if "status" not in data:
-                            data["status"] = "unknown"
-                        return data
+            data = load_progress() or {}
+            if "processing" in data:
+                processing_data = data["processing"].copy()
+                if "status" not in processing_data:
+                    processing_data["status"] = "unknown"
+                return processing_data
+            if data:
+                if "status" not in data:
+                    data["status"] = "unknown"
+                return data
         except Exception as e:
-            self.logger.warning(f"Error leyendo progress.json: {e}")
+            self.logger.warning(f"Error leyendo progreso desde DB: {e}")
 
         return {
             "current_file": 0,
@@ -294,22 +289,16 @@ class TelegramNotifier:
         }
 
     def _get_subtitle_progress_info(self) -> Dict:
-        """Obtener información del progreso de subtítulos desde progress.json"""
-        progress_file = self.scripts_dir / "tmp" / "progress.json"
+        """Obtener información del progreso de subtítulos desde la DB"""
         try:
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    data = json.load(f)
-
-                    # Si existe la sección subtitle_translation, devolver esa información
-                    if "subtitle_translation" in data:
-                        subtitle_data = data["subtitle_translation"].copy()
-                        # Asegura que tenga el campo status
-                        if "status" not in subtitle_data:
-                            subtitle_data["status"] = "unknown"
-                        return subtitle_data
+            data = load_progress() or {}
+            if "subtitle_translation" in data:
+                subtitle_data = data["subtitle_translation"].copy()
+                if "status" not in subtitle_data:
+                    subtitle_data["status"] = "unknown"
+                return subtitle_data
         except Exception as e:
-            self.logger.warning(f"Error leyendo progress.json para subtítulos: {e}")
+            self.logger.warning(f"Error leyendo progreso de subtítulos desde DB: {e}")
 
         return {
             "current_file": 0,
@@ -339,9 +328,13 @@ class TelegramNotifier:
             return ""
 
         summary = f"{EmojiGenerator.error()} Errores encontrados: {len(errors)}\n"
-        # Muestra hasta 5 errores
+        # Muestra hasta 5 errores (truncando cada línea para no saturar el mensaje;
+        # el detalle completo siempre queda en scripts/tmp/failed-compression.txt
+        # y se puede consultar con /errores en el bot de Telegram)
+        max_line_len = 300
         for error in errors[:5]:
-            summary += f"• {error}\n"
+            line = error if len(error) <= max_line_len else error[:max_line_len] + "…"
+            summary += f"• {line}\n"
 
         if len(errors) > 5:
             summary += f"... y {len(errors) - 5} más\n"
@@ -388,21 +381,21 @@ class TelegramNotifier:
     def has_new_processing(self) -> bool:
         """Verificar si hubo procesamiento nuevo"""
         success_log = self.scripts_dir / "logs" / "compression-success.log"
-        pending_file = self.scripts_dir / "pending-compression.txt"
-        completed_file = self.scripts_dir / "completed.txt"
 
         # Estado actual
         current_pending = 0
         current_completed = 0
         current_last_log = ""
 
-        if pending_file.exists():
-            with open(pending_file, "r") as f:
-                current_pending = len([line for line in f if line.strip()])
+        try:
+            current_pending = len(get_pending_files())
+        except Exception:
+            current_pending = 0
 
-        if completed_file.exists():
-            with open(completed_file, "r") as f:
-                current_completed = len([line for line in f if line.strip()])
+        try:
+            current_completed = len(get_all_completed_files())
+        except Exception:
+            current_completed = 0
 
         if success_log.exists():
             with open(success_log, "r") as f:

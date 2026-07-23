@@ -9,7 +9,6 @@ import time
 import json
 import re
 import logging
-import logging.handlers
 import resource
 import subprocess
 from pathlib import Path
@@ -45,7 +44,17 @@ from mediajelly_exceptions import (
     ConfigurationError,
     LanguageDetectionError,
 )
-from mediajelly_utils import MediaJellyPaths
+from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
+from mediajelly_db import (
+    add_pending,
+    remove_pending,
+    get_pending_files,
+    mark_completed,
+    is_completed,
+    save_progress,
+    load_progress,
+    get_all_completed_files,
+)
 try:
     from mediajelly_language_detector import set_cached_language, detect_language_with_whisper_for_processor
     LANGUAGE_DETECTOR_AVAILABLE = True
@@ -140,11 +149,11 @@ class MediaJellyProcessor:
 
     def __init__(self):
         # Detecta el entorno
-        self.is_container = Path("/mediajelly").exists()
-        self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
+        self.is_container = MediaJellyPaths.is_container()
+        self.base_dir = MediaJellyPaths.get_base_path()
         self.media_dir = self.base_dir / "media"
         self.scripts_dir = self.base_dir / "scripts"
-        self.logs_dir = self.scripts_dir / "logs"
+        self.logs_dir = self.scripts_dir / "tmp" / "logs"
         self.tmp_dir = self.scripts_dir / "tmp"
 
         # Archivos
@@ -222,16 +231,16 @@ class MediaJellyProcessor:
         backup_count = 5
 
         # Configuración del handler para compression-success.log con rotación
-        success_handler = logging.handlers.RotatingFileHandler(
-            self.logs_dir / "compression-success.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        success_handler = create_compressed_rotating_file_handler(
+            self.logs_dir / "compression-success.log", max_bytes=max_bytes, backup_count=backup_count
         )
         success_handler.setLevel(logging.INFO)
         success_formatter = logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")
         success_handler.setFormatter(success_formatter)
 
         # Configuración del handler para compression-errors.log con rotación
-        error_handler = logging.handlers.RotatingFileHandler(
-            self.logs_dir / "compression-errors.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        error_handler = create_compressed_rotating_file_handler(
+            self.logs_dir / "compression-errors.log", max_bytes=max_bytes, backup_count=backup_count
         )
         error_handler.setLevel(logging.ERROR)
         error_formatter = logging.Formatter("[%(asctime)s] ERROR: %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -242,8 +251,8 @@ class MediaJellyProcessor:
         self.no_spanish_logger.setLevel(logging.INFO)
         self.no_spanish_logger.handlers.clear()
         self.no_spanish_logger.propagate = False  # No heredar handlers del padre
-        no_spanish_handler = logging.handlers.RotatingFileHandler(
-            self.logs_dir / "no-spanish.log", maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        no_spanish_handler = create_compressed_rotating_file_handler(
+            self.logs_dir / "no-spanish.log", max_bytes=max_bytes, backup_count=backup_count
         )
         no_spanish_formatter = logging.Formatter("[%(asctime)s] SIN ESPAÑOL: %(message)s", "%Y-%m-%d %H:%M:%S")
         no_spanish_handler.setFormatter(no_spanish_formatter)
@@ -306,16 +315,11 @@ class MediaJellyProcessor:
             current_file_name: Nombre del archivo actual o mensaje de estado
             status: Estado del procesamiento (scanning, processing, completed, error)
         """
-        progress_file = self.tmp_dir / PROGRESS_FILE_NAME
-
-        # Leer progreso existente para preservar otras secciones
-        existing_progress = {}
-        if progress_file.exists():
-            try:
-                with open(progress_file, "r") as f:
-                    existing_progress = json.load(f)
-            except Exception:
-                existing_progress = {}
+        # Leer progreso existente desde la DB para preservar otras secciones
+        try:
+            existing_progress = load_progress()
+        except Exception:
+            existing_progress = {}
 
         # Resetear progreso si está corrupto (porcentaje > 100%)
         if self._reset_progress_if_corrupted(existing_progress.get("processing", {})):
@@ -398,46 +402,39 @@ class MediaJellyProcessor:
         existing_progress["processing"]["processed_files"] = self.processed_files
 
         try:
-            with open(progress_file, "w") as f:
-                json.dump(existing_progress, f, indent=2)
+            save_progress(existing_progress)
         except Exception as e:
-            self.logger.warning(f"Error guardando progreso: {e}")
+            self.logger.warning(f"Error guardando progreso en DB: {e}")
 
     def get_progress_info(self) -> Dict:
-        """Obtiene información del progreso actual"""
-        progress_file = self.tmp_dir / PROGRESS_FILE_NAME
+        """Obtiene información del progreso actual desde la DB"""
         try:
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    data = json.load(f)
+            data = load_progress()
+            if not data:
+                raise ValueError("No progress in DB")
 
-                    # Si existe la sección processing, devolver esa información
-                    if "processing" in data:
-                        processing_data = data["processing"].copy()
-                        # Asegura que tenga el campo status
-                        if "status" not in processing_data:
-                            processing_data["status"] = "unknown"
-                        return processing_data
-                    else:
-                        # Fallback para compatibilidad con estructura antigua
-                        if "status" not in data:
-                            data["status"] = "unknown"
-                        return data
-        except Exception as e:
-            self.logger.warning(f"Error leyendo progreso: {e}")
-
-        # Retornar estructura por defecto para la sección processing
-        return {
-            "current_file": 0,
-            "total_files": 0,
-            "current_file_name": "N/A",
-            "percentage": 0,
-            "last_updated": None,
-            "status": "idle",
-            "notified": False,
-            "stats": asdict(self.stats),
-            "processed_files": {},
-        }
+            if "processing" in data:
+                processing_data = data["processing"].copy()
+                if "status" not in processing_data:
+                    processing_data["status"] = "unknown"
+                return processing_data
+            else:
+                if "status" not in data:
+                    data["status"] = "unknown"
+                return data
+        except Exception:
+            # Retornar estructura por defecto para la sección processing
+            return {
+                "current_file": 0,
+                "total_files": 0,
+                "current_file_name": "N/A",
+                "percentage": 0,
+                "last_updated": None,
+                "status": "idle",
+                "notified": False,
+                "stats": asdict(self.stats),
+                "processed_files": {},
+            }
 
     def _check_hardware_acceleration_available(self) -> bool:
         """Verifica si la aceleración por hardware está disponible"""
@@ -815,15 +812,12 @@ class MediaJellyProcessor:
         return failed_files
 
     def _load_completed_files(self) -> set:
-        """Carga archivos completados para evitar reprocesamiento"""
-        completed_files = set()
-        if self.completed_file.exists():
-            with open(self.completed_file, "r") as f:
-                for line in f:
-                    file_path = line.strip()
-                    if file_path:
-                        completed_files.add(file_path)
-        return completed_files
+        """Carga archivos completados para evitar reprocesamiento (desde DB)."""
+        try:
+            files = get_all_completed_files()
+            return {str(p) for p in files}
+        except Exception:
+            return set()
 
     def _get_pending_files(self) -> List[Path]:
         """Obtiene archivos pendientes de procesamiento y normaliza sus nombres"""
@@ -834,23 +828,22 @@ class MediaJellyProcessor:
         files_renamed: List[Tuple[str, str]] = []
         invalid_files: List[str] = []
 
-        # Procesar cada línea del archivo pending
-        with open(self.pending_file, "r") as f:
-            for line in f:
-                file_path = line.strip()
-                if not file_path:
-                    continue
+        try:
+            db_pending = get_pending_files()
+        except Exception:
+            db_pending = []
 
-                processed_file = self._process_pending_file_line(file_path, invalid_files, files_renamed)
-                if processed_file:
-                    pending_files.append(processed_file)
+        for p in db_pending:
+            processed_file = self._process_pending_file_line(str(p), invalid_files, files_renamed)
+            if processed_file:
+                pending_files.append(processed_file)
 
-        # Limpiar archivos inválidos del pending
+        # Limpiar archivos inválidos del pending (DB)
         if invalid_files:
             self._remove_invalid_files_from_pending(invalid_files)
-            self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending-compression.txt")
+            self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending-compression (DB)")
 
-        # Actualizar pending después de renombramientos
+        # Actualizar pending después de renombramientos en DB
         if files_renamed:
             self._update_pending_after_rename(files_renamed)
 
@@ -891,123 +884,73 @@ class MediaJellyProcessor:
         return file_path.suffix.lower() in VALID_VIDEO_EXTENSIONS
 
     def _remove_invalid_files_from_pending(self, invalid_files: List[str]) -> None:
-        """Remueve archivos inválidos (no-video) del archivo pending-compression.txt"""
-        if not self.pending_file.exists():
-            return
-
-        # Convertir lista de inválidos a set para búsqueda rápida
-        invalid_set = set(invalid_files)
-
-        # Leer todas las líneas válidas
-        valid_lines = []
-        with open(self.pending_file, "r") as f:
-            for line in f:
-                line_clean = line.strip()
-                if line_clean and line_clean not in invalid_set:
-                    valid_lines.append(line_clean)
-
-        # Reescribir el archivo solo con líneas válidas
-        with open(self.pending_file, "w") as f:
-            for line in valid_lines:
-                f.write(f"{line}\n")
+        """Remueve archivos inválidos (no-video) del pending en la DB."""
+        for inv in invalid_files:
+            try:
+                remove_pending(inv)
+            except Exception:
+                self.logger.debug(f"No se pudo remover pending inválido de la DB: {inv}")
 
     def _update_pending_after_rename(self, renamed_files: List[Tuple[str, str]]) -> None:
-        """Actualiza pending-compression.txt después de renombrar archivos"""
-        if not self.pending_file.exists():
-            return
-
-        # Leer todas las líneas
-        with open(self.pending_file, "r") as f:
-            lines = [line.strip() for line in f if line.strip()]
-
-        # Crear diccionario de renombramientos
-        rename_map = dict(renamed_files)
-
-        # Actualizar las líneas
-        updated_lines = []
-        for line in lines:
-            if line in rename_map:
-                updated_lines.append(rename_map[line])
-            else:
-                updated_lines.append(line)
-
-        # Reescribir el archivo
-        with open(self.pending_file, "w") as f:
-            for line in updated_lines:
-                f.write(f"{line}\n")
-
-        self.logger.info(f"Archivo pending actualizado con {len(renamed_files)} renombramientos")
+        """Actualiza pendings en DB después de renombrar archivos."""
+        for old, new in renamed_files:
+            try:
+                remove_pending(old)
+                add_pending(new)
+            except Exception:
+                self.logger.debug(f"No se pudo actualizar pending en DB: {old} -> {new}")
+        self.logger.info(f"Pendings (DB) actualizados con {len(renamed_files)} renombramientos")
 
     def _update_pending_file(self, old_path: str, new_path: str) -> None:
-        """Actualiza un archivo individual en pending-compression.txt después de renombrarlo"""
-        if not self.pending_file.exists():
-            return
-
-        # Leer todas las líneas
-        with open(self.pending_file, "r") as f:
-            lines = [line.strip() for line in f if line.strip()]
-
-        # Actualizar la línea correspondiente
-        updated_lines = []
-        for line in lines:
-            if line == old_path:
-                updated_lines.append(new_path)
-                self.logger.debug(f"Actualizado en pending: {old_path} -> {new_path}")
-            else:
-                updated_lines.append(line)
-
-        # Reescribir el archivo
-        with open(self.pending_file, "w") as f:
-            for line in updated_lines:
-                f.write(f"{line}\n")
+        """Actualiza un pending individual en la DB después de renombrarlo."""
+        try:
+            remove_pending(old_path)
+            add_pending(new_path)
+            self.logger.debug(f"Actualizado pending (DB): {old_path} -> {new_path}")
+        except Exception:
+            self.logger.debug(f"No se pudo actualizar pending (DB): {old_path} -> {new_path}")
 
     def _clean_pending_duplicates(self) -> int:
-        """Limpia duplicados del archivo pending-compression.txt"""
-        if not self.pending_file.exists():
+        """Limpia duplicados en la tabla pending_files de la DB."""
+        try:
+            paths = get_pending_files()
+        except Exception:
             return 0
 
-        unique_files = set()
+        seen = set()
         duplicates_removed = 0
+        for p in paths:
+            norm = str(Path(p).resolve())
+            if norm in seen:
+                try:
+                    remove_pending(str(p))
+                    duplicates_removed += 1
+                except Exception:
+                    pass
+            else:
+                seen.add(norm)
 
-        # Lee el archivo y mantiene solo rutas únicas
-        with open(self.pending_file, "r") as f:
-            for line in f:
-                line_clean = line.strip()
-                if line_clean:
-                    # Normaliza la ruta para comparación consistente
-                    normalized_path = str(Path(line_clean).resolve())
-                    if normalized_path in unique_files:
-                        duplicates_removed += 1
-                        self.logger.info(f"Duplicado encontrado y eliminado: {line_clean}")
-                    else:
-                        unique_files.add(normalized_path)
-
-        # Reescribe el archivo sin duplicados
         if duplicates_removed > 0:
-            with open(self.pending_file, "w") as f:
-                for file_path in sorted(unique_files):
-                    f.write(f"{file_path}\n")
-            self.logger.info(f"Limpieza completada: {duplicates_removed} duplicados eliminados")
+            self.logger.info(f"Limpieza DB completada: {duplicates_removed} duplicados eliminados")
 
         return duplicates_removed
 
     def _add_to_pending(self, file_path: Union[str, Path]) -> None:
         """Agrega un archivo a la cola de pendientes de compresión"""
         file_path_str = str(file_path) if isinstance(file_path, Path) else file_path
+        try:
+            current = {str(p) for p in get_pending_files()}
+        except Exception:
+            current = set()
 
-        # Verificar si ya existe en el archivo
-        existing_files = set()
-        if self.pending_file.exists():
-            with open(self.pending_file, "r") as f:
-                existing_files = {line.strip() for line in f if line.strip()}
-
-        # Agregar solo si no existe
-        if file_path_str not in existing_files:
-            with open(self.pending_file, "a") as f:
-                f.write(f"{file_path_str}\n")
-            self.logger.debug(f"Archivo agregado a pendientes: {file_path_str}")
+        if file_path_str not in current:
+            try:
+                add_pending(file_path_str)
+                self.logger.debug(f"Archivo agregado a pendientes (DB): {file_path_str}")
+            except Exception as e:
+                self.logger.warning(f"No se pudo agregar pending a DB: {e}")
         else:
-            self.logger.debug(f"Archivo ya existe en pendientes: {file_path_str}")
+            self.logger.debug(f"Archivo ya existe en pendientes (DB): {file_path_str}")
 
     def scan_media_files(self) -> List[Path]:
         """Escanea archivos multimedia con pathlib optimizado"""
@@ -1079,23 +1022,16 @@ class MediaJellyProcessor:
 
     def _update_files_found_in_existing_progress(self, files_count: int):
         """Actualiza files_found en progreso existente sin cambiar el estado"""
-        progress_file = self.tmp_dir / PROGRESS_FILE_NAME
         try:
-            existing_full_progress = {}
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    existing_full_progress = json.load(f)
-
-            # Asegurar que existe la sección processing
+            existing_full_progress = load_progress() or {}
             if "processing" not in existing_full_progress:
                 existing_full_progress["processing"] = self._create_default_progress_structure()
 
             existing_full_progress["processing"]["stats"]["files_found"] = files_count
 
-            with open(progress_file, "w") as f:
-                json.dump(existing_full_progress, f, indent=2)
+            save_progress(existing_full_progress)
         except Exception as e:
-            self.logger.warning(f"Error actualizando files_found en progreso: {e}")
+            self.logger.warning(f"Error actualizando files_found en progreso (DB): {e}")
 
     def _set_normal_progress_state(self, filtered_files: List[Path]):
         """Establece el estado de progreso normal para ejecuciones nuevas"""
@@ -1143,7 +1079,12 @@ class MediaJellyProcessor:
                 self.logger.info(f"{EmojiGenerator.refresh()} Cargando modelo Whisper (base)...")
                 # Usar modelo 'base' (ya descargado - 140MB)
                 # Se carga ANTES de iniciar compresiones para evitar conflictos de memoria
-                self.whisper_model = whisper.load_model("base")
+                try:
+                    import whisper as _whisper  # type: ignore
+                    self.whisper_model = _whisper.load_model("base")
+                except Exception as e:
+                    self.logger.error(f"Error importando/cargando Whisper: {e}")
+                    raise
                 self.logger.info(f"{EmojiGenerator.success()} Modelo Whisper cargado exitosamente")
                 return True
             except Exception as e:
@@ -2553,6 +2494,71 @@ class MediaJellyProcessor:
         Se guarda además una etiqueta ligera (el sufijo) en la estructura de
         `processed_files` para facilitar detecciones de cambios posteriores.
         """
+        # Antes de marcar como completado, verificar que las pistas de audio tengan idioma detectado.
+        try:
+            has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(final_name)
+
+            # Determinar si existen pistas de audio sin idioma detectado.
+            undetected_audio = False
+            if audio_languages:
+                for idx, lang in audio_languages.items():
+                    if not lang or str(lang).strip() == "" or str(lang).lower() == "und":
+                        undetected_audio = True
+                        break
+
+            if undetected_audio:
+                # No marcar como completado: agregar a pending para re-intento de detección
+                try:
+                    from mediajelly_db import add_pending
+
+                    add_pending(str(final_name), label=final_name.suffix.lower())
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Archivo sin idioma detectado, movido a pending: {final_name.name}")
+                    # Registrar en logger específico y en estadísticas
+                    try:
+                        self.no_spanish_logger.info(str(final_name))
+                    except Exception:
+                        pass
+                    self.processed_files[str(final_name)] = {
+                        "status": "no_language",
+                        "timestamp": datetime.now().isoformat(),
+                        "label": final_name.suffix.lower(),
+                    }
+                    try:
+                        self.stats.no_spanish.append(str(final_name))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.logger.error(f"Error agregando a pending tras falta de idioma: {e}")
+                return
+
+        except Exception as e:
+            # En caso de error al detectar, prevenir marcar completado y dejar en pending
+            self.logger.warning(f"{EmojiGenerator.warning_msg()} Error verificando idioma antes de marcar completado: {e}")
+            try:
+                from mediajelly_db import add_pending
+
+                add_pending(str(final_name), label=final_name.suffix.lower())
+            except Exception:
+                pass
+            self.processed_files[str(final_name)] = {
+                "status": "no_language",
+                "timestamp": datetime.now().isoformat(),
+                "label": final_name.suffix.lower(),
+            }
+            try:
+                self.no_spanish_logger.info(str(final_name))
+            except Exception:
+                pass
+            try:
+                self.stats.no_spanish.append(str(final_name))
+            except Exception:
+                pass
+            return
+
+        # Si llegamos aquí, todo ok: marcar completado
+        mark_completed(str(final_name))
+
+        # Mantener el archivo legacy para compatibilidad con utilidades antiguas.
         with open(self.completed_file, "a") as f:
             f.write(f"{final_name}\n")
 
@@ -3150,10 +3156,14 @@ class MediaJellyProcessor:
 
         if result["error"]:
             self.logger.error(result["error"])
-            current_errors.append(file_path.name)
+            # CORRECCIÓN: antes solo se guardaba el nombre del archivo, perdiendo el motivo
+            # real del fallo (timeout, señal, stderr de ffmpeg, validación, etc.), por lo que
+            # el resumen de Telegram mostraba "• archivo.mkv" sin ninguna pista de la causa.
+            error_line = f"{file_path.name}: {result['error']}"
+            current_errors.append(error_line)
             # Agrega el error a las estadísticas también
-            if file_path.name not in self.stats.errors:
-                self.stats.errors.append(file_path.name)
+            if error_line not in self.stats.errors:
+                self.stats.errors.append(error_line)
 
         if result["no_spanish"]:
             current_no_spanish.append(file_path.name)
@@ -3300,14 +3310,17 @@ class MediaJellyProcessor:
             self._rebuild_processed_files_from_completed()
 
     def _rebuild_processed_files_from_completed(self) -> None:
-        """Reconstruye processed_files desde completed.txt"""
+        """Reconstruye processed_files desde completed_files en la DB."""
         completed_files = set()
-        if self.completed_file.exists():
-            with open(self.completed_file, "r") as f:
-                for line in f:
-                    file_path = line.strip()
-                    if file_path:
-                        completed_files.add(file_path)
+        try:
+            completed_files = {str(p) for p in get_all_completed_files()}
+        except Exception:
+            if self.completed_file.exists():
+                with open(self.completed_file, "r") as f:
+                    for line in f:
+                        file_path = line.strip()
+                        if file_path:
+                            completed_files.add(file_path)
 
         self.processed_files = {
             path: {
@@ -3317,7 +3330,7 @@ class MediaJellyProcessor:
             }
             for path in completed_files
         }
-        self.logger.info(f"Reconstruyendo processed_files de completed.txt: {len(self.processed_files)} archivos")
+        self.logger.info(f"Reconstruyendo processed_files desde completados persistidos: {len(self.processed_files)} archivos")
 
     def _filter_already_processed_files(self, files: List[Path]) -> List[Path]:
         """Filtra archivos ya procesados exitosamente.
@@ -3467,10 +3480,11 @@ class MediaJellyProcessor:
         except Exception as e:
             error_msg = f"Error procesando {file_path}: {str(e)}"
             self.logger.error(error_msg)
-            current_errors.append(file_path.name)
+            error_line = f"{file_path.name}: {error_msg}"
+            current_errors.append(error_line)
             # Agregar a stats.errors también
-            if file_path.name not in self.stats.errors:
-                self.stats.errors.append(file_path.name)
+            if error_line not in self.stats.errors:
+                self.stats.errors.append(error_line)
             self.processed_files[str(file_path)] = {
                 "status": "failed",
                 "timestamp": datetime.now().isoformat(),
@@ -3500,10 +3514,11 @@ class MediaJellyProcessor:
 
         # Maneja errores
         if result.get("error"):
-            current_errors.append(file_path.name)
+            error_line = f"{file_path.name}: {result['error']}"
+            current_errors.append(error_line)
             # Agregar a stats.errors también
-            if file_path.name not in self.stats.errors:
-                self.stats.errors.append(file_path.name)
+            if error_line not in self.stats.errors:
+                self.stats.errors.append(error_line)
             self.processed_files[str(file_path)] = {
                 "status": "failed",
                 "timestamp": datetime.now().isoformat(),
@@ -3566,17 +3581,12 @@ class MediaJellyProcessor:
         try:
             self.logger.info("=== Iniciando MediaJelly Python ===")
 
-            # Al iniciar el procesamiento, marca notified=False en la sección processing
-            progress_file = self.tmp_dir / PROGRESS_FILE_NAME
-            existing_progress = {}
-            if progress_file.exists():
-                try:
-                    with open(progress_file, "r") as f:
-                        existing_progress = json.load(f)
-                except Exception:
-                    existing_progress = {}
+            # Al iniciar el procesamiento, marca notified=False en la sección processing (DB)
+            try:
+                existing_progress = load_progress() or {}
+            except Exception:
+                existing_progress = {}
 
-            # Asegurar que existe la sección processing
             if "processing" not in existing_progress:
                 existing_progress["processing"] = {
                     "current_file": 0,
@@ -3604,9 +3614,11 @@ class MediaJellyProcessor:
             existing_progress["processing"]["notified"] = False
             existing_progress["processing"]["status"] = "processing"
 
-            with open(progress_file, "w") as f:
-                json.dump(existing_progress, f, indent=2)
-            self.logger.info("Estado de notificación reseteado (notified=False)")
+            try:
+                save_progress(existing_progress)
+                self.logger.info("Estado de notificación reseteado (notified=False) en DB")
+            except Exception:
+                self.logger.warning("No se pudo resetear estado de notificación en DB")
 
             # Limpia archivos pendientes procesados antes de escanear
             self.cleanup_processed_files()
@@ -3658,16 +3670,21 @@ class MediaJellyProcessor:
         self._log_cleanup_results(files_removed, orphaned_count, files_kept, orphaned_files)
 
     def _load_completed_base_paths(self) -> set:
-        """Carga las rutas base de archivos completados"""
+        """Carga las rutas base de archivos completados desde la DB."""
         completed_base_paths = set()
-        if self.completed_file.exists():
-            with open(self.completed_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        path_obj = Path(line)
-                        base_path = str(path_obj.parent / path_obj.stem)
-                        completed_base_paths.add(base_path)
+        try:
+            for path_obj in get_all_completed_files():
+                base_path = str(path_obj.parent / path_obj.stem)
+                completed_base_paths.add(base_path)
+        except Exception:
+            if self.completed_file.exists():
+                with open(self.completed_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            path_obj = Path(line)
+                            base_path = str(path_obj.parent / path_obj.stem)
+                            completed_base_paths.add(base_path)
         return completed_base_paths
 
     def _filter_pending_files(self, completed_files: set) -> Tuple[List[str], List[str], int]:
@@ -3676,20 +3693,24 @@ class MediaJellyProcessor:
         orphaned_files = []
         files_removed = 0
 
-        with open(self.pending_file, "r") as f:
-            for line in f:
-                file_path = line.strip()
-                if not file_path:
-                    continue
+        try:
+            db_pending = get_pending_files()
+        except Exception:
+            db_pending = []
 
-                result = self._get_pending_file_action(file_path, completed_files)
-                if result == "remove":
-                    files_removed += 1
-                elif result == "orphan":
-                    orphaned_files.append(file_path)
-                    files_removed += 1
-                else:
-                    remaining_pending.append(file_path)
+        for p in db_pending:
+            file_path = str(p)
+            if not file_path:
+                continue
+
+            result = self._get_pending_file_action(file_path, completed_files)
+            if result == "remove":
+                files_removed += 1
+            elif result == "orphan":
+                orphaned_files.append(file_path)
+                files_removed += 1
+            else:
+                remaining_pending.append(file_path)
 
         return remaining_pending, orphaned_files, files_removed
 
@@ -3772,10 +3793,29 @@ class MediaJellyProcessor:
             self.logger.error(f"Error agregando archivo a failed-compression.txt: {e}")
 
     def _rewrite_pending_file(self, remaining_pending: List[str]) -> None:
-        """Reescribe el archivo de pendientes con archivos válidos"""
-        with open(self.pending_file, "w") as f:
-            for file_path in remaining_pending:
-                f.write(f"{file_path}\n")
+        """Actualiza la tabla pending_files en la DB con la lista de remaining_pending."""
+        try:
+            current = {str(p) for p in get_pending_files()}
+        except Exception:
+            current = set()
+
+        remaining_set = set(remaining_pending)
+
+        # Remover los que no deben quedarse
+        to_remove = current - remaining_set
+        for r in to_remove:
+            try:
+                remove_pending(r)
+            except Exception:
+                pass
+
+        # Añadir los que faltan
+        to_add = remaining_set - current
+        for a in to_add:
+            try:
+                add_pending(a)
+            except Exception:
+                pass
 
     def _log_cleanup_results(
         self, files_removed: int, orphaned_count: int, files_kept: int, orphaned_files: List[str]
@@ -3812,10 +3852,11 @@ class MediaJellyProcessor:
         def normalize_path(path_str: str) -> str:
             """Normaliza una ruta para comparación"""
             path_obj = Path(path_str)
+            base_prefix = str(MediaJellyPaths.get_base_path()) + "/"
 
             # Reemplaza diferentes prefijos de ruta para normalizar
             path_str_normalized = str(path_obj)
-            path_str_normalized = path_str_normalized.replace("/home/tafurc/mediaJelly/", "")
+            path_str_normalized = path_str_normalized.replace(base_prefix, "")
             path_str_normalized = path_str_normalized.replace("/mediajelly/", "")
 
             return path_str_normalized
