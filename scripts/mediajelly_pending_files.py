@@ -4,6 +4,14 @@ mediajelly_pending_files.py
 
 Mixin con la gestión de la cola de archivos pendientes de compresión y de
 archivos ya completados, respaldada por mediajelly_db.py (SQLite).
+
+Extraído de MediaJellyProcessor (mediajelly_processor.py) para reducir el
+tamaño de esa clase y aislar esta responsabilidad.
+
+Requiere que la clase que lo use tenga disponibles: `self.logger`,
+`self.pending_file` (Path). También depende de `self._is_video_file` y
+`self._normalize_filename`, provistos por MediaJellyProcessor /
+FilenameNormalizerMixin respectivamente.
 """
 
 from pathlib import Path
@@ -35,22 +43,14 @@ class PendingFilesMixin:
             return set()
 
     def _get_pending_files(self) -> List[Path]:
-        """
-        Obtiene archivos pendientes de procesamiento desde la DB.
-        NOTA: Ya no depende del archivo pending-compression.txt.
-        """
-        # ⚠️ CORREGIDO: Ya no verifica pending_file.exists()
-        # Ahora siempre consulta la DB como fuente principal
-
+        """Obtiene archivos pendientes de procesamiento y normaliza sus nombres"""
         pending_files = []
         files_renamed: List[Tuple[str, str]] = []
         invalid_files: List[str] = []
 
         try:
             db_pending = get_pending_files()
-            self.logger.info(f"📊 _get_pending_files: {len(db_pending)} archivos obtenidos desde DB")
-        except Exception as e:
-            self.logger.error(f"❌ Error obteniendo pendientes desde DB: {e}")
+        except Exception:
             db_pending = []
 
         for p in db_pending:
@@ -61,13 +61,12 @@ class PendingFilesMixin:
         # Limpiar archivos inválidos del pending (DB)
         if invalid_files:
             self._remove_invalid_files_from_pending(invalid_files)
-            self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending (DB)")
+            self.logger.info(f"Removidos {len(invalid_files)} archivos no-video de pending-compression (DB)")
 
         # Actualizar pending después de renombramientos en DB
         if files_renamed:
             self._update_pending_after_rename(files_renamed)
 
-        self.logger.info(f"✅ _get_pending_files: {len(pending_files)} archivos pendientes válidos")
         return pending_files
 
     def _process_pending_file_line(
@@ -78,7 +77,6 @@ class PendingFilesMixin:
 
         # Verificar que el archivo existe
         if not original_path.exists():
-            self.logger.debug(f"Archivo no existe en disco: {original_path}")
             return None
 
         # Filtrar archivos que no son videos
@@ -95,7 +93,6 @@ class PendingFilesMixin:
         if new_path and new_path != original_path:
             # El archivo fue renombrado
             files_renamed.append((str(original_path), str(new_path)))
-            self.logger.info(f"✏️ Archivo renombrado: {original_path.name} -> {new_path.name}")
             return new_path
         else:
             # No se renombró, usar el path original
@@ -111,9 +108,8 @@ class PendingFilesMixin:
         for inv in invalid_files:
             try:
                 remove_pending(inv)
-                self.logger.debug(f"Removido de pending: {inv}")
-            except Exception as e:
-                self.logger.debug(f"No se pudo remover pending inválido de la DB: {inv} - {e}")
+            except Exception:
+                self.logger.debug(f"No se pudo remover pending inválido de la DB: {inv}")
 
     def _update_pending_after_rename(self, renamed_files: List[Tuple[str, str]]) -> None:
         """Actualiza pendings en DB después de renombrar archivos."""
@@ -121,9 +117,8 @@ class PendingFilesMixin:
             try:
                 remove_pending(old)
                 add_pending(new)
-                self.logger.debug(f"Actualizado pending: {old} -> {new}")
-            except Exception as e:
-                self.logger.debug(f"No se pudo actualizar pending en DB: {old} -> {new} - {e}")
+            except Exception:
+                self.logger.debug(f"No se pudo actualizar pending en DB: {old} -> {new}")
         self.logger.info(f"Pendings (DB) actualizados con {len(renamed_files)} renombramientos")
 
     def _update_pending_file(self, old_path: str, new_path: str) -> None:
@@ -132,15 +127,14 @@ class PendingFilesMixin:
             remove_pending(old_path)
             add_pending(new_path)
             self.logger.debug(f"Actualizado pending (DB): {old_path} -> {new_path}")
-        except Exception as e:
-            self.logger.debug(f"No se pudo actualizar pending (DB): {old_path} -> {new_path} - {e}")
+        except Exception:
+            self.logger.debug(f"No se pudo actualizar pending (DB): {old_path} -> {new_path}")
 
     def _clean_pending_duplicates(self) -> int:
         """Limpia duplicados en la tabla pending_files de la DB."""
         try:
             paths = get_pending_files()
-        except Exception as e:
-            self.logger.error(f"Error obteniendo pendientes para limpieza: {e}")
+        except Exception:
             return 0
 
         seen = set()
@@ -151,9 +145,8 @@ class PendingFilesMixin:
                 try:
                     remove_pending(str(p))
                     duplicates_removed += 1
-                    self.logger.debug(f"Duplicado removido: {p}")
-                except Exception as e:
-                    self.logger.debug(f"No se pudo remover duplicado {p}: {e}")
+                except Exception:
+                    pass
             else:
                 seen.add(norm)
 
@@ -167,8 +160,7 @@ class PendingFilesMixin:
         file_path_str = str(file_path) if isinstance(file_path, Path) else file_path
         try:
             current = {str(p) for p in get_pending_files()}
-        except Exception as e:
-            self.logger.error(f"Error obteniendo pendientes actuales: {e}")
+        except Exception:
             current = set()
 
         if file_path_str not in current:

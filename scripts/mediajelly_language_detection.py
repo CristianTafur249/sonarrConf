@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from mediajelly_emoji import EmojiGenerator
+
 SHORT_TIMEOUT = 10
 try:
     from mediajelly_config import get_config
@@ -366,10 +367,21 @@ class LanguageDetectionMixin:
             self.logger.error(f"Error en detección multi-muestra: {e}")
             return "spa"  # Fallback a español
 
-    def detect_audio_language(self, file_path: Path, stream_index: int) -> Optional[str]:
+    def detect_audio_language(
+        self, file_path: Path, stream_index: int, allow_whisper_fallback: bool = True
+    ) -> Optional[str]:
         """
         Detecta el idioma de una pista de audio usando el caché pre-analizado.
         Si no está en caché, NO asume ningún idioma (retorna None).
+
+        Args:
+            allow_whisper_fallback: Si es False, no se carga un modelo Whisper
+                cuando caché/metadatos no alcanzan (usado desde el worker de
+                compresión, para no sumar la carga de Whisper a un proceso que
+                ya está ejecutando ffmpeg y puede estar cerca del límite de
+                memoria del contenedor). El paso dedicado
+                mediajelly_language_detector.py sigue poblando el caché por
+                separado.
         """
         try:
             # Normalizar la ruta para comparación consistente
@@ -488,6 +500,13 @@ class LanguageDetectionMixin:
                         return "jpn"
 
             # Paso 3: Intentar detección con Whisper si está disponible
+            if not allow_whisper_fallback:
+                self.logger.debug(
+                    f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma en caché/metadatos, "
+                    f"Whisper deshabilitado en este contexto: {file_path.name}"
+                )
+                return None
+
             if LANGUAGE_DETECTOR_AVAILABLE:
                 self.logger.info(
                     f"{EmojiGenerator.magnifying_glass()} Stream {stream_index} sin idioma en caché/metadatos, ejecutando detección con Whisper: {file_path.name}"
@@ -506,21 +525,22 @@ class LanguageDetectionMixin:
                 except Exception as e:
                     self.logger.error(f"Error ejecutando detector de idiomas con Whisper: {e}")
 
-            # Paso 4: NO asumir ningún idioma por defecto - retornar None
-            self.logger.info(
-                f"{EmojiGenerator.warning_msg()} Stream {stream_index} sin idioma detectado (no en caché, no metadatos, detección falló): {file_path.name}"
-            )
             return None
 
         except Exception as e:
             self.logger.error(f"Error detectando idioma de audio en stream {stream_index} de {file_path}: {e}")
             return None  # No asumir idioma en caso de error
 
-    def detect_language_streams(self, file_path: Path) -> Tuple[bool, List[int], List[int], Dict[int, str]]:
+    def detect_language_streams(
+        self, file_path: Path, allow_whisper_fallback: bool = True
+    ) -> Tuple[bool, List[int], List[int], Dict[int, str]]:
         """
         Detecta streams de audio y subtítulos en español y devuelve índices.
         También detecta y etiqueta streams sin idioma.
         Retorna: (has_spanish, audio_indices, sub_indices, audio_languages)
+
+        Args:
+            allow_whisper_fallback: ver detect_audio_language().
         """
         try:
             # Comando para detectar todos los streams (audio y subtítulos)
@@ -575,7 +595,9 @@ class LanguageDetectionMixin:
                                     f"{EmojiGenerator.audio()} Stream audio {audio_stream_counter} (índice absoluto {index}) sin etiqueta ('{lang}'), iniciando detección..."
                                 )
                                 # Pasar el índice absoluto del stream
-                                detected_lang = self.detect_audio_language(file_path, index)
+                                detected_lang = self.detect_audio_language(
+                                    file_path, index, allow_whisper_fallback=allow_whisper_fallback
+                                )
                                 if detected_lang:
                                     lang = detected_lang
                                     self.logger.info(
@@ -587,6 +609,8 @@ class LanguageDetectionMixin:
                                     )
 
                             # Guardar el idioma del stream usando el índice relativo de audio
+                            if not lang or lang == "und":
+                                lang = "spa"
                             audio_languages[audio_stream_counter] = lang
 
                             # Verificar si es español

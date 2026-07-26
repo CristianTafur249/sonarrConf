@@ -10,12 +10,13 @@ import json
 import re
 import logging
 import resource
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed  # Volviendo a ProcessPool
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union, Any
 import signal
 import atexit
 
@@ -73,7 +74,13 @@ except Exception:
 
 # Configuración optimizada de constantes
 MAX_MEMORY_GB = 4
-FFMPEG_TIMEOUT = 14400  # 4 horas por archivo
+# Contenido 4K/UHD necesita mucho más espacio de direcciones para libx264
+# (lookahead + buffers de frame escalan con la resolución); con 4GB el
+# fallback CPU falla con "malloc failed" en archivos 2160p.
+MAX_MEMORY_GB_UHD = 10
+UHD_WIDTH_THRESHOLD = 3800   # cubre 3840x2160 (2160p) y variantes cercanas
+UHD_HEIGHT_THRESHOLD = 2000
+FFMPEG_TIMEOUT = 18000 # 5 horas por archivo
 COMPRESSED_FILE_SUFFIX = ".compressed.mp4"
 STREAM_LANGUAGE_QUERY = "stream=index:stream_tags=language"
 CSV_FORMAT_PARAM = "csv=p=0"
@@ -84,14 +91,70 @@ VAAPI_DEVICE_PATH = "/dev/dri/renderD128"
 LOG_RETENTION_DAYS = 7  # Reducido para ahorrar espacio
 SHORT_TIMEOUT = 10
 MEDIUM_TIMEOUT = 300  # Aumentado para probes más largos
+LONG_TIMEOUT = 60     # Para remux/etiquetado rápido
 PROCESSING_COMPLETED_MESSAGE = "Procesamiento completado"
 EXCLUDED_FOLDERS = MediaJellyPaths.EXCLUDED_FOLDERS
 MOVFLAGS_FASTSTART = "+faststart"
+
+# Piso de memoria libre exigido antes de lanzar ffmpeg. Si no se cumple, el
+# archivo se pospone (no se marca como fallido) para el siguiente ciclo de
+# cron en vez de arriesgarse a que el kernel lo mate por OOM.
+MIN_FREE_MEMORY_GB_HOST = 2.0
+MIN_FREE_MEMORY_GB_CGROUP = 1.0
+
+# Mensajes que identifican un fallo por falta de recursos (OOM/timeout) en vez
+# de un problema real del archivo (códec corrupto, validación, etc.). Estos
+# fallos no deben consumir intentos de la cuarentena de 3 intentos: ver
+# _build_failed_entry / _should_remove_failed_file.
+RESOURCE_FAILURE_MARKERS = (
+    "SIGKILL - posible OOM",
+    "terminado por señal",
+    "Timeout alcanzado",
+)
+
+
+def _read_cgroup_memory_status() -> Optional[Tuple[int, int]]:
+    """Lee el límite y uso actual de memoria del cgroup (v2) del contenedor.
+
+    Returns:
+        Tupla (limit_bytes, available_bytes) o None si no se puede leer
+        (entorno sin cgroup v2, ejecución fuera de Docker, o sin límite fijado).
+    """
+    try:
+        limit_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        if limit_raw == "max":
+            return None
+        limit_bytes = int(limit_raw)
+        current_bytes = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        return limit_bytes, max(0, limit_bytes - current_bytes)
+    except Exception:
+        return None
+
+
+def _read_cgroup_cpu_quota() -> Optional[float]:
+    """Lee la cuota de CPU (en núcleos) asignada al contenedor vía cgroup v2.
+
+    Returns:
+        Núcleos disponibles (puede ser fraccional) o None si no hay cuota
+        fijada o el archivo no existe (entorno sin cgroup v2 / fuera de Docker).
+    """
+    try:
+        quota_raw = Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+        quota_str, period_str = quota_raw.split()
+        if quota_str == "max":
+            return None
+        return int(quota_str) / int(period_str)
+    except Exception:
+        return None
 
 
 def get_optimal_workers() -> int:
     """
     Calcula el número óptimo de workers basado en recursos disponibles.
+
+    Considera tanto los recursos del host (vía psutil) como el cupo real del
+    cgroup del contenedor (si existe), para no proponer más workers de los
+    que el contenedor puede sostener sin que el kernel lo mate por OOM.
 
     Returns:
         Número óptimo de workers para procesamiento concurrente
@@ -101,16 +164,29 @@ def get_optimal_workers() -> int:
         return 1
 
     try:
-        # Obtener información del sistema
+        # Obtener información del sistema (host completo)
         available_ram_gb = psutil.virtual_memory().available / (1024**3)
-        cpu_count = psutil.cpu_count(logical=True)  # Usar logical cores
-        cpu_physical = psutil.cpu_count(logical=False)  # Physical cores
+        cpu_physical = psutil.cpu_count(logical=False) or 1  # Physical cores
 
-        # Calcular límites basados en RAM (4GB por worker)
-        max_by_ram = int((available_ram_gb - 2) / 4)  # Reservar 2GB para sistema
+        # Calcular límites basados en RAM (4GB por worker), reservando 2GB para sistema
+        max_by_ram = int((available_ram_gb - 2) / 4)
 
         # Calcular límites basados en CPU (dejar 1 core libre para sistema)
         max_by_cpu = max(1, cpu_physical - 1)
+
+        # Ajustar por el cupo real del contenedor (cgroup v2), si está disponible:
+        # el host puede reportar mucha más RAM/CPU de la que el propio
+        # contenedor tiene permitido usar.
+        cgroup_mem = _read_cgroup_memory_status()
+        if cgroup_mem is not None:
+            limit_bytes, _available_bytes = cgroup_mem
+            cgroup_limit_gb = limit_bytes / (1024**3)
+            max_by_cgroup_mem = max(1, int((cgroup_limit_gb - 1) / 4))
+            max_by_ram = min(max_by_ram, max_by_cgroup_mem)
+
+        cgroup_cpu = _read_cgroup_cpu_quota()
+        if cgroup_cpu is not None:
+            max_by_cpu = min(max_by_cpu, max(1, int(cgroup_cpu)))
 
         # Tomar el mínimo de ambos límites
         optimal_workers = max(1, min(max_by_ram, max_by_cpu))
@@ -125,6 +201,28 @@ def get_optimal_workers() -> int:
         return 1
 
 
+def get_ffmpeg_thread_count(workers: int) -> Optional[int]:
+    """Calcula cuántos threads debe usar cada proceso ffmpeg para no pelear
+    por más CPU de la que el contenedor tiene realmente asignada.
+
+    Args:
+        workers: Número de workers de compresión activos en paralelo.
+
+    Returns:
+        Número de threads a pasar con `-threads`, o None si no se pudo
+        determinar la cuota disponible (en ese caso ffmpeg usa su default).
+    """
+    cores = _read_cgroup_cpu_quota()
+    if cores is None and PSUTIL_AVAILABLE and psutil is not None:
+        try:
+            cores = psutil.cpu_count(logical=True)
+        except Exception:
+            cores = None
+    if cores is None:
+        return None
+    return max(1, int(cores / max(1, workers)))
+
+
 @dataclass
 class ProcessingStats:
     """Estadísticas de procesamiento"""
@@ -135,6 +233,7 @@ class ProcessingStats:
     files_compressed: int = 0
     files_renamed: int = 0
     files_skipped: int = 0
+    files_postponed: int = 0
     total_original_size: int = 0
     total_compressed_size: int = 0
     errors: Optional[List[str]] = None
@@ -220,9 +319,13 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
     def setup_logging(self):
         """Configura logging estructurado con rotación automática"""
-        # Limpia los handlers existentes
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
+        # NOTA: no tocar logging.root aquí. Este método antes limpiaba
+        # logging.root.handlers, lo que borraba (entre otros) el FileHandler
+        # que mediajelly_cron_runner.py configura hacia cron_runner.log —
+        # como MediaJellyProcessor se instancia en el MISMO proceso que el
+        # cron runner (no en un subproceso aparte), eso dejaba sin handlers
+        # al logger del cron runner para el resto del ciclo. Esta clase solo
+        # debe gestionar SU PROPIO logger ("mediajelly"), no el raíz global.
 
         # Configuración del logger principal
         self.logger = logging.getLogger("mediajelly")
@@ -293,19 +396,81 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         """Verifica si un archivo está en una carpeta excluida"""
         return any(part.lower() in EXCLUDED_FOLDERS for part in file_path.parts)
 
-    def set_resource_limits(self):
-        """Establecimiento de límites de recursos del proceso"""
+    def set_resource_limits(self, memory_gb: Optional[int] = None):
+        """Establecimiento de límites de recursos del proceso.
+        """
         try:
-            # Límite de memoria (en bytes)
-            memory_limit = MAX_MEMORY_GB * 1024 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+            effective_gb = memory_gb if memory_gb else MAX_MEMORY_GB
+            soft_limit = effective_gb * 1024 * 1024 * 1024
+            hard_ceiling = MAX_MEMORY_GB_UHD * 1024 * 1024 * 1024
+
+            _, current_hard = resource.getrlimit(resource.RLIMIT_AS)
+            if current_hard == resource.RLIM_INFINITY:
+                target_hard = hard_ceiling
+            else:
+                target_hard = min(current_hard, hard_ceiling)
+            # El hard limit nunca puede quedar por debajo del soft que vamos a pedir
+            target_hard = max(target_hard, soft_limit)
+
+            resource.setrlimit(resource.RLIMIT_AS, (soft_limit, target_hard))
 
             # Límite de tiempo de CPU (en segundos)
             resource.setrlimit(resource.RLIMIT_CPU, (FFMPEG_TIMEOUT, FFMPEG_TIMEOUT))
 
-            self.logger.info(f"Límites de recursos establecidos: {MAX_MEMORY_GB}GB RAM, {FFMPEG_TIMEOUT}s CPU")
+            self.logger.info(
+                f"Límites de recursos establecidos: {effective_gb}GB RAM (soft, techo {target_hard // (1024 ** 3)}GB), {FFMPEG_TIMEOUT}s CPU"
+            )
         except Exception as e:
             self.logger.warning(f"No se pudieron establecer límites de recursos: {e}")
+
+    def _check_sufficient_resources(self, file_path: Path) -> Tuple[bool, str]:
+        """Verifica que haya memoria y espacio en disco suficientes antes de
+        lanzar ffmpeg.
+
+        No es una garantía absoluta (el uso real puede variar durante la
+        compresión), pero evita lanzar procesos que muy probablemente van a
+        terminar en SIGKILL por OOM o en un temporal truncado por falta de
+        espacio, en vez de intentarlo y fallar.
+
+        Returns:
+            (True, "") si hay recursos suficientes; (False, motivo) si no.
+        """
+        if PSUTIL_AVAILABLE and psutil is not None:
+            try:
+                available_host_gb = psutil.virtual_memory().available / (1024**3)
+            except Exception:
+                available_host_gb = None
+            if available_host_gb is not None and available_host_gb < MIN_FREE_MEMORY_GB_HOST:
+                return False, (
+                    f"memoria insuficiente en el host: {available_host_gb:.2f}GB disponibles, "
+                    f"se requieren {MIN_FREE_MEMORY_GB_HOST}GB"
+                )
+
+        cgroup_mem = _read_cgroup_memory_status()
+        if cgroup_mem is not None:
+            _limit_bytes, available_bytes = cgroup_mem
+            available_cgroup_gb = available_bytes / (1024**3)
+            if available_cgroup_gb < MIN_FREE_MEMORY_GB_CGROUP:
+                return False, (
+                    f"memoria insuficiente en el contenedor: {available_cgroup_gb:.2f}GB disponibles, "
+                    f"se requieren {MIN_FREE_MEMORY_GB_CGROUP}GB"
+                )
+
+        try:
+            original_size_gb = file_path.stat().st_size / (1024**3)
+            free_disk_gb = shutil.disk_usage(file_path.parent).free / (1024**3)
+            # El temporal puede llegar a pesar similar al original en el peor
+            # caso; exigimos ese margen más un colchón fijo.
+            required_disk_gb = original_size_gb + 1.0
+            if free_disk_gb < required_disk_gb:
+                return False, (
+                    f"espacio en disco insuficiente: {free_disk_gb:.2f}GB libres, "
+                    f"se requieren ~{required_disk_gb:.2f}GB"
+                )
+        except Exception:
+            pass
+
+        return True, ""
 
     def _save_progress_state(
         self, current_file: int, total_files: int, current_file_name: str, status: str = "processing"
@@ -873,6 +1038,56 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         return None
 
+    def _get_video_resolution(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """Obtiene ancho/alto y pix_fmt del stream de video principal (para
+        decisiones de GPU vs CPU y límites de memoria dinámicos en contenido
+        4K/UHD o 10-bit, que VAAPI no puede manejar en todo el hardware)."""
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,pix_fmt",
+                "-of",
+                "csv=s=x:p=0",
+                str(file_path),
+            ]
+            result = subprocess.run(
+                probe_cmd, capture_output=True, timeout=SHORT_TIMEOUT, encoding="utf-8", errors="replace"
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split("x")
+                if len(parts) == 3:
+                    width, height, pix_fmt = parts
+                    return {"width": int(width), "height": int(height), "pix_fmt": pix_fmt}
+                if len(parts) == 2:
+                    # Fallback por si algún build de ffprobe no reporta pix_fmt
+                    return {"width": int(parts[0]), "height": int(parts[1]), "pix_fmt": ""}
+        except Exception as e:
+            self.logger.warning(f"Error obteniendo resolución de video: {e}")
+
+        return None
+
+    def _is_uhd_resolution(self, resolution: Optional[Dict[str, Any]]) -> bool:
+        """True si la resolución detectada corresponde a 4K/UHD (2160p+)."""
+        if not resolution:
+            return False
+        return (
+            resolution.get("width", 0) >= UHD_WIDTH_THRESHOLD
+            or resolution.get("height", 0) >= UHD_HEIGHT_THRESHOLD
+        )
+
+    def _is_10bit_pix_fmt(self, resolution: Optional[Dict[str, Any]]) -> bool:
+        """True si el pix_fmt detectado es de 10 bits (yuv420p10le, p010le,
+        etc)."""
+        if not resolution:
+            return False
+        pix_fmt = (resolution.get("pix_fmt") or "").lower()
+        return "10" in pix_fmt
+
     def _build_remux_command(
         self,
         file_path: Path,
@@ -1029,6 +1244,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_indices: List[int],
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
+        resolution: Optional[Dict[str, Any]] = None,
+        threads: Optional[int] = None,
     ) -> List[str]:
         """Construye comando ffmpeg optimizado"""
         if audio_languages is None:
@@ -1053,15 +1270,30 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             "vaapi",
             "-i",
             str(file_path),
-            "-c:v",
-            "h264_vaapi",
-            "-qp",
-            "28",
-            "-low_power",
-            "1",
-            "-max_muxing_queue_size",
-            "1024",
         ]
+
+        # Contenido 10-bit (yuv420p10le, p010le, etc.): h264_vaapi sólo puede
+        # codificar superficies de 8-bit. Confirmado en este hardware que hay
+        # que convertir explícitamente vía VPP (scale_vaapi=format=nv12)
+        # antes de encodear, o falla con "No usable encoding profile found".
+        # No depende de la resolución: se aplica igual a 1080p que a 4K.
+        if self._is_10bit_pix_fmt(resolution):
+            ffmpeg_cmd.extend(["-vf", "scale_vaapi=format=nv12"])
+
+        ffmpeg_cmd.extend(
+            [
+                "-c:v",
+                "h264_vaapi",
+                "-qp",
+                "28",
+                "-low_power",
+                "1",
+                "-max_muxing_queue_size",
+                "1024",
+            ]
+        )
+        if threads:
+            ffmpeg_cmd.extend(["-threads", str(threads)])
 
         # Mapeo de streams
         # Logging de idiomas que se aplicarán a metadatos
@@ -1151,6 +1383,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_indices: List[int],
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
+        threads: Optional[int] = None,
     ) -> List[str]:
         """Construye comando ffmpeg fallback sin aceleración de hardware"""
         if audio_languages is None:
@@ -1173,6 +1406,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Video config
         ffmpeg_cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-map", "0:v:0"])  # Más rápido
+        if threads:
+            ffmpeg_cmd.extend(["-threads", str(threads)])
 
         # Audio: mapear español si existe, sino el primero
         audio_map_count = 0
@@ -1258,6 +1493,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         temp_output: Path,
         audio_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
+        threads: Optional[int] = None,
     ) -> List[str]:
         """Construye comando ffmpeg sin subtítulos para archivos con subtítulos corruptos"""
         if audio_languages is None:
@@ -1284,6 +1520,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             "-map",
             "0:v:0",
         ]
+        if threads:
+            ffmpeg_cmd.extend(["-threads", str(threads)])
 
         audio_map_count = 0
         if audio_languages:
@@ -1693,12 +1931,17 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         """
         error_msg = self._generate_compression_error_message(process, file_path, temp_output)
 
-        # Adjuntar un snippet del stderr de ffmpeg para diagnóstico
+        # Adjuntar un snippet del stderr de ffmpeg para diagnóstico.
         stderr_snippet = ""
         try:
             if process and getattr(process, "stderr", None):
-                stderr_snippet = process.stderr.strip().splitlines()
-                stderr_snippet = " | ".join(stderr_snippet[:10])
+                lines = process.stderr.strip().splitlines()
+                head = lines[:3]
+                tail = lines[-10:] if len(lines) > 3 else []
+                combined = head + (["[...]"] if len(lines) > 13 else []) + [
+                    line for line in tail if line not in head
+                ]
+                stderr_snippet = " | ".join(combined)
                 error_msg = f"{error_msg} | ffmpeg-stderr: {stderr_snippet}"
                 self.logger.debug(f"FFmpeg stderr completo para {file_path.name}:\n{process.stderr}")
         except Exception:
@@ -1820,17 +2063,24 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             "compressed": False,
             "renamed": False,
             "skipped": False,
+            "postponed": False,
         }
 
         temp_output = None
 
         try:
+            # Detecta resolución antes de fijar límites: el contenido 4K/UHD
+            # necesita bastante más memoria para el fallback CPU (libx264) y
+            # además se salta la GPU (ver _should_use_gpu_compression).
+            resolution = self._get_video_resolution(file_path)
+            is_uhd = self._is_uhd_resolution(resolution)
+
             # Establece límites para este proceso (aislado)
-            self.set_resource_limits()
+            self.set_resource_limits(memory_gb=MAX_MEMORY_GB_UHD if is_uhd else None)
 
             # Prepara compresión: validación, detección de idiomas, selección de método
             is_prepared, compression_info, temp_output, audio_indices, sub_indices, audio_languages = (
-                self._prepare_compression(file_path)
+                self._prepare_compression(file_path, resolution=resolution)
             )
             if not is_prepared:
                 # Si se skippeó, considerarlo exitoso
@@ -1841,6 +2091,19 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if temp_output is None:
                 result["error"] = "Error interno: temp_output es None"
                 return result
+
+            # Control de memoria/disco previo: si no hay margen suficiente, no
+            # lanzamos ffmpeg (evita SIGKILL por OOM) — se pospone el archivo
+            # para el siguiente ciclo sin marcarlo como fallido ni gastar un
+            # intento de su cuarentena.
+            has_resources, resource_reason = self._check_sufficient_resources(file_path)
+            if not has_resources:
+                self.logger.warning(
+                    f"{EmojiGenerator.warning_msg()} Compresión pospuesta ({resource_reason}): {file_path.name}"
+                )
+                if temp_output.exists():
+                    temp_output.unlink()
+                return {**result, "postponed": True}
 
             use_gpu = compression_info["use_gpu"]
             has_spanish = compression_info["has_spanish"]
@@ -1859,7 +2122,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
             # Ejecuta compresión (aislada) - ahora pasa audio_languages también
             process, elapsed_time = self._execute_compression_attempt(
-                file_path, temp_output, use_gpu, audio_indices, sub_indices, use_remux, audio_languages
+                file_path, temp_output, use_gpu, audio_indices, sub_indices, use_remux, audio_languages,
+                resolution=resolution,
             )
 
             # Procesa resultado inicial
@@ -1937,12 +2201,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                     pass
         return False
 
-    def _prepare_compression(self, file_path: Path) -> Tuple[bool, Dict, Optional[Path], List[int], List[int], Dict[int, str]]:
+    def _prepare_compression(
+        self, file_path: Path, resolution: Optional[Dict[str, int]] = None
+    ) -> Tuple[bool, Dict, Optional[Path], List[int], List[int], Dict[int, str]]:
         """
         Prepara la compresión: validación, idiomas, método.
 
         Args:
             file_path: Ruta al archivo a procesar.
+            resolution: Resolución ya detectada (width/height), para evitar
+                volver a hacer ffprobe si ya se calculó en compress_single_file.
 
         Returns:
             Tuple conteniendo:
@@ -1976,8 +2244,60 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             result = {"skipped": False, "error": str(e)}
             return False, result, None, [], [], {}
 
-        # Idiomas - ahora retorna también audio_languages
-        has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(file_path)
+        # Idiomas - ahora retorna también audio_languages.
+        # allow_whisper_fallback=False: este método corre dentro del worker que
+        # está a punto de lanzar ffmpeg para comprimir este mismo archivo; no
+        # queremos cargar un modelo Whisper adicional en el mismo proceso justo
+        # antes de eso (mediajelly_language_detector.py ya puebla el caché de
+        # idiomas por separado, antes de que el processor arranque).
+        has_spanish, audio_indices, sub_indices, audio_languages = self.detect_language_streams(
+            file_path, allow_whisper_fallback=False
+        )
+
+        # -----------------------------------------------------------------
+        # NUEVA LÓGICA: FILTRAR A UN SOLO STREAM DE AUDIO SEGÚN PRIORIDAD
+        # Y OPCIONALMENTE OMITIR SUBTÍTULOS PARA AHORRAR MEMORIA
+        # -----------------------------------------------------------------
+        # 1. Determinar si es anime por la ruta
+        is_anime = 'anime' in str(file_path).lower()
+
+        # 2. Definir prioridad de idiomas: para anime, español > japonés > inglés > cualquiera
+        #    para no anime, español > inglés > cualquiera
+        if is_anime:
+            priority_langs = [ 'spa', 'es','jpn', 'ja', 'esp', 'eng', 'en']
+        else:
+            priority_langs = ['spa', 'es', 'esp', 'eng', 'en']
+
+        # 3. Función de prioridad
+        def audio_priority(idx: int) -> int:
+            lang = audio_languages.get(idx, '').lower()
+            for i, prio in enumerate(priority_langs):
+                if lang.startswith(prio) or lang == prio:
+                    return i
+            return len(priority_langs)  # cualquier otro idioma al final
+
+        # 4. Si hay pistas de audio, ordenar por prioridad y elegir la primera
+        if audio_indices:
+            audio_indices_sorted = sorted(audio_indices, key=audio_priority)
+            selected_audio = audio_indices_sorted[0]
+            audio_indices = [selected_audio]
+            # Filtrar el diccionario de idiomas para que solo contenga el seleccionado
+            audio_languages = {selected_audio: audio_languages.get(selected_audio, '')}
+        else:
+            # Si no se detectó ningún audio, usar el stream 0 (por si acaso)
+            audio_indices = [0]
+            audio_languages = {0: ''}
+
+        # 5. Para archivos grandes (>5 GB) o UHD, omitir subtítulos para ahorrar memoria
+        file_size = file_path.stat().st_size
+        if file_size > 5 * 1024**3 or self._is_uhd_resolution(resolution):
+            sub_indices = []   # no mapear subtítulos
+            self.logger.info(f"Archivo grande/UHD: omitiendo subtítulos para ahorrar memoria")
+        # (Opcional: si se quiere limitar subtítulos a solo el primero en español, se puede descomentar)
+        # else:
+        #     if sub_indices:
+        #         # Podríamos filtrar subtítulos para quedarnos solo con el primero, pero lo dejamos como estaba.
+        #         pass
 
         # Temporal
         temp_output = file_path.with_suffix(COMPRESSED_FILE_SUFFIX)
@@ -1998,7 +2318,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 use_gpu = False
                 use_remux = True  # Usar remux en lugar de compresión
             else:
-                use_gpu = self._should_use_gpu_compression(file_path)
+                use_gpu = self._should_use_gpu_compression(file_path, resolution=resolution)
                 use_remux = False
         elif is_av1:
             use_gpu = False  # No usar GPU para remux
@@ -2007,7 +2327,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 f"{EmojiGenerator.refresh()} Archivo AV1 detectado, usando remux (sin recodificación): {file_path.name}"
             )
         else:
-            use_gpu = self._should_use_gpu_compression(file_path)
+            use_gpu = self._should_use_gpu_compression(file_path, resolution=resolution)
             use_remux = False
 
         return (
@@ -2029,6 +2349,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         use_remux: bool = False,
         audio_languages: Optional[Dict[int, str]] = None,
         skip_subtitles: bool = False,
+        resolution: Optional[Dict[str, Any]] = None,
     ) -> Tuple[subprocess.CompletedProcess, float]:
         """
         Ejecuta un intento de compresión o remux usando ffmpeg.
@@ -2041,6 +2362,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             sub_indices: Lista de índices de streams de subtítulos a conservar.
             use_remux: Si True, usa modo remux (copia de streams) en lugar de recodificar.
             audio_languages: Diccionario de idiomas de audio {index: lang_code}.
+            resolution: Resolución/pix_fmt ya detectados (evita reprobar); usado
+                sólo en el path GPU para decidir si hace falta convertir a 8-bit.
 
         Returns:
             Tuple conteniendo:
@@ -2050,8 +2373,15 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if audio_languages is None:
             audio_languages = {}
 
+        # Threads por proceso ffmpeg, acotados a la cuota real de CPU del
+        # contenedor entre los workers activos, para no pelear sin control
+        # por más cores de los que el cgroup realmente tiene asignados.
+        threads = get_ffmpeg_thread_count(get_optimal_workers())
+
         if skip_subtitles:
-            ffmpeg_cmd = self._build_ffmpeg_command_no_subtitles(file_path, temp_output, audio_indices, audio_languages)
+            ffmpeg_cmd = self._build_ffmpeg_command_no_subtitles(
+                file_path, temp_output, audio_indices, audio_languages, threads=threads
+            )
             cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [CPU/audio/no-subs]"
             self.logger.info(f"Comando ffmpeg NO-SUBS: {cmd_str}")
         elif use_remux:
@@ -2060,12 +2390,14 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [REMUX/copy/output]"
             self.logger.info(f"Comando ffmpeg REMUX: {cmd_str}")
         elif use_gpu:
-            ffmpeg_cmd = self._build_ffmpeg_command(file_path, temp_output, audio_indices, sub_indices, audio_languages)
-            cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [GPU/audio/subs/output]"
+            ffmpeg_cmd = self._build_ffmpeg_command(
+                file_path, temp_output, audio_indices, sub_indices, audio_languages, resolution=resolution, threads=threads
+            )
+            cmd_str = " ".join(ffmpeg_cmd[:12]) + " ... [GPU/audio/subs/output]"
             self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
         else:
             ffmpeg_cmd = self._build_fallback_ffmpeg_command(
-                file_path, temp_output, audio_indices, sub_indices, audio_languages
+                file_path, temp_output, audio_indices, sub_indices, audio_languages, threads=threads
             )
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
             self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
@@ -2080,10 +2412,21 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         )
         elapsed_time = time.time() - start_time
 
-        # Logear stderr corto en debug para facilitar diagnóstico sin llenar logs
+        # Si el intento falló, subir el snippet de stderr a WARNING (no debug) para que
+        # quede visible en el log normal y se pueda diagnosticar sin activar debug logging.
         if process.stderr:
-            short_err = process.stderr.strip().splitlines()[:6]
-            self.logger.debug(f"FFmpeg stderr (short): {' | '.join(short_err)}")
+            all_lines = process.stderr.strip().splitlines()
+            head = all_lines[:3]
+            tail = all_lines[-8:] if len(all_lines) > 3 else []
+            # Evitar duplicar líneas si el stderr es corto y head/tail se solapan
+            snippet_lines = head + (["[...]"] if len(all_lines) > 11 else []) + [
+                line for line in tail if line not in head
+            ]
+            joined_err = " | ".join(snippet_lines)
+            if process.returncode != 0:
+                self.logger.warning(f"FFmpeg stderr (short, rc={process.returncode}): {joined_err}")
+            else:
+                self.logger.debug(f"FFmpeg stderr (short): {joined_err}")
 
         return process, elapsed_time
 
@@ -2177,7 +2520,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 failed_files_path = self.failed_file
                 reason = compression_result.get("error", "Fallo en compresión sin mensaje")
                 self._add_to_failed_files(str(file_path), failed_files_path, reason)
-                self.logger.warning(f"Archivo marcado como fallido después de fallback: {file_path.name}")
+                self.logger.error(
+                    f"Archivo marcado como fallido después de fallback: {file_path.name} | motivo: {reason}"
+                )
             except Exception as e:
                 self.logger.error(f"Error marcando archivo como fallido: {e}")
 
@@ -2222,7 +2567,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             self.logger.warning(f"Error comprobando procesos ffmpeg: {e}")
             return
 
-    def _should_use_gpu_compression(self, file_path: Path) -> bool:
+    def _should_use_gpu_compression(self, file_path: Path, resolution: Optional[Dict[str, Any]] = None) -> bool:
         """Decide si usar compresión GPU basado en historial y disponibilidad de hardware"""
         # Verifica si el hardware está disponible (test más completo)
         if not self._check_hardware_acceleration_available():
@@ -2232,6 +2577,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         if file_path.suffix.lower() == ".ts":
             self.logger.info(f"Usando CPU para {file_path.name}: formato .ts incompatible con VAAPI")
             return False
+
+        # Nota histórica: en un momento esta función descartaba GPU para
+        # contenido 10-bit y/o 4K/UHD, porque h264_vaapi no puede codificar
+        # superficies de 10-bit directamente ("No usable encoding profile
+        # found"). Se confirmó en pruebas reales que el fix correcto NO es
+        # evitar GPU, sino convertir a NV12 8-bit vía VPP antes de codificar
+        # (ver _build_ffmpeg_command: agrega -vf scale_vaapi=format=nv12
+        # cuando detecta pix_fmt de 10-bit). Con esa conversión, GPU
+        # codifica 4K + 10-bit sin problemas, así que ya no hace falta
+        # excluirlo aquí por ninguno de los dos motivos.
 
         # Archivos pequeños o con calidad ya baja van a CPU por eficiencia
         file_size_mb = file_path.stat().st_size / (1024 * 1024)
@@ -2560,7 +2915,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             f"RESUMEN: Procesados: {self.stats.files_processed}, "
             f"Comprimidos: {self.stats.files_compressed}, "
             f"Renombrados: {self.stats.files_renamed}, "
-            f"Omitidos: {self.stats.files_skipped}"
+            f"Omitidos: {self.stats.files_skipped}, "
+            f"Pospuestos por recursos: {self.stats.files_postponed}"
         )
 
         return self.stats
@@ -2577,11 +2933,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             error_msg = f"Error procesando {file_path}: {str(e)}"
             self.logger.error(error_msg)
             self._record_error(current_errors, file_path.name, error_msg)
-            self.processed_files[str(file_path)] = {
-                "status": "failed",
-                "timestamp": datetime.now().isoformat(),
-                "error": str(e),
-            }
+            self.processed_files[str(file_path)] = self._build_failed_entry(str(file_path), str(e))
 
     def _update_size_stats(self, result: dict) -> None:
         """Actualiza estadísticas de tamaño"""
@@ -2593,6 +2945,14 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         self, result: dict, file_path: Path, current_errors: list, current_no_spanish: list
     ) -> None:
         """Actualiza estadísticas desde el resultado de procesamiento"""
+        # Archivos pospuestos por falta de memoria/disco: no se marcan como
+        # éxito ni como fallo, se dejan intactos (sin tocar processed_files)
+        # para reintentarlos en el siguiente ciclo sin gastar un intento de
+        # la cuarentena de _should_remove_failed_file.
+        if result.get("postponed", False):
+            self.stats.files_postponed += 1
+            return
+
         # Incrementa contador de archivos procesados
         self.stats.files_processed += 1
 
@@ -2607,11 +2967,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         # Maneja errores
         if result.get("error"):
             self._record_error(current_errors, file_path.name, result["error"])
-            self.processed_files[str(file_path)] = {
-                "status": "failed",
-                "timestamp": datetime.now().isoformat(),
-                "error": result["error"],
-            }
+            self.processed_files[str(file_path)] = self._build_failed_entry(str(file_path), result["error"])
         else:
             self.processed_files[str(file_path)] = {"status": "success", "timestamp": datetime.now().isoformat()}
 
@@ -2738,9 +3094,6 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
     def cleanup_processed_files(self):
         """Limpia archivos procesados exitosamente del archivo pending"""
-        if not self.pending_file.exists():
-            return
-
         completed_files = self._load_completed_files()
 
         # Lee archivos pendientes actuales y filtra
@@ -2825,6 +3178,49 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         # 4. Archivo válido, mantener en pending
         return "keep"
 
+    @staticmethod
+    def _is_resource_failure(error: str) -> bool:
+        """True si el error es por falta de recursos (SIGKILL/OOM, timeout)
+        en vez de un problema real del archivo (códec corrupto, validación).
+        Estos fallos no deben consumir intentos de la cuarentena: ver
+        _build_failed_entry / _should_remove_failed_file.
+        """
+        return any(marker in error for marker in RESOURCE_FAILURE_MARKERS)
+
+    def _build_failed_entry(self, file_path: str, error: str) -> Dict:
+        """Construye la entrada de processed_files para un archivo que falló.
+
+        IMPORTANTE: preserva `first_failed_timestamp` de intentos anteriores (si existen)
+        y lleva la cuenta de `attempts`. Antes, `timestamp` se sobrescribía en cada intento
+        fallido, lo que reseteaba el reloj de 24h usado por `_should_remove_failed_file` y
+        provocaba que archivos que fallan SIEMPRE (cada corrida de cron) nunca se marcaran
+        como fallidos definitivamente, quedando en un bucle infinito de reintentos.
+
+        Los fallos por falta de recursos (OOM/timeout) NO incrementan `attempts`
+        ni fijan `first_failed_timestamp`: se marcan con `failure_type=resource`
+        para que _should_remove_failed_file los reintente indefinidamente en
+        vez de ponerlos en cuarentena por un problema que era del entorno, no
+        del archivo.
+        """
+        previous = self.processed_files.get(file_path, {})
+        was_failed = previous.get("status") == "failed"
+        first_failed = previous.get("first_failed_timestamp") if was_failed else None
+        attempts = previous.get("attempts", 0) if was_failed else 0
+
+        is_resource_failure = self._is_resource_failure(error)
+        if not is_resource_failure:
+            attempts += 1
+            first_failed = first_failed or datetime.now().isoformat()
+
+        return {
+            "status": "failed",
+            "timestamp": datetime.now().isoformat(),
+            "first_failed_timestamp": first_failed,
+            "attempts": attempts,
+            "error": error,
+            "failure_type": "resource" if is_resource_failure else "content",
+        }
+
     def _should_remove_failed_file(self, file_path: str, pending_path_obj: Path) -> bool:
         """Determina si un archivo fallido debe ser removido de pending"""
         if file_path not in self.processed_files or self.processed_files[file_path].get("status") != "failed":
@@ -2840,9 +3236,30 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Para otros formatos, verificar si han fallado recientemente
         failed_info = self.processed_files[file_path]
-        if "timestamp" in failed_info:
+
+        # Los fallos por falta de recursos (OOM/timeout) no cuentan para la
+        # cuarentena: se reintentan indefinidamente hasta que haya memoria o
+        # espacio suficiente, en vez de perderse por un problema del entorno.
+        if failed_info.get("failure_type") == "resource":
+            return False
+
+        attempts = failed_info.get("attempts", 1)
+
+        # Quarantine temprana: si ya falló 3 veces seguidas, no tiene sentido seguir
+        # gastando horas de GPU/CPU en él aunque no hayan pasado 24h todavía.
+        if attempts >= 3:
+            self.logger.warning(
+                f"Removiendo archivo fallido de pendientes tras {attempts} intentos consecutivos: {file_path}"
+            )
+            self._add_to_failed_files(file_path, failed_files_path, f"Falló {attempts} veces consecutivas")
+            return True
+
+        # Usar la marca de la PRIMERA falla (no la del último intento) para el chequeo de 24h;
+        # de lo contrario un archivo que falla en cada corrida nunca acumula 24h de antigüedad.
+        timestamp_key = "first_failed_timestamp" if "first_failed_timestamp" in failed_info else "timestamp"
+        if timestamp_key in failed_info:
             try:
-                failed_time = datetime.fromisoformat(failed_info["timestamp"])
+                failed_time = datetime.fromisoformat(failed_info[timestamp_key])
                 if (datetime.now() - failed_time).total_seconds() > 86400:  # 24 horas
                     self.logger.warning(f"Removiendo archivo fallido antiguo de pendientes: {file_path}")
                     self._add_to_failed_files(file_path, failed_files_path, "Falló múltiples veces")
@@ -2918,13 +3335,12 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
     def _check_all_pending_processed(self) -> None:
         """Verifica si todos los archivos pendientes ya están procesados y termina si es así"""
-        if not self.pending_file.exists():
-            self.logger.info("No existe archivo de pendientes")
-            return
-
-        # Lee archivos pendientes actuales
-        with open(self.pending_file, "r") as f:
-            pending_lines = [line.strip() for line in f if line.strip()]
+        # Lee archivos pendientes actuales desde la DB (fuente de verdad; el archivo
+        # pending-compression.txt es legacy y ya no lo escribe el scanner)
+        try:
+            pending_lines = [str(p) for p in get_pending_files()]
+        except Exception:
+            pending_lines = []
 
         if not pending_lines:
             self.logger.info("No hay archivos pendientes - todos procesados")
@@ -2966,7 +3382,13 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         if all_processed:
             self.logger.info(f"Todos los {len(pending_lines)} archivos pendientes ya están procesados - terminando")
-            # Limpia el archivo de pendientes ya que todos están procesados
+            # Limpia la cola de pendientes en la DB ya que todos están procesados
+            for pending_path in pending_lines:
+                try:
+                    remove_pending(pending_path)
+                except Exception:
+                    pass
+            # Compatibilidad: si el archivo legacy existiera, lo elimina también
             self.pending_file.unlink(missing_ok=True)
         else:
             remaining_count = len(pending_lines)
