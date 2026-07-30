@@ -241,3 +241,5 @@ yarn-debug.log*
 yarn-error.log*
 package-lock.json
 yarn.lock
+scripts/mediajelly_bot.session
+scripts/mediajelly_bot.session-journal
