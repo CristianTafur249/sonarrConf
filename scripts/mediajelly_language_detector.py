@@ -104,6 +104,7 @@ LOG_FILE_PATH = config.logging.language_detection_log
 REDIS_HOST = config.language_detection.redis_host
 REDIS_PORT = config.language_detection.redis_port
 REDIS_DB = config.language_detection.redis_db
+REDIS_PASSWORD = config.language_detection.redis_password
 CACHE_TTL = config.language_detection.cache_ttl_seconds
 
 LANGUAGE_CODE_MAP = config.language_detection.language_code_map
@@ -451,6 +452,7 @@ def get_redis_client():
             host=REDIS_HOST,
             port=REDIS_PORT,
             db=REDIS_DB,
+            password=REDIS_PASSWORD,
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2
