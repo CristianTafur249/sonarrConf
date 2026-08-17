@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Set, Optional
 import os
 import shutil
+try:
+    from mediajelly_config import get_config
+except Exception:
+    get_config = None
+
+_module_logger = logging.getLogger("mediajelly.utils")
 
 
 class MediaJellyPaths:
@@ -280,42 +286,60 @@ def create_compressed_rotating_file_handler(
     backup_count: int = 5,
     encoding: str = "utf-8",
 ) -> RotatingFileHandler:
-    """Crea un handler de logs con rotación comprimida."""
+    """Crea un handler de logs con rotación estándar y limpieza de backups.
+
+    La estrategia personalizada con `namer`/`rotator` (gzip manual) provocaba rollovers
+    inconsistentes y limpieza agresiva de archivos antiguos al mezclarse múltiples
+    handlers sobre el mismo nombre de log o al reutilizar los mismos archivos desde
+    varios procesos. Para evitarlo, usamos la implementación nativa de
+    `RotatingFileHandler` y dejamos la compresión para un tratamiento posterior
+    explícito (logrotate o gzip manual fuera del handler).
+    """
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding=encoding)
+    try:
+        handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count, encoding=encoding)
+    except Exception as exc:
+        _module_logger.warning(f"Fallo al crear RotatingFileHandler para '{log_file}': {exc}. Usando fallback simple.")
+        from logging import FileHandler
 
-    def namer(name: str) -> str:
-        return f"{name}.gz"
+        handler = FileHandler(log_file, encoding=encoding)
+        handler._mediajelly_fallback = True
 
-    def rotator(source: str, destination: str) -> None:
-        with open(source, "rb") as source_file, gzip.open(destination, "wb") as destination_file:
-            shutil.copyfileobj(source_file, destination_file)
-        os.remove(source)
+    # Deshabilitar `namer`/`rotator` para evitar rollover con nombres comprimidos
+    # no estándar ni limpieza de archivos en conflicto.
+    if hasattr(handler, "namer"):
+        handler.namer = None
+    if hasattr(handler, "rotator"):
+        handler.rotator = None
 
-    handler.namer = namer
-    handler.rotator = rotator
-
-    if log_file.exists() and log_file.stat().st_size >= max_bytes:
-        try:
+    try:
+        if log_file.exists() and log_file.stat().st_size >= max_bytes:
             handler.doRollover()
-        except Exception:
-            pass
+            _module_logger.info(f"Rollover forzado en '{log_file.name}' al iniciar por tamaño excedido")
+    except Exception as exc:
+        _module_logger.warning(f"No se pudo ejecutar rollover inicial para '{log_file}': {exc}")
 
     def cleanup_old_archives() -> None:
+        # Limpiar backups legacy generados por la implementación anterior (archivo.log.1.gz, etc.)
         archive_files = sorted(
-            [path for path in log_file.parent.glob(f"{log_file.name}.*.gz") if path.is_file()],
+            [path for path in log_file.parent.glob(f"{log_file.name}.*") if path.is_file() and path.suffix in {".1", ".2", ".3", ".4", ".5", ".gz", ".log"}],
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
         for old_archive in archive_files[backup_count:]:
             try:
                 old_archive.unlink()
-            except Exception:
-                pass
+                _module_logger.info(f"Backup antiguo eliminado: {old_archive.name}")
+            except Exception as exc:
+                _module_logger.warning(f"No se pudo eliminar backup antiguo '{old_archive}': {exc}")
 
-    cleanup_old_archives()
+    try:
+        cleanup_old_archives()
+    except Exception as exc:
+        _module_logger.warning(f"No se pudo limpiar backups antiguos de '{log_file}': {exc}")
+
     return handler
 
 
@@ -325,7 +349,14 @@ def archive_legacy_log_file(
     archive_name: Optional[str] = None,
     backup_count: int = 5,
 ) -> Optional[Path]:
-    """Comprime un log legado en una carpeta de archivo y limpia excedentes."""
+    """Comprime un log legado en una carpeta de archivo y limpia excedentes.
+
+    Antes, cualquier excepción durante el archivado (permisos, archivo en uso
+    por otro proceso escribiendo por redirección de shell, etc.) se tragaba
+    en silencio con `except Exception: return None`, por lo que si esta
+    función fallaba, el log legado (p. ej. `cron.log`) quedaba creciendo sin
+    límite para siempre sin que quedara ningún rastro del porqué.
+    """
 
     if not legacy_log_file.exists() or not legacy_log_file.is_file():
         return None
@@ -338,8 +369,25 @@ def archive_legacy_log_file(
     try:
         with open(legacy_log_file, "rb") as source_file, gzip.open(archive_file, "wb") as destination_file:
             shutil.copyfileobj(source_file, destination_file)
-        legacy_log_file.unlink()
-    except Exception:
+    except Exception as e:
+        _module_logger.error(
+            f"No se pudo comprimir el log legado '{legacy_log_file}': {e}"
+        )
+        return None
+
+    # Trunca in-place (equivalente a 'copytruncate' de logrotate) en vez de borrar+recrear.
+    # Esto es importante: si algo externo al proceso Python (p. ej. una redirección de
+    # shell '>> cron.log' en el entrypoint/cron del contenedor) mantiene el archivo abierto
+    # de forma persistente, un unlink() no libera nada — ese escritor seguiría escribiendo
+    # para siempre en el inodo ya borrado (invisible por su ruta, pero ocupando disco).
+    # Truncar el mismo inodo sí es visible para cualquier escritor que ya lo tenga abierto.
+    try:
+        with open(legacy_log_file, "r+b") as f:
+            f.truncate(0)
+    except Exception as e:
+        _module_logger.error(
+            f"Se comprimió pero no se pudo truncar '{legacy_log_file}' in-place: {e}"
+        )
         return None
 
     archive_files = sorted(
@@ -350,8 +398,8 @@ def archive_legacy_log_file(
     for old_archive in archive_files[backup_count:]:
         try:
             old_archive.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            _module_logger.warning(f"No se pudo eliminar archivo antiguo '{old_archive}': {e}")
 
     return archive_file
 
