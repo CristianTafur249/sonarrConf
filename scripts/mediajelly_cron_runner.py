@@ -142,6 +142,7 @@ class MediaJellyCron:
                                 cmdline = f.read().replace('\0', ' ').strip()
                             if "mediajelly_cron_runner.py" in cmdline:
                                 print(f"Otra instancia del cron runner ya está ejecutándose (PID: {pid}). Saliendo...")
+                                self.logger.info(f"Lock file existente con PID {pid} y cmdline: {cmdline}")
                                 print(f"Comando: {cmdline}")
                                 sys.exit(1)
                             else:
@@ -166,7 +167,7 @@ class MediaJellyCron:
         log_path = self.tmp_path / "logs"
         log_path.mkdir(parents=True, exist_ok=True)
 
-        legacy_log = self.scripts_path / "logs" / "cron.log"
+        legacy_log = self.tmp_path / "logs" / "cron.log"
         archive_legacy_log_file(legacy_log, log_path, archive_name="cron.log", backup_count=5)
 
         try:
