@@ -3,7 +3,6 @@
 # MediaJelly Hybrid Docker Entrypoint
 # Permite alternar entre versión Bash y Python
 
-# Funciones para generar emojis
 get_rocket() { echo "🚀"; }
 get_calendar() { echo "📅"; }
 get_gear() { echo "🔧"; }
@@ -21,12 +20,24 @@ get_magnifying_glass() { echo "🔍"; }
 echo "$(get_rocket) Iniciando MediaJelly Hybrid Service..."
 echo "$(get_calendar) $(date '+%Y-%m-%d %H:%M:%S')"
 
-# Verificar que los directorios existen con permisos correctos
-echo "$(get_gear) Configurando directorios y permisos..."
-mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp
-chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp
+# Ajustar propiedad del volumen en tiempo de ejecución al UID/GID especificado
+chown -R ${PUID:-1000}:${PGID:-1000} /mediajelly/scripts /mediajelly/config 2>/dev/null || true
 
-# Limpiar archivos de lock antiguos que puedan causar problemas
+echo "$(get_gear) Configurando directorios y permisos..."
+mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp /mediajelly/scripts/tmp/logs
+chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp /mediajelly/scripts/tmp/logs
+
+touch /mediajelly/scripts/tmp/logs/cron.log 2>/dev/null || true
+
+if [ -f /mediajelly/config/logrotate-mediajelly ]; then
+    cp /mediajelly/config/logrotate-mediajelly /etc/logrotate.d/mediajelly
+    chmod 644 /etc/logrotate.d/mediajelly
+    if command -v logrotate >/dev/null 2>&1; then
+        logrotate -d /etc/logrotate.d/mediajelly 2>/dev/null || true
+    fi
+fi
+
+# Limpiar archivos de lock antiguos
 rm -f /mediajelly/scripts/tmp/*.lock
 
 # Detectar modo de operación
@@ -35,44 +46,36 @@ echo "$(get_gear) Modo de operación: $MODE"
 
 if [ "$MODE" = "python" ]; then
     echo "$(get_snake) Configurando modo Python..."
-    # Instalar crontab Python
-    crontab -u mediauser /etc/cron.d/mediajelly-python
-    echo "$(get_clipboard) Configuración de cron Python:"
-    crontab -l -u mediauser
+    # Instalar crontab desde el sistema
+    cp /etc/cron.d/mediajelly-python /etc/cron.d/mediajelly-active
+    chmod 644 /etc/cron.d/mediajelly-active
+
     echo "$(get_magnifying_glass) Verificando scripts Python..."
     ls -la /mediajelly/scripts/*.py
-    # Dar permisos de ejecución a scripts Python
     chmod +x /mediajelly/scripts/*.py
+
     echo "$(get_test_tube) Probando imports Python..."
     python3 -c "import requests, psutil; print('$(get_check_mark) Dependencias Python OK')"
 
-    # Bot interactivo de Telegram (long-polling, proceso de fondo de larga duración).
-    # Es independiente del cron: solo responde consultas de estado, no procesa videos.
+    # Bot interactivo de Telegram (ejecutado con gosu sin interactividad de contraseña)
     if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
         echo "$(get_rocket) Iniciando bot interactivo de Telegram en segundo plano..."
         cd /mediajelly/scripts
-        su -s /bin/bash -c "python3 mediajelly_telegram_bot.py >> /mediajelly/scripts/tmp/logs/telegram_bot.log 2>&1 &" mediauser
+        gosu mediauser python3 mediajelly_telegram_bot.py >> /mediajelly/scripts/tmp/logs/telegram_bot.log 2>&1 &
     else
         echo "$(get_warning) TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no configurados: bot interactivo deshabilitado"
     fi
 
 else
-    echo "$(get_scroll) Configurando modo Bash (por defecto)..."
-    
-    # Instalar crontab Bash
-    crontab -u mediauser /etc/cron.d/mediajelly
-    
-    echo "$(get_clipboard) Configuración de cron Bash:"
-    crontab -l -u mediauser
-    
+    echo "$(get_scroll) Configurando modo Bash..."
+    cp /etc/cron.d/mediajelly /etc/cron.d/mediajelly-active
+    chmod 644 /etc/cron.d/mediajelly-active
+
     echo "$(get_magnifying_glass) Verificando scripts Bash..."
     ls -la /mediajelly/scripts/*.sh
-    
-    # Dar permisos de ejecución a scripts Bash
     chmod +x /mediajelly/scripts/*.sh
 fi
 
-# Verificar hardware acceleration
 echo "$(get_clapper) Verificando aceleración por hardware..."
 if [ -e /dev/dri/renderD128 ]; then
     echo "$(get_check_mark) Hardware acceleration disponible"

@@ -1,50 +1,97 @@
-# Dockerfile híbrido para MediaJelly
 FROM ubuntu:22.04
 
+# Argumentos para personalizar la instalación
 ARG DEBIAN_FRONTEND=noninteractive
+ARG PIP_DEFAULT_TIMEOUT=1000
+ARG TZ=UTC
 
-# Configuración completa del sistema
-ENV TZ=America/Bogota
+# Argumentos para el UID/GID dinámico
+ARG PUID=1000
+ARG PGID=1000
 
+# Variables de entorno para Python
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONOPTIMIZE=2 \
+    PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT} \
+    TZ=${TZ}
+
+# Instalar dependencias del sistema (se añade gosu)
 RUN apt-get update && apt-get install -y \
     cron \
     curl \
     ffmpeg \
-    intel-media-va-driver \
+    gosu \
+    intel-media-va-driver-non-free \
+    va-driver-all \
+    mesa-va-drivers \
     python3 \
     python3-pip \
+    python3-dev \
+    python3-venv \
     tzdata \
-    vainfo \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -snf /usr/share/zoneinfo/"$TZ" /etc/localtime && echo "$TZ" > /etc/timezone \
-    && groupadd -g 992 render \
-    && useradd -m -s /bin/bash -G video,render mediauser \
-    && mkdir -p /mediajelly/scripts/logs /mediajelly/scripts/tmp \
-    && chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp \
-    && chown -R mediauser:mediauser /mediajelly
+    && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo ${TZ} > /etc/timezone \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear grupo y usuario con el UID/GID configurado por argumentos
+RUN groupadd -g ${PGID} mediauser || groupadd mediauser && \
+    useradd -u ${PUID} -g ${PGID} -m -d /mediajelly mediauser
+
+# Configurar directorios con permisos correctos
+RUN mkdir -p /mediajelly/scripts /mediajelly/config /mediajelly/media && \
+    chown -R ${PUID}:${PGID} /mediajelly
+
+# Copiar requirements y scripts
+COPY requirements.txt /tmp/requirements.txt
+
+# Copiar entrypoint y crontabs. NOTA sobre doble crontab: docker-entrypoint-hybrid.sh
+# activa solo UNO de los dos según MEDIAJELLY_MODE (mediajelly-python en modo
+# "python", que es el default en docker-compose.yaml; mediajelly en modo
+# "bash", legacy). No hay doble disparo: config/crontab.example está
+# íntegramente comentado (no define ningún job), así que el modo bash, si
+# alguna vez se activa, simplemente no ejecuta nada.
+COPY docker-entrypoint-hybrid.sh /docker-entrypoint.sh
+COPY config/crontab-python /etc/cron.d/mediajelly-python
+COPY config/crontab.example /etc/cron.d/mediajelly
+
+# Dar permisos de ejecución y ajustar crontabs del sistema
+RUN chmod +x /docker-entrypoint.sh && \
+    chmod 644 /etc/cron.d/mediajelly-python && \
+    chmod 644 /etc/cron.d/mediajelly
 
 # Instalar dependencias de Python
-COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --default-timeout=100 \
+    requests>=2.31.0 \
+    psutil>=5.9.0 \
+    translatepy>=2.3 \
+    langdetect>=1.0.9 \
+    PyYAML>=6.0 \
+    telethon>=1.34.0 \
+    redis>=5.0.0 \
+    numpy>=1.24.0,<2.0.0
 
-# Copiar scripts y configuraciones
-COPY config/crontab.example /etc/cron.d/mediajelly
-COPY config/crontab-python /etc/cron.d/mediajelly-python
-COPY scripts/*.py /mediajelly/scripts/
-COPY scripts/*.sh /mediajelly/scripts/
-COPY docker-entrypoint-hybrid.sh /usr/local/bin/
+RUN pip3 install --no-cache-dir --default-timeout=1000 \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch>=2.0.0,<2.2.0 \
+    torchaudio>=2.0.0,<2.2.0
 
-# Configurar permisos finales
-RUN chmod 0644 /etc/cron.d/mediajelly* \
-    && chmod +x /mediajelly/scripts/*.py \
-    && chmod +x /mediajelly/scripts/*.sh \
-    && chmod +x /usr/local/bin/docker-entrypoint-hybrid.sh \
-    && chmod 777 /mediajelly/scripts/logs /mediajelly/scripts/tmp
+RUN pip3 install --no-cache-dir --default-timeout=100 \
+    openai-whisper>=20231117
 
-# Variables de entorno por defecto
-ENV MEDIAJELLY_MODE=python
-ENV PYTHONUNBUFFERED=1
+RUN pip3 cache purge
 
-# Punto de entrada híbrido
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint-hybrid.sh"]
+# Copiar scripts
+COPY scripts/ /mediajelly/scripts/
+
+# Establecer permisos finales
+RUN chown -R ${PUID}:${PGID} /mediajelly && \
+    chmod +x /mediajelly/scripts/*.py 2>/dev/null || true && \
+    chmod +x /mediajelly/scripts/*.sh 2>/dev/null || true
+
+# IMPORTANTE: Mantener en usuario root para la inicialización (entrypoint)
+USER root
+
+WORKDIR /mediajelly/scripts
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
