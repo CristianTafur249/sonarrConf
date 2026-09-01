@@ -1,35 +1,22 @@
 # MediaJelly - Python Dependencies
-# Actualizado: 11 de noviembre de 2025
+# Actualizado: 24 de agosto de 2026
+# NOTA: PyTorch y torchaudio se instalan por separado en el Dockerfile
 
-# Core dependencies
+# Core
 requests>=2.31.0
 psutil>=5.9.0
 
-# Translation and language detection
-translatepy>=2.3
-# Translation and language detection
+# Traducción y detección de idiomas
 translatepy>=2.3
 langdetect>=1.0.9
 PyYAML>=6.0
 
-
-# AI/ML - Whisper for language detection
+# Whisper (detección de idioma) - PyTorch instalado por separado
 openai-whisper>=20231117
-torch>=2.0.0,<2.2.0
-torchaudio>=2.0.0,<2.2.0
 numpy>=1.24.0,<2.0.0
 
-# Dashboard Web - FastAPI (Tarea 16) - Flask Web Interface eliminada - API REST eliminada
-# fastapi>=0.104.0 - eliminado
-# uvicorn[standard]>=0.24.0 - eliminado
-# python-multipart>=0.0.6 - eliminado
-# jinja2>=3.1.2 - eliminado
+# Telethon (descarga de archivos grandes)
+telethon>=1.34.0
 
-# Monitoring - Prometheus client (Tarea 17) - métricas eliminadas
-# prometheus-client>=0.19.0 - eliminado
-
-# Caching - Redis for language detection cache (Tarea 18)
+# Redis (caché)
 redis>=5.0.0
-
-# Optional: For better performance
-# numba>=0.57.0  # Uncomment if needed for audio processing optimization
