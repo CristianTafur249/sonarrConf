@@ -24,6 +24,22 @@ from typing import Any, Dict, Optional
 
 from mediajelly_emoji import EmojiGenerator
 
+# Importaciones opcionales con manejo de errores
+try:
+    import whisper  # type: ignore
+
+    WHISPER_AVAILABLE = True
+except ImportError:
+    whisper = None
+    WHISPER_AVAILABLE = False
+
+# Path to whisper.cpp binary if compiled in the image
+WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
+
+import threading
+
+# Lock global para Whisper (solo un proceso a la vez)
+whisper_lock = threading.Lock()
 
 class WhisperAudioExtractorMixin:
     """Extracción de subtítulos desde audio mediante transcripción con Whisper."""

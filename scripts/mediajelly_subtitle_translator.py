@@ -35,6 +35,10 @@ try:
 except ImportError:
     MediaJellyConfig = None
     CONFIG_AVAILABLE = False
+try:
+    from mediajelly_config import get_config
+except Exception:
+    get_config = None
 
 # Importaciones opcionales con manejo de errores
 try:
