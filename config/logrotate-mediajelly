@@ -6,7 +6,7 @@
     delaycompress
     missingok
     notifempty
-    create 0644
+    create 0644 mediauser mediauser
     sharedscripts
     postrotate
         find /home/tafur/mediaJelly/scripts/tmp/logs /mediajelly/scripts/tmp/logs -type f -name '*.log.*.gz' -mtime +30 -delete 2>/dev/null || true

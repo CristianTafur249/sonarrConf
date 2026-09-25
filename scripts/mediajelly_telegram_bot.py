@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import time
 import traceback
@@ -59,6 +60,7 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
 from telethon import TelegramClient, events, Button
+from telethon.errors import QueryIdInvalidError
 
 from mediajelly_emoji import EmojiGenerator
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
@@ -79,6 +81,16 @@ TELEGRAM_MESSAGE_LIMIT = 3500
 
 UPLOAD_DIR = Path(__file__).parent / "tmp" / "telegram_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Cantidad de msg_id ya descargados que se recuerdan para no descargar dos veces
+# el mismo archivo (p. ej. cola persistida + catch-up de Telegram al reiniciar).
+MAX_PROCESSED_MSGS = 500
+
+# Backoff del bucle de reinicio en main() cuando se pierde la conexión.
+RESTART_DELAY_MIN = 10
+RESTART_DELAY_MAX = 300
+
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 
 def load_config():
@@ -146,6 +158,7 @@ class UserSession:
     base_type: Optional[str] = None           # movie o series (para el paso intermedio)
     raw_title: Optional[str] = None
     selected_folder: Optional[str] = None
+    pending_matches: List[str] = field(default_factory=list)
     season: Optional[int] = None
     episode: Optional[int] = None
     step: str = "idle"
@@ -172,6 +185,8 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
 
         self.pending_file_db = self.tmp_dir / "pending_telegram_uploads.json"
         self.queue_file_db = self.tmp_dir / "download_queue_persist.json"
+        self.processed_msgs_db = self.tmp_dir / "processed_telegram_msgs.json"
+        self.processed_msgs: Deque[str] = self._load_processed_msgs()
 
         self.pending_uploads: Dict[str, Deque[PendingItem]] = {}
         self.processing_chats: set[str] = set()
@@ -185,8 +200,20 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
         self._recovered_already = False
 
         self.sessions: Dict[str, UserSession] = {}
+        self._background_task: Optional[asyncio.Task] = None
 
-        self.client = TelegramClient('mediajelly_bot', API_ID, API_HASH).start(bot_token=self.bot_token)
+        # El cliente se conecta en run_forever(), después de registrar los handlers,
+        # para que las actualizaciones recuperadas por catch_up (mensajes enviados
+        # mientras el bot estaba apagado, Telegram las guarda ~24 h) no se pierdan.
+        # connection_retries=None: reintenta indefinidamente en vez de morir tras 5.
+        self.client = TelegramClient(
+            'mediajelly_bot', API_ID, API_HASH,
+            catch_up=True,
+            connection_retries=None,
+            retry_delay=5,
+            auto_reconnect=True,
+            request_retries=10,
+        )
 
     def _setup_logging(self) -> logging.Logger:
         logger = logging.getLogger("mediajelly_telegram_bot")
@@ -290,17 +317,36 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
         except Exception as e:
             self.logger.error(f"Error guardando pending_uploads: {e}")
 
-    # ============================================================
-    # MODIFICACIÓN: _save_queue_to_disk (no sobrescribe con [])
-    # ============================================================
-    def _save_queue_to_disk(self) -> None:
+    def _load_processed_msgs(self) -> Deque[str]:
         try:
-            # Si no hay tareas, no borrar el archivo (solo actualizar timestamp)
-            if not self.download_queue_list:
-                if self.queue_file_db.exists():
-                    self.queue_file_db.touch()  # actualiza timestamp pero no contenido
-                return
+            if self.processed_msgs_db.exists():
+                with open(self.processed_msgs_db, "r", encoding="utf-8") as f:
+                    return deque(json.load(f), maxlen=MAX_PROCESSED_MSGS)
+        except Exception as e:
+            self.logger.warning(f"Error cargando mensajes procesados: {e}")
+        return deque(maxlen=MAX_PROCESSED_MSGS)
 
+    def _mark_msg_processed(self, chat_id: int, msg_id: int) -> None:
+        key = f"{chat_id}:{msg_id}"
+        if key in self.processed_msgs:
+            return
+        self.processed_msgs.append(key)
+        try:
+            with open(self.processed_msgs_db, "w", encoding="utf-8") as f:
+                json.dump(list(self.processed_msgs), f)
+        except Exception as e:
+            self.logger.error(f"Error guardando mensajes procesados: {e}")
+
+    def _is_known_msg(self, chat_id: int, msg_id: int) -> bool:
+        """True si el mensaje ya se descargó o ya está en la cola de descargas."""
+        if f"{chat_id}:{msg_id}" in self.processed_msgs:
+            return True
+        return any(t.chat_id == chat_id and t.msg_id == msg_id for t in self.download_queue_list)
+
+    def _save_queue_to_disk(self) -> None:
+        # Se escribe siempre, incluso la lista vacía: si no, la última tarea
+        # completada quedaría persistida y se re-encolaría al reiniciar.
+        try:
             data = [
                 {
                     "chat_id": task.chat_id,
@@ -549,10 +595,25 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
         async def on_callback(event):
             await self._handle_callback(event)
 
-        loop = asyncio.get_event_loop()
-        loop.create_task(self._init_bot_background())
+        self.client.start(bot_token=self.bot_token)
 
-        self.client.run_until_disconnected()
+        loop = asyncio.get_event_loop()
+        # Desconexión limpia ante `stop`/`restart` (telegram_bot_ctl.sh): Telethon
+        # guarda así el estado de actualizaciones y no se pierden mensajes.
+        try:
+            loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(self.client.disconnect()))
+        except (NotImplementedError, RuntimeError):
+            pass
+        self._background_task = loop.create_task(self._init_bot_background())
+
+        try:
+            self.client.run_until_disconnected()
+        finally:
+            self._background_task.cancel()
+            try:
+                loop.run_until_complete(self._background_task)
+            except BaseException:
+                pass
 
     async def _init_bot_background(self) -> None:
         await self._recover_pending_queue()
@@ -627,6 +688,7 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
 
         # ========== GUARDAR COLA ANTES DE PROCESAR ==========
         # Descarga verificada: eliminar de la lista y guardar persistencia
+        self._mark_msg_processed(task.chat_id, task.msg_id)
         if task in self.download_queue_list:
             self.download_queue_list.remove(task)
         self._save_queue_to_disk()  # Guarda el estado (si queda vacía, solo toca el archivo)
@@ -726,6 +788,12 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
             self.logger.info(f"Auto-organización no concluyente para '{clean_title}', se deja para manual.")
             return None
 
+        except PermissionError as e:
+            self.logger.warning(
+                f"Auto-organización sin permisos ({e}); se deja para /organize. "
+                f"Revisa el propietario de la carpeta destino (debe ser uid {os.getuid()})."
+            )
+            return None
         except Exception as e:
             self.logger.error(f"Error en auto-organización de serie: {e}\n{traceback.format_exc()}")
             return None
@@ -770,6 +838,10 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
 
         # Recepción de archivos multimedia
         if event.message.media:
+            if self._is_known_msg(chat_id, event.message.id):
+                self.logger.info(f"Mensaje {event.message.id} ya descargado o en cola; se ignora.")
+                return
+
             caption_text = event.message.message.strip() if event.message.message else ""
             file_name = event.message.file.name if event.message.file and event.message.file.name else ""
 
@@ -1028,6 +1100,8 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
         # Obtener la ruta base para mostrar en el mensaje
         base_path = self._get_base_folder(session.media_type)
 
+        session.pending_matches = matches
+
         if matches:
             text = (
                 f"🔎 **Confirmación de Carpeta**\n\n"
@@ -1035,12 +1109,11 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
                 f"Nombre sugerido: `{session.raw_title}`\n"
                 f"Encontramos coincidencias en `{base_path}`. ¿A cuál corresponde?"
             )
-            for match_name in matches:
-                cb_data = f"use_exist_{match_name}".encode('utf-8')[:64]
+            for index, match_name in enumerate(matches):
+                cb_data = f"use_exist_{index}".encode('utf-8')
                 buttons.append([Button.inline(f"📂 Usar: {match_name}", cb_data)])
 
-            cb_new = f"use_new_{session.raw_title}".encode('utf-8')[:64]
-            buttons.append([Button.inline(f"🆕 Crear nueva carpeta: \"{session.raw_title}\"", cb_new)])
+            buttons.append([Button.inline(f"🆕 Crear nueva carpeta: \"{session.raw_title}\"", b"use_new")])
         else:
             text = (
                 f"📁 **Confirmación de Carpeta**\n\n"
@@ -1049,8 +1122,7 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
                 f"📂 `{base_path / session.raw_title}/`\n\n"
                 f"¿Es correcto o deseas cambiar el nombre?"
             )
-            cb_new = f"use_new_{session.raw_title}".encode('utf-8')[:64]
-            buttons.append([Button.inline(f"✅ Sí, crear/usar \"{session.raw_title}\"", cb_new)])
+            buttons.append([Button.inline(f"✅ Sí, crear/usar \"{session.raw_title}\"", b"use_new")])
 
         buttons.append([Button.inline("✏️ Corregir / Cambiar nombre", b"edit_title")])
         buttons.append([Button.inline("❌ Cancelar este archivo", b"cancel")])
@@ -1083,19 +1155,32 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
         ]
         await self._update_session_message(chat_id, text, buttons=buttons)
 
+    async def _safe_answer(self, event, *args, **kwargs) -> None:
+        # Si el usuario pulsa un botón y el bot tarda (o estaba caído), Telegram
+        # invalida el query_id; no es un error real.
+        try:
+            await event.answer(*args, **kwargs)
+        except QueryIdInvalidError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"No se pudo responder al callback: {e}")
+
     async def _handle_callback(self, event):
         chat_id_str = str(event.chat_id)
         data = event.data.decode('utf-8')
+
+        session = self.sessions.get(chat_id_str)
+        if not session and data != "cancel":
+            await self._safe_answer(event, "Sesión expirada o no encontrada.", alert=True)
+            return
+        # Responder de inmediato: así event.edit() no lanza su propio answer()
+        # en segundo plano (origen de los "Task exception was never retrieved").
+        await self._safe_answer(event)
 
         if data == "cancel":
             self._clean_session(chat_id_str)
             await self._release_processing(chat_id_str)
             await event.edit(f"{EmojiGenerator.check_mark()} Omitido este archivo. Pasando al siguiente si existe...")
-            return
-
-        session = self.sessions.get(chat_id_str)
-        if not session:
-            await event.answer("Sesión expirada o no encontrada.", alert=True)
             return
 
         # Paso 1: elección de tipo base (película o serie)
@@ -1146,8 +1231,12 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
                 await event.edit(prompt)
 
         # Selección de carpeta existente o nueva
-        elif data.startswith("use_exist_") or data.startswith("use_new_"):
-            selected_folder = data[10:] if data.startswith("use_exist_") else data[8:]
+        elif data.startswith("use_exist_") or data == "use_new":
+            if data == "use_new":
+                selected_folder = session.raw_title
+            else:
+                index = int(data[len("use_exist_"):])
+                selected_folder = session.pending_matches[index]
             session.selected_folder = selected_folder
 
             if session.media_type in ("movie", "anime_movie"):
@@ -1219,6 +1308,18 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
                 f"📂 **Ubicación:** `{dest_file}`\n"
                 f"📌 Agregado a la cola de compresión y subtítulos."
             )
+        except PermissionError as e:
+            blocked = Path(e.filename) if e.filename else None
+            self.logger.error(f"Sin permisos moviendo archivo: {e}")
+            await self._release_processing(chat_id_str)
+            await event.edit(
+                f"{EmojiGenerator.error()} **Sin permisos de escritura**\n\n"
+                f"`{blocked or e}` pertenece a otro usuario (probablemente se creó como root "
+                f"desde Samba u otro servicio).\n\n"
+                f"Se corrige automáticamente en ≤15 min, o ejecuta en el servidor:\n"
+                f"`sudo chown -R {os.getuid()}:{os.getgid()} \"{blocked.parent if blocked else ''}\"`\n\n"
+                f"Luego usa /retry_organize."
+            )
         except Exception as e:
             self.logger.error(f"Error moviendo archivo: {e}\n{traceback.format_exc()}")
             await self._release_processing(chat_id_str)
@@ -1249,8 +1350,32 @@ class MediaJellyTelegramBot(FilenameNormalizerMixin):
 
 
 def main():
-    bot = MediaJellyTelegramBot()
-    bot.run_forever()
+    # Si la red cae más allá de lo que Telethon reintenta por su cuenta, se
+    # recrea el bot con backoff en lugar de terminar el proceso.
+    delay = RESTART_DELAY_MIN
+    while True:
+        bot = None
+        started = time.time()
+        try:
+            bot = MediaJellyTelegramBot()
+            bot.run_forever()
+            # Retorno limpio: desconexión pedida (SIGTERM desde telegram_bot_ctl.sh).
+            logging.getLogger("mediajelly_telegram_bot").info("Bot detenido.")
+            return
+        except KeyboardInterrupt:
+            return
+        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+            logger = logging.getLogger("mediajelly_telegram_bot")
+            if time.time() - started > 600:
+                delay = RESTART_DELAY_MIN
+            logger.error(f"Conexión con Telegram perdida ({e}); reintentando en {delay}s...")
+            if bot is not None:
+                try:
+                    bot.client.loop.run_until_complete(bot.client.disconnect())
+                except Exception:
+                    pass
+            time.sleep(delay)
+            delay = min(delay * 2, RESTART_DELAY_MAX)
 
 
 if __name__ == "__main__":
