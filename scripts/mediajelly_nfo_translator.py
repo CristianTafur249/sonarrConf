@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 MediaJelly NFO Translator
-Traduce archivos .nfo que no están en español al español
+Traduce al español los textos descriptivos (sinopsis, lema, reseña) de los .nfo.
+Solo revisa los archivos nuevos o modificados desde la última ejecución.
 Soporta procesamiento en paralelo
 """
 
@@ -12,14 +13,15 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
-import subprocess
 import json
 import hashlib
 
 # Importaciones opcionales con manejo de errores
 try:
-    from langdetect import detect as langdetect_detect
+    from langdetect import DetectorFactory, detect as langdetect_detect
+
+    # Sin semilla langdetect no es determinista y el mismo texto cambia de idioma entre ejecuciones
+    DetectorFactory.seed = 0
     LANGDETECT_AVAILABLE = True
 except ImportError:
     langdetect_detect = None
@@ -34,44 +36,79 @@ except ImportError:
 
 from mediajelly_emoji import EmojiGenerator
 
-# Configuración de logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
 logger = logging.getLogger(__name__)
 
+# Únicas etiquetas con texto libre que tiene sentido traducir. El resto del .nfo son
+# datos técnicos (codec, watched, language, URLs...) y nombres propios que no deben tocarse.
+TRANSLATABLE_TAGS = {"plot", "outline", "tagline", "review", "biography"}
+
+
 class NFOTranslator:
-    def __init__(self):
+    def __init__(self, tmp_dir: Optional[Path] = None):
         if not LANGDETECT_AVAILABLE:
             raise ImportError("langdetect no está disponible. Instala con: pip install langdetect")
         if not TRANSLATE_AVAILABLE:
             raise ImportError("translatepy no está disponible. Instala con: pip install translatepy")
 
         self.translator = Translator()
+        # langdetect carga sus perfiles en el primer uso y esa carga no es segura entre
+        # hilos ("Need to load profiles"): forzarla aquí, antes de lanzar los workers
+        try:
+            langdetect_detect("texto de calentamiento")
+        except Exception:
+            pass
         # Cache de traducciones
-        self.cache_file = Path("/mediajelly/scripts/tmp/nfo_translation_cache.json")
+        tmp_dir = Path(tmp_dir) if tmp_dir else Path("/mediajelly/scripts/tmp")
+        self.cache_file = tmp_dir / "nfo_translation_cache.json"
         self.cache = self.load_cache()
+        # Archivos ya revisados: {ruta: [mtime_ns, size]}. Mientras no cambien, no se vuelven a parsear
+        self.state_file = tmp_dir / "nfo_state.json"
+        self.state = self._load_json(self.state_file)
 
-    def load_cache(self):
-        """Carga el cache de traducciones"""
-        if self.cache_file.exists():
+    @staticmethod
+    def _load_json(path: Path) -> dict:
+        """Carga un JSON de estado; devuelve {} si no existe o está dañado"""
+        if path.exists():
             try:
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception:
                 return {}
         return {}
 
-    def save_cache(self):
-        """Guarda el cache de traducciones"""
+    @staticmethod
+    def _save_json(path: Path, data: dict, indent: Optional[int] = None) -> None:
+        """Guarda un JSON de estado de forma atómica"""
         try:
-            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(self.cache, f, ensure_ascii=False, indent=2)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=indent)
+            os.replace(tmp_path, path)
         except Exception as e:
-            logger.warning(f"Error guardando cache: {e}")
+            logger.warning(f"Error guardando {path.name}: {e}")
+
+    def load_cache(self):
+        """Carga el cache de traducciones"""
+        return self._load_json(self.cache_file)
+
+    def save_cache(self):
+        """Guarda el cache de traducciones y el estado de archivos revisados"""
+        self._save_json(self.cache_file, self.cache, indent=2)
+        self._save_json(self.state_file, self.state)
+
+    @staticmethod
+    def _file_signature(nfo_path: Path) -> List[int]:
+        """Firma de un archivo para detectar cambios: [mtime_ns, size]"""
+        stat = nfo_path.stat()
+        return [stat.st_mtime_ns, stat.st_size]
+
+    def is_unchanged(self, nfo_path: Path) -> bool:
+        """Indica si el archivo ya fue revisado y no ha cambiado desde entonces"""
+        try:
+            return self.state.get(str(nfo_path)) == self._file_signature(nfo_path)
+        except OSError:
+            return False
 
     def get_cache_key(self, text: str, target_lang: str = 'es') -> str:
         """Genera clave de cache para el texto"""
@@ -95,8 +132,8 @@ class NFOTranslator:
             logger.warning(f"Error detectando idioma: {e}")
             return 'unknown'
 
-    def translate_text(self, text: str, target_lang: str = 'es') -> str:
-        """Traduce el texto al idioma objetivo con cache"""
+    def translate_text(self, text: str, target_lang: str = 'es') -> Optional[str]:
+        """Traduce el texto al idioma objetivo con cache. Devuelve None si la traducción falla"""
         cache_key = self.get_cache_key(text, target_lang)
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -108,86 +145,63 @@ class NFOTranslator:
             return translated
         except Exception as e:
             logger.warning(f"Error traduciendo texto: {e}")
-            return text
+            return None
 
     def should_translate_element(self, element: ET.Element) -> bool:
         """Determina si un elemento XML debe ser traducido"""
-        # No traducir títulos, nombres, IDs, etc.
-        non_translate_tags = {
-            'title', 'name', 'filename', 'path', 'id', 'uniqueid',
-            'season', 'episode', 'aired', 'premiered', 'rating',
-            'mpaa', 'genre', 'status', 'studio', 'episodeguide'
-        }
-
-        return element.tag.lower() not in non_translate_tags and element.text and element.text.strip()
+        if not isinstance(element.tag, str) or element.tag.lower() not in TRANSLATABLE_TAGS:
+            return False
+        return bool(element.text and element.text.strip())
 
     def process_nfo_file(self, nfo_path: Path) -> bool:
-        """Procesa un archivo .nfo individual"""
+        """Procesa un archivo .nfo individual. Devuelve True si se modificó"""
         try:
             # Parsear XML
             tree = ET.parse(nfo_path)
             root = tree.getroot()
 
             modified = False
+            complete = True
 
             # Recorrer todos los elementos
             for elem in root.iter():
                 if self.should_translate_element(elem):
                     text = elem.text.strip()
-                    if text:
-                        lang = self.detect_language(text)
-                        if lang != 'es' and lang != 'unknown':
-                            logger.info(f"Traduciendo {nfo_path.name}: {elem.tag} ({lang} -> es)")
-                            translated = self.translate_text(text)
+                    lang = self.detect_language(text)
+                    if lang != 'es' and lang != 'unknown':
+                        logger.debug(f"Traduciendo {nfo_path.name}: {elem.tag} ({lang} -> es)")
+                        translated = self.translate_text(text)
+                        if translated is None:
+                            # Fallo de red: reintentar este archivo en la próxima ejecución
+                            complete = False
+                        elif translated != text:
                             elem.text = translated
                             modified = True
 
             if modified:
                 # Guardar el archivo modificado
                 tree.write(nfo_path, encoding='utf-8', xml_declaration=True)
-                logger.info(f"Archivo actualizado: {nfo_path}")
-                return True
-            else:
-                logger.info(f"No se modificó: {nfo_path}")
-                return False
+                logger.debug(f"Archivo actualizado: {nfo_path}")
 
+            if complete:
+                self.state[str(nfo_path)] = self._file_signature(nfo_path)
+            return modified
+
+        except ET.ParseError as e:
+            # XML inválido: no tiene arreglo hasta que el archivo cambie, no reintentar cada ciclo
+            logger.warning(f"NFO con XML inválido, se omite: {nfo_path}: {e}")
+            try:
+                self.state[str(nfo_path)] = self._file_signature(nfo_path)
+            except OSError:
+                pass
+            return False
         except Exception as e:
             logger.error(f"Error procesando {nfo_path}: {e}")
             return False
 
-    def is_file_spanish(self, nfo_path: Path) -> bool:
-        """Verifica si el archivo ya está mayoritariamente en español"""
-        try:
-            tree = ET.parse(nfo_path)
-            root = tree.getroot()
-            spanish_count = 0
-            total_count = 0
-
-            for elem in root.iter():
-                if self.should_translate_element(elem):
-                    text = elem.text.strip()
-                    if text and len(text) > 10:  # Solo textos significativos
-                        lang = self.detect_language(text)
-                        total_count += 1
-                        if lang == 'es':
-                            spanish_count += 1
-
-            # Si más del 80% está en español, considerarlo español
-            if total_count > 0 and spanish_count / total_count > 0.8:
-                return True
-            return False
-        except Exception:
-            return False
-
     def find_nfo_files(self, base_path: Path) -> List[Path]:
-        """Encuentra todos los archivos .nfo en el directorio, filtrando los ya en español"""
-        nfo_files = []
-        for nfo_file in base_path.rglob('*.nfo'):
-            if self.is_file_spanish(nfo_file):
-                logger.info(f"Saltando archivo ya en español: {nfo_file}")
-            else:
-                nfo_files.append(nfo_file)
-        return nfo_files
+        """Encuentra los archivos .nfo nuevos o modificados desde la última revisión"""
+        return [nfo_file for nfo_file in base_path.rglob('*.nfo') if not self.is_unchanged(nfo_file)]
 
     def process_directory(self, directory: str, max_workers: Optional[int] = None) -> None:
         """Procesa todos los .nfo en un directorio usando paralelismo"""
@@ -197,20 +211,14 @@ class NFOTranslator:
             logger.error(f"Directorio no existe: {directory}")
             return
 
-        # Cambiar permisos para asegurar escritura
-        try:
-            subprocess.run(['chmod', '-R', '777', str(base_path)], check=True)
-            logger.info(f"Permisos cambiados en {base_path}")
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"No se pudieron cambiar permisos en {base_path}: {e}")
-
-        # Encontrar archivos .nfo
+        # Encontrar archivos .nfo nuevos o modificados
         nfo_files = self.find_nfo_files(base_path)
-        logger.info(f"Encontrados {len(nfo_files)} archivos .nfo")
 
         if not nfo_files:
-            logger.info("No hay archivos .nfo para procesar")
+            logger.info("No hay archivos .nfo nuevos o modificados")
             return
+
+        logger.info(f"Encontrados {len(nfo_files)} archivos .nfo nuevos o modificados")
 
         # Usar paralelismo limitado
         if max_workers is None:
@@ -221,28 +229,31 @@ class NFOTranslator:
         processed = 0
         translated = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Enviar tareas
-            future_to_file = {
-                executor.submit(self.process_nfo_file, Path(nfo_file)): nfo_file
-                for nfo_file in nfo_files
-            }
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Enviar tareas
+                future_to_file = {
+                    executor.submit(self.process_nfo_file, Path(nfo_file)): nfo_file
+                    for nfo_file in nfo_files
+                }
 
-            # Procesar resultados
-            for future in as_completed(future_to_file):
-                nfo_file = future_to_file[future]
-                try:
-                    result = future.result()
-                    processed += 1
-                    if result:
-                        translated += 1
-                    if processed % 10 == 0:
-                        logger.info(f"Procesados: {processed}/{len(nfo_files)}, Traducidos: {translated}")
-                except Exception as e:
-                    logger.error(f"Error procesando {nfo_file}: {e}")
+                # Procesar resultados
+                for future in as_completed(future_to_file):
+                    nfo_file = future_to_file[future]
+                    try:
+                        result = future.result()
+                        processed += 1
+                        if result:
+                            translated += 1
+                        if processed % 50 == 0:
+                            logger.info(f"Procesados: {processed}/{len(nfo_files)}, Traducidos: {translated}")
+                    except Exception as e:
+                        logger.error(f"Error procesando {nfo_file}: {e}")
+        finally:
+            # Guardar siempre: una ejecución interrumpida no debe perder lo ya traducido
+            self.save_cache()
 
         logger.info(f"Procesamiento completado. Total: {len(nfo_files)}, Traducidos: {translated}")
-        self.save_cache()
 
 def main():
     if len(sys.argv) != 2:
@@ -261,4 +272,9 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
     main()
