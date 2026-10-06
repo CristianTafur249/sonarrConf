@@ -2,6 +2,31 @@
 
 Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado con Docker.
 
+## [Sin publicar]
+
+### Correcciones
+
+- **Zona horaria en los jobs de cron**: el entrypoint aplica `TZ` a `/etc/localtime` en cada arranque. Antes cron lanzaba los scripts sin `TZ` y veían UTC, por lo que la "noche" caía entre las 19:00 y las 00:59 hora local.
+- **Corte real de subtítulos a las 06:00**: el cron runner lanza el traductor como subproceso y lo termina (con ffmpeg/Whisper) al acabar la ventana 00:00-05:59. El progreso se conserva y se reanuda la noche siguiente.
+- **Escáner**: un `.srt` genérico que no está en español ya no cuenta como "tiene subtítulos"; el video queda pendiente para traducirlo.
+
+### Rendimiento del ciclo
+
+- **Traductor de NFO**: solo traduce texto descriptivo (`plot`, `outline`, `tagline`, `review`, `biography`). Antes traducía también campos técnicos y los dañaba (`<watched>FALSO`, `<codec>CAA`, `<language>japonés`). `repair_nfo_fields.py --write` restaura los booleanos.
+- **NFO incremental**: solo se revisan los `.nfo` nuevos o modificados (estado en `scripts/tmp/nfo_state.json`); se eliminó el `chmod -R 777` sobre la biblioteca y la doble pasada por archivo.
+- **NFO en segundo plano**: ya no retrasa la compresión.
+- **Subtítulos y compresión en paralelo de noche** (Whisper en CPU, compresión en GPU). El traductor deja para un ciclo posterior los videos que aún esperan compresión, lo que además evita `.srt` huérfanos tras el renombrado.
+- **Escáner**: las comprobaciones de subtítulos con `ffprobe` se ejecutan en paralelo.
+- `mediajelly-cron` pasa de 3 a 5 CPUs.
+
+### Mejoras de subtítulos
+
+- **Transcripción con faster-whisper** (VAD + marcas por palabra) en lugar de openai-whisper, que queda como fallback: mejor sincronía y menos tiempo por episodio. Los cues se limitan a 7 s y no se solapan; el audio se extrae alineado a t=0.
+- **Selección de pista embebida por metadatos**: se descartan pistas forzadas y de carteles/canciones, se prioriza inglés y se extrae solo la pista elegida.
+- **Regla de cobertura**: un subtítulo existente o embebido solo se usa como fuente si llega al 60 % de la duración del video y tiene al menos 2 cues por minuto; si no, se recurre a Whisper.
+- **Un solo `ffprobe` por archivo** en el traductor.
+- **Regeneración**: `mediajelly_subtitle_translator.py --regenerate <video>` rehace un subtítulo desde el audio; `requeue_whisper_subtitles.py --write` encola los generados antes con Whisper y el cron runner los rehace de noche (`--redo-queue`).
+
 ## [v3.2.4] - 2025-11-10
 
 ### Nuevas Características
