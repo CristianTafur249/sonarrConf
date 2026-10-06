@@ -9,6 +9,8 @@ import sys
 import logging
 import subprocess
 import signal
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Tuple
@@ -42,20 +44,22 @@ try:
 except ImportError:
     LANGUAGE_DETECTOR_AVAILABLE = False
 
-try:
-    from mediajelly_subtitle_translator import main as subtitle_main
+# Ventana nocturna para subtítulos: de 00:00 hasta NIGHT_END_HOUR (exclusivo)
+NIGHT_END_HOUR = 6
+# Segundos de gracia entre SIGTERM y SIGKILL al cortar el traductor
+SUBTITLE_KILL_GRACE_SECONDS = 30
+# Tope para la traducción de .nfo, que corre en segundo plano durante el ciclo
+NFO_TIMEOUT_SECONDS = 600
 
-    SUBTITLE_AVAILABLE = True
-except ImportError:
-    SUBTITLE_AVAILABLE = False
 
-# Importar traductor de NFO (.nfo) si está disponible
-try:
-    from mediajelly_nfo_translator import NFOTranslator
+@dataclass
+class BackgroundJob:
+    """Subproceso que corre en paralelo al resto del ciclo, con hora límite propia."""
 
-    NFO_AVAILABLE = True
-except ImportError:
-    NFO_AVAILABLE = False
+    name: str
+    proc: subprocess.Popen
+    timer: threading.Timer
+    timed_out: threading.Event = field(default_factory=threading.Event)
 
 
 class MediaJellyCron:
@@ -258,117 +262,169 @@ class MediaJellyCron:
         Returns:
             bool: True si la hora actual está entre 00:00 y 05:59.
         """
-        current_hour = datetime.now().hour
-        # Noche: de 00:00 a 05:59 (0-5)
-        return current_hour <= 5
+        return datetime.now().hour < NIGHT_END_HOUR
 
-    def run_subtitle_translator(self) -> bool:
+    def _seconds_until_night_end(self) -> float:
         """
-        Ejecuta el traductor de subtítulos.
-
-        Intenta usar la función main del módulo directamente si está disponible,
-        de lo contrario hace fallback a ejecución por subprocess.
+        Calcula cuánto falta para que termine la ventana nocturna.
 
         Returns:
-            bool: True si la ejecución fue exitosa.
+            float: Segundos hasta las NIGHT_END_HOUR:00 de hoy (0 si ya pasó).
         """
-        if not SUBTITLE_AVAILABLE:
-            self.logger.error("Subtitle translator no disponible, usando subprocess fallback")
-            success, _ = self._run_script(self.subtitle_script, timeout=3600)
-            return success
+        now = datetime.now()
+        night_end = now.replace(hour=NIGHT_END_HOUR, minute=0, second=0, microsecond=0)
+        return max(0.0, (night_end - now).total_seconds())
 
+    def _start_background(self, name: str, cmd: List[str], timeout: float) -> Optional[BackgroundJob]:
+        """
+        Lanza un subproceso sin esperar a que termine. Un temporizador termina su
+        grupo de procesos completo al cumplirse `timeout`, aunque el ciclo esté
+        ocupado en otra etapa.
+
+        Args:
+            name: Nombre para los logs.
+            cmd: Comando a ejecutar.
+            timeout: Segundos máximos de ejecución.
+
+        Returns:
+            Optional[BackgroundJob]: El trabajo lanzado o None si no se pudo iniciar.
+        """
         try:
-            self.logger.info("Ejecutando subtitle translator usando función directa")
+            self.logger.info(f"Lanzando en segundo plano: {name} (límite: {timeout / 60:.0f} min)")
+            # Sin pipes: puede durar horas y cada script escribe su propio log
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            self.logger.error(f"Error lanzando {name}: {e}")
+            return None
 
-            # Crear argumentos simulados para el subtitle translator
-            import sys
-            from io import StringIO
+        timed_out = threading.Event()
 
-            # Guardar sys.argv original
-            original_argv = sys.argv[:]
+        def on_deadline():
+            # Si ya terminó por su cuenta no hay nada que cortar (ni que reportar como corte)
+            if proc.poll() is not None:
+                return
+            timed_out.set()
+            self._terminate_process_group(proc)
 
-            # Simular argumentos para procesamiento automático
-            sys.argv = ["mediajelly_subtitle_translator.py"]
+        timer = threading.Timer(timeout, on_deadline)
+        timer.daemon = True
+        timer.start()
+        return BackgroundJob(name=name, proc=proc, timer=timer, timed_out=timed_out)
 
-            # Capturar salida
-            old_stdout = sys.stdout
-            sys.stdout = StringIO()
+    def _finish_background(self, job: Optional[BackgroundJob]) -> Optional[int]:
+        """
+        Espera a que termine un trabajo en segundo plano (o a que lo corte su hora límite).
 
+        Args:
+            job: Trabajo devuelto por `_start_background`.
+
+        Returns:
+            Optional[int]: Código de salida, o None si no se lanzó o fue cortado por hora límite.
+        """
+        if job is None:
+            return None
+        returncode = job.proc.wait()
+        job.timer.cancel()
+        return None if job.timed_out.is_set() else returncode
+
+    def _start_subtitle_translator(self, extra_args: Optional[List[str]] = None) -> Optional[BackgroundJob]:
+        """
+        Lanza el traductor de subtítulos en segundo plano, limitado a la ventana nocturna.
+
+        Al llegar la hora límite se termina el grupo de procesos completo (traductor,
+        ffmpeg y Whisper). El traductor guarda progreso por archivo, así que la
+        siguiente noche continúa donde quedó.
+
+        Args:
+            extra_args: Argumentos adicionales para el traductor (ej: ["--redo-queue"]).
+
+        Returns:
+            Optional[BackgroundJob]: El trabajo lanzado, o None si la ventana ya terminó.
+        """
+        remaining = self._seconds_until_night_end()
+        if remaining <= 0:
+            self.logger.info("Ventana nocturna terminada, no se inicia el traductor de subtítulos")
+            return None
+
+        cmd = [sys.executable, str(self.subtitle_script)] + list(extra_args or [])
+        return self._start_background("traductor de subtítulos", cmd, remaining)
+
+    def _finish_subtitle_translator(self, job: Optional[BackgroundJob]) -> bool:
+        """
+        Espera al traductor de subtítulos lanzado con `_start_subtitle_translator`.
+
+        Returns:
+            bool: True si terminó bien, se pausó por hora límite o no llegó a lanzarse.
+        """
+        if job is None:
+            return True
+
+        returncode = self._finish_background(job)
+        if job.timed_out.is_set():
+            self.logger.warning(
+                f"Hora límite ({NIGHT_END_HOUR:02d}:00) alcanzada - subtítulos pausados, se reanudan la próxima noche"
+            )
+            return True
+        if returncode == 0:
+            self.logger.info("Subtitle translator completado exitosamente")
+            return True
+        self.logger.warning(f"Subtitle translator terminó con código: {returncode}")
+        return False
+
+    def run_subtitle_translator(self, extra_args: Optional[List[str]] = None) -> bool:
+        """
+        Ejecuta el traductor de subtítulos y espera a que termine o a la hora límite.
+
+        Args:
+            extra_args: Argumentos adicionales para el traductor (ej: ["--redo-queue"]).
+
+        Returns:
+            bool: True si terminó bien o se pausó por hora límite.
+        """
+        return self._finish_subtitle_translator(self._start_subtitle_translator(extra_args))
+
+    def _terminate_process_group(self, proc: subprocess.Popen) -> None:
+        """
+        Termina un subproceso y todos sus hijos (SIGTERM y, si no basta, SIGKILL).
+
+        Args:
+            proc: Proceso lanzado con start_new_session=True.
+        """
+        for sig, wait_seconds in ((signal.SIGTERM, SUBTITLE_KILL_GRACE_SECONDS), (signal.SIGKILL, 10)):
             try:
-                # Llamar directamente a la función main
-                subtitle_main()
-                self.logger.info("Subtitle translator completado exitosamente")
-                return True
-            finally:
-                # Restaurar stdout y argv
-                sys.stdout = old_stdout
-                sys.argv = original_argv
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return
+            except Exception as e:
+                self.logger.error(f"Error enviando señal {sig} al subproceso {proc.pid}: {e}")
+            try:
+                proc.wait(timeout=wait_seconds)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
-        except SystemExit as e:
-            # El subtitle translator hace sys.exit(1) si no es hora de noche
-            if e.code == 1:
-                self.logger.warning("Subtitle translator cancelado (fuera de horario de noche)")
-                return False
-            else:
-                self.logger.error(f"Subtitle translator terminó con código: {e.code}")
-                raise
-        except Exception as e:
-            self.logger.error(f"Error ejecutando subtitle translator: {e}")
-            return False
-
-    def run_nfo_translator(self) -> bool:
+    def _start_nfo_translator(self) -> Optional[BackgroundJob]:
         """
-        Ejecuta la traducción de archivos .nfo y .info si existen.
-
-        Intenta usar la clase NFOTranslator directamente si está disponible, de lo
-        contrario hace fallback a ejecución por subprocess.
+        Lanza la traducción de archivos .nfo en segundo plano. Es trabajo de red, no
+        de CPU, así que no hay motivo para que la compresión espere por ella.
 
         Returns:
-            bool: True si completó la verificación (aunque no haya archivos para procesar)
+            Optional[BackgroundJob]: El trabajo lanzado o None si no se pudo iniciar.
         """
-        try:
-            media_dir = self.base_path / "media"
+        cmd = [sys.executable, str(self.scripts_path / "mediajelly_nfo_translator.py"), str(self.base_path / "media")]
+        return self._start_background("traductor de NFO", cmd, NFO_TIMEOUT_SECONDS)
 
-            # Buscar archivos .nfo y .info
-            nfo_files = list(media_dir.rglob("*.nfo")) + list(media_dir.rglob("*.info"))
-            if not nfo_files:
-                self.logger.info("No hay archivos .nfo/.info para procesar")
-                return True
-
-            self.logger.info(f"Detectados {len(nfo_files)} archivos .nfo/.info para revisar")
-
-            if NFO_AVAILABLE:
-                try:
-                    translator = NFOTranslator()
-                    # Procesar por subcarpetas principales para limitar el alcance
-                    for sub in ["anime", "Peliculas", "series"]:
-                        path = media_dir / sub
-                        if path.exists():
-                            translator.process_directory(str(path))
-
-                    self.logger.info("Traducción de NFO completada (módulo)")
-                    return True
-                except Exception as e:
-                    self.logger.error(f"Error en NFOTranslator: {e}")
-                    return False
-            else:
-                # Fallback a subprocess
-                try:
-                    self.logger.info("Ejecutando mediajelly_nfo_translator.py vía subprocess")
-                    result = subprocess.run([sys.executable, str(self.scripts_path / "mediajelly_nfo_translator.py"), str(media_dir)], timeout=3600, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        self.logger.info("Traducción de NFO completada (subprocess)")
-                        return True
-                    else:
-                        self.logger.error(f"NFO translator falló (subprocess): {result.stderr}")
-                        return False
-                except Exception as e:
-                    self.logger.error(f"Error ejecutando NFO translator: {e}")
-                    return False
-
-        except Exception as e:
-            self.logger.error(f"Error detectando archivos .nfo/.info: {e}")
-            return False
+    def _finish_nfo_translator(self, job: Optional[BackgroundJob]) -> None:
+        """Recoge el traductor de NFO lanzado con `_start_nfo_translator` y registra el resultado."""
+        if job is None:
+            return
+        returncode = self._finish_background(job)
+        if job.timed_out.is_set():
+            self.logger.warning("Traductor de NFO cortado por tiempo; continúa en el próximo ciclo")
+        elif returncode == 0:
+            self.logger.info("Traducción de NFO completada")
+        else:
+            self.logger.warning(f"Traductor de NFO terminó con código: {returncode}")
 
     def run_language_detector(self) -> bool:
         """
@@ -441,8 +497,10 @@ class MediaJellyCron:
 
         Flujo de ejecución:
         1. Scanner: Detecta nuevos archivos.
-        2. Processor: Comprime y optimiza archivos (incluye traducción de subtítulos de noche).
-        3. Language Detector: Analiza idiomas después del procesamiento.
+        2. Traductor de NFO: se lanza en segundo plano y se recoge al final.
+        3. Language Detector: Analiza idiomas antes del procesamiento.
+        4. Processor: Comprime y optimiza archivos. De noche, el traductor de
+           subtítulos corre en paralelo hasta la hora límite.
 
         Returns:
             bool: True si el ciclo completo fue exitoso.
@@ -460,7 +518,8 @@ class MediaJellyCron:
         signal.signal(signal.SIGTERM, cleanup_lock)
         signal.signal(signal.SIGINT, cleanup_lock)
 
-        processor_executed = False
+        nfo_job: Optional[BackgroundJob] = None
+        subtitle_job: Optional[BackgroundJob] = None
         try:
             self.logger.info("Iniciando ciclo de procesamiento")
 
@@ -469,12 +528,8 @@ class MediaJellyCron:
                 self.logger.error("Error en scanner, saltando procesamiento")
                 return False
 
-            # Paso adicional: revisar y traducir archivos .nfo / .info si existen
-            try:
-                if not self.run_nfo_translator():
-                    self.logger.warning("Error en NFO/.info translator, continuando con el ciclo")
-            except Exception as e:
-                self.logger.error(f"Error ejecutando run_nfo_translator: {e}")
+            # Traducción de .nfo en segundo plano: no retrasa la compresión
+            nfo_job = self._start_nfo_translator()
 
             # Verificar si es hora de procesar subtítulos (noche)
             is_night = self._is_night_time()
@@ -484,44 +539,47 @@ class MediaJellyCron:
             self.logger.info(f"{EmojiGenerator.audio()} Ejecutando análisis de idiomas antes del procesamiento...")
             detector_ok = self.run_language_detector()
 
+            # Si el detector falló, registramos warning pero continuamos con el processor
+            if not detector_ok:
+                self.logger.warning("Detector de idiomas no estuvo disponible o falló; continuando con processor sin cache")
+
             if is_night:
-                self.logger.info(f"Es de noche ({current_time}) - Ejecutando subtítulos + compresión")
-
-                # Ejecutar subtítulos y compresión
-                if not self.run_subtitle_translator():
-                    self.logger.warning("Error en traductor de subtítulos, continuando con compresión")
-
-                # Si el detector falló, registramos warning pero continuamos con el processor
-                if not detector_ok:
-                    self.logger.warning("Detector de idiomas no estuvo disponible o falló; continuando con processor sin cache")
-
-                if not self.run_processor():
-                    self.logger.error("Error en processor")
-                    return False
-                processor_executed = True
-                # Liberar lock después de que el processor termine
-                self._release_lock()
+                self.logger.info(f"Es de noche ({current_time}) - Ejecutando subtítulos y compresión en paralelo")
+                # Whisper usa CPU y la compresión GPU: corren a la vez. El traductor omite
+                # los videos que aún están pendientes de compresión, así que no chocan.
+                subtitle_job = self._start_subtitle_translator()
             else:
                 self.logger.info(f"Es de día ({current_time}) - Ejecutando solo compresión")
 
-                # Ejecutar compresión
-                if not self.run_processor():
-                    self.logger.error("Error en processor")
-                    return False
-                processor_executed = True
-                # Liberar lock después de que el processor termine
-                self._release_lock()
+            processor_ok = self.run_processor()
+            if not processor_ok:
+                self.logger.error("Error en processor")
+
+            if is_night:
+                if not self._finish_subtitle_translator(subtitle_job):
+                    self.logger.warning("Error en traductor de subtítulos")
+                subtitle_job = None
+
+                # Con el tiempo que quede de la ventana, rehacer subtítulos antiguos de Whisper
+                redo_queue = self.tmp_path / "whisper_redo_queue.txt"
+                if redo_queue.exists() and redo_queue.stat().st_size > 0:
+                    if not self.run_subtitle_translator(["--redo-queue"]):
+                        self.logger.warning("Error rehaciendo subtítulos de Whisper")
+
+            if not processor_ok:
+                return False
 
             self.logger.info("Ciclo completado exitosamente")
             return True
         finally:
+            # No dejar trabajos en segundo plano sin recoger, pase lo que pase en el ciclo
+            self._finish_subtitle_translator(subtitle_job)
+            self._finish_nfo_translator(nfo_job)
             # Forzar flush de logs antes de salir
             for handler in self.logger.handlers:
                 handler.flush()
-            # Limpiar archivo de bloqueo al finalizar, pero solo si el processor no se ejecutó
-            # (para evitar liberar el lock mientras el processor sigue trabajando)
-            if not processor_executed:
-                self._release_lock()
+            # El lock se libera solo cuando todas las etapas terminaron
+            self._release_lock()
 
 
 def main():
