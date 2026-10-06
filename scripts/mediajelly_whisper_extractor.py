@@ -16,22 +16,48 @@ SubtitleTranslator.__init__): `self.logger`, `self.tmp_dir`,
 `self._improve_extracted_subtitles_quality` (definido en la clase principal).
 """
 
+import os
 import re
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from mediajelly_emoji import EmojiGenerator
 
 # Importaciones opcionales con manejo de errores
 try:
+    from faster_whisper import WhisperModel as FasterWhisperModel  # type: ignore
+
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FasterWhisperModel = None
+    FASTER_WHISPER_AVAILABLE = False
+
+try:
     import whisper  # type: ignore
 
-    WHISPER_AVAILABLE = True
+    OPENAI_WHISPER_AVAILABLE = True
 except ImportError:
     whisper = None
-    WHISPER_AVAILABLE = False
+    OPENAI_WHISPER_AVAILABLE = False
+
+# Hay transcripción disponible con cualquiera de los dos motores
+WHISPER_AVAILABLE = FASTER_WHISPER_AVAILABLE or OPENAI_WHISPER_AVAILABLE
+
+# Modelo usado para transcribir (faster-whisper y fallback openai-whisper)
+WHISPER_MODEL_NAME = "small"
+
+# Límites de un cue de subtítulo generado desde audio
+MAX_CUE_SECONDS = 7.0
+MIN_CUE_SECONDS = 1.0
+# Tiempo mínimo en pantalla según la longitud del texto (caracteres por segundo de lectura)
+CUE_CHARS_PER_SECOND = 17.0
+# Margen tras la última palabra antes de retirar el cue, si el siguiente lo permite
+CUE_LINGER_SECONDS = 0.3
+MAX_CUE_CHARS = 100
+# Una pausa mayor entre palabras parte el cue aunque no se alcancen los límites
+CUE_SPLIT_GAP_SECONDS = 1.5
 
 # Path to whisper.cpp binary if compiled in the image
 WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
@@ -193,6 +219,8 @@ class WhisperAudioExtractorMixin:
             "-y",
             "-i",
             str(video_file),
+            "-af",
+            "aresample=async=1:first_pts=0",  # WAV alineado a t=0 aunque el audio tenga retardo inicial
             "-ar",
             "16000",  # Whisper requiere 16kHz
             "-ac",
@@ -234,6 +262,8 @@ class WhisperAudioExtractorMixin:
             "ignore_err",  # Ignorar errores de decodificación
             "-i",
             str(video_file),
+            "-af",
+            "aresample=async=1:first_pts=0",  # WAV alineado a t=0 aunque el audio tenga retardo inicial
             "-ar",
             "16000",  # Whisper requiere 16kHz
             "-ac",
@@ -392,6 +422,16 @@ class WhisperAudioExtractorMixin:
         Returns:
             Optional[dict]: Resultado de la transcripción con claves `segments` y `language`.
         """
+        # Motor principal: faster-whisper (VAD + marcas por palabra)
+        if FASTER_WHISPER_AVAILABLE:
+            try:
+                result = self._transcribe_with_faster_whisper(audio_file)
+                if result:
+                    return result
+                self.logger.warning("faster-whisper no generó segmentos, usando motor alternativo")
+            except Exception as e:
+                self.logger.warning(f"Error en faster-whisper, usando motor alternativo: {e}")
+
         # Intentar usar whisper.cpp binario si está disponible (PoC CPU)
         try:
             if WHISPER_CPP_BIN.exists() and WHISPER_CPP_DEFAULT_MODEL.exists():
@@ -514,20 +554,141 @@ class WhisperAudioExtractorMixin:
 
         return result
 
+    def _transcribe_with_faster_whisper(self, audio_file: Path) -> Optional[dict]:
+        """
+        Transcribe audio con faster-whisper usando filtro de voz (VAD) y marcas por
+        palabra, lo que evita cues estirados sobre silencios o música.
+
+        Args:
+            audio_file: Ruta del archivo de audio.
+
+        Returns:
+            Optional[dict]: Resultado con claves `segments` y `language`, o None si no hubo voz.
+        """
+        with whisper_lock:
+            model = getattr(self, "_faster_whisper_model", None)
+            if model is None:
+                # Carpeta montada: el modelo sobrevive a la recreación del contenedor
+                models_dir = self.tmp_dir / "models"
+                models_dir.mkdir(parents=True, exist_ok=True)
+                self.logger.info(f"Cargando modelo faster-whisper ({WHISPER_MODEL_NAME})...")
+                model = FasterWhisperModel(
+                    WHISPER_MODEL_NAME,
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=min(4, os.cpu_count() or 2),
+                    download_root=str(models_dir),
+                )
+                self._faster_whisper_model = model
+
+            segments_iter, info = model.transcribe(
+                str(audio_file),
+                language=(self.force_language if getattr(self, "force_language", None) else None),
+                task="transcribe",
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                word_timestamps=True,
+                condition_on_previous_text=False,
+            )
+            self.logger.info(f"Idioma detectado por faster-whisper: {info.language}")
+
+            segments: List[Dict[str, Union[float, str]]] = []
+            for segment in segments_iter:
+                words = [(w.start, w.end, w.word) for w in (segment.words or [])]
+                if words:
+                    segments.extend(self._split_words_into_cues(words))
+                else:
+                    segments.append({"start": segment.start, "end": segment.end, "text": segment.text})
+
+        if not segments:
+            return None
+        return {"segments": segments, "language": info.language}
+
+    @staticmethod
+    def _split_words_into_cues(words: List[tuple]) -> List[Dict[str, Union[float, str]]]:
+        """
+        Agrupa palabras con marca de tiempo en cues, partiendo cuando se superan
+        MAX_CUE_SECONDS/MAX_CUE_CHARS o hay una pausa larga entre palabras.
+
+        Args:
+            words: Lista de tuplas (inicio, fin, texto) en orden.
+
+        Returns:
+            List[Dict[str, Union[float, str]]]: Cues con `start`, `end` y `text`.
+        """
+        cues: List[Dict[str, Union[float, str]]] = []
+        current: List[tuple] = []
+
+        def flush():
+            if current:
+                text = "".join(word[2] for word in current).strip()
+                if text:
+                    cues.append({"start": current[0][0], "end": current[-1][1], "text": text})
+                current.clear()
+
+        for word in words:
+            if current:
+                too_long = word[1] - current[0][0] > MAX_CUE_SECONDS
+                too_wide = sum(len(w[2]) for w in current) + len(word[2]) > MAX_CUE_CHARS
+                paused = word[0] - current[-1][1] > CUE_SPLIT_GAP_SECONDS
+                if paused and len(current) == 1:
+                    # Palabra suelta antes de un silencio: Whisper suele adelantar su marca.
+                    # Se une a lo que sigue en vez de dejar un cue huérfano.
+                    word = (word[0], word[1], current[0][2] + word[2])
+                    current.clear()
+                elif too_long or too_wide or paused:
+                    flush()
+            current.append(word)
+        flush()
+        return cues
+
+    @staticmethod
+    def _normalize_cues(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Deja los cues listos para escribir: sin texto vacío, ordenados, sin solaparse
+        con el siguiente y con duración entre MIN_CUE_SECONDS y MAX_CUE_SECONDS.
+
+        El final se alarga hasta dar tiempo de lectura (longitud del texto entre
+        CUE_CHARS_PER_SECOND, más CUE_LINGER_SECONDS tras la última palabra): Whisper
+        marca el fin exacto de la voz y las frases cortas desaparecían al instante.
+
+        Args:
+            segments: Segmentos con `start`, `end` y `text`.
+
+        Returns:
+            List[Dict[str, Any]]: Cues normalizados.
+        """
+        cues = [
+            {"start": float(seg["start"]), "end": float(seg["end"]), "text": str(seg["text"]).strip()}
+            for seg in segments
+            if str(seg.get("text", "")).strip()
+        ]
+        cues.sort(key=lambda cue: cue["start"])
+
+        for i, cue in enumerate(cues):
+            reading_time = max(MIN_CUE_SECONDS, len(cue["text"]) / CUE_CHARS_PER_SECOND)
+            end = max(cue["end"] + CUE_LINGER_SECONDS, cue["start"] + reading_time)
+            end = min(end, cue["start"] + MAX_CUE_SECONDS)
+            if i + 1 < len(cues):
+                end = min(end, cues[i + 1]["start"])
+            # Nunca dejar un cue de duración nula o negativa
+            cue["end"] = max(end, cue["start"] + 0.05)
+        return cues
+
     def _ensure_whisper_model_loaded(self) -> None:
         """Asegura que el modelo Whisper esté cargado."""
         if self.whisper_model is None:
-            if not WHISPER_AVAILABLE:
+            if not OPENAI_WHISPER_AVAILABLE:
                 self.logger.error("Intentando cargar modelo Whisper pero la librería no está disponible")
                 self.whisper_model = None
                 return
 
-            self.logger.info("Cargando modelo Whisper (small)...")
+            self.logger.info(f"Cargando modelo Whisper ({WHISPER_MODEL_NAME})...")
             try:
                 # Importar localmente para evitar usar el objeto global que puede ser None
                 import whisper as _whisper  # type: ignore
 
-                self.whisper_model = _whisper.load_model("small")
+                self.whisper_model = _whisper.load_model(WHISPER_MODEL_NAME)
             except Exception as e:
                 self.logger.error(f"No se pudo cargar el modelo Whisper: {e}")
                 self.whisper_model = None
@@ -563,19 +724,16 @@ class WhisperAudioExtractorMixin:
         Returns:
             Optional[Path]: Ruta del archivo SRT generado o None.
         """
-        self.logger.info(f"Generando archivo SRT con {len(result['segments'])} segmentos")
+        cues = self._normalize_cues(result["segments"])
+        self.logger.info(f"Generando archivo SRT con {len(cues)} segmentos")
 
         with open(output_srt, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(result["segments"], start=1):
-                start_time = self._format_timestamp(segment["start"])
-                end_time = self._format_timestamp(segment["end"])
-                text = segment["text"].strip()
-
-                # Solo escribir si hay texto
-                if text:
-                    f.write(f"{i}\n")
-                    f.write(f"{start_time} --> {end_time}\n")
-                    f.write(f"{text}\n\n")
+            for i, cue in enumerate(cues, start=1):
+                start_time = self._format_timestamp(cue["start"])
+                end_time = self._format_timestamp(cue["end"])
+                f.write(f"{i}\n")
+                f.write(f"{start_time} --> {end_time}\n")
+                f.write(f"{cue['text']}\n\n")
 
         # Verificar que el archivo SRT se creó correctamente
         if not output_srt.exists() or output_srt.stat().st_size == 0:

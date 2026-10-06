@@ -61,6 +61,28 @@ class MediaJellyPaths:
 
     EXTENSIONS: Set[str] = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 
+    # Archivo vacío que excluye de subtítulos a su carpeta y subcarpetas (p. ej. videos
+    # con subtítulos ya incrustados en la imagen)
+    NOSUBS_MARKER: str = ".nosubs"
+
+    @staticmethod
+    def has_nosubs_marker(file_path: Path) -> bool:
+        """
+        Indica si un video está bajo una carpeta marcada para no generar subtítulos.
+
+        Args:
+            file_path: Ruta del video.
+
+        Returns:
+            bool: True si su carpeta o alguna superior (hasta `media/`) contiene `.nosubs`.
+        """
+        for parent in file_path.parents:
+            if (parent / MediaJellyPaths.NOSUBS_MARKER).exists():
+                return True
+            if parent.name == "media":
+                break
+        return False
+
     @staticmethod
     def is_container() -> bool:
         """

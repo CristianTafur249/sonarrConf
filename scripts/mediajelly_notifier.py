@@ -721,6 +721,32 @@ class TelegramNotifier:
             self.logger.info("No se enviaron notificaciones de subtítulos - no hay archivos procesados ni actividad")
             return True
 
+    def notify_subtitle_paused(self, stats: dict) -> bool:
+        """Notificar el avance de subtítulos cuando el proceso se pausa antes de terminar"""
+        message = f"{EmojiGenerator.moon()} MediaJelly - Traducción de Subtítulos pausada\n\n"
+
+        message += f"{EmojiGenerator.folder()} Procesados: {stats['processed']} de {stats['total_files']}\n"
+
+        if stats["with_spanish_audio"] > 0:
+            message += f"{EmojiGenerator.audio()} Con audio español: {stats['with_spanish_audio']}\n"
+
+        if stats["with_spanish_subs"] > 0:
+            message += f"{EmojiGenerator.check()} Ya tenían subtítulos español: {stats['with_spanish_subs']}\n"
+
+        if stats["extracted"] > 0:
+            message += f"{EmojiGenerator.extract()} Subtítulos extraídos: {stats['extracted']}\n"
+
+        if stats["translated"] > 0:
+            message += f"{EmojiGenerator.translate()} Subtítulos traducidos: {stats['translated']}\n"
+
+        if stats["errors"] > 0:
+            message += f"{EmojiGenerator.warning()} Errores: {stats['errors']}\n"
+
+        message += f"\n{EmojiGenerator.time()} Pausado: {datetime.now().strftime('%H:%M')} ({datetime.now().strftime('%Y-%m-%d')})"
+        message += f"\n{EmojiGenerator.info()} Se reanuda la próxima noche"
+
+        return self.send_long_message(message)
+
     def notify_no_pending_files(self, total_files: int, completed_files: int) -> bool:
         """Notificar cuando no hay archivos pendientes"""
         message = f"{EmojiGenerator.info()} MediaJelly - Escaneo Completado\n\n"
@@ -799,7 +825,7 @@ def main():
     """Función principal"""
     if len(sys.argv) < 2:
         print(
-            "Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state|completed_cleanup|night_subtitles|subtitle_translation|process_queue} [argumentos...]"
+            "Uso: mediajelly_notifier.py {start_processing|scan_result|no_pending|critical_error|test|reset_state|completed_cleanup|night_subtitles|subtitle_translation|subtitle_paused|process_queue} [argumentos...]"
         )
         sys.exit(1)
 
@@ -818,6 +844,7 @@ def main():
         "cleanup_result": _handle_cleanup_result,
         "night_subtitles": _handle_night_subtitles,
         "subtitle_translation": _handle_subtitle_translation,
+        "subtitle_paused": _handle_subtitle_paused,
         "process_queue": _handle_process_queue,
     }
 
@@ -947,6 +974,30 @@ def _handle_subtitle_translation(notifier: TelegramNotifier, args: list) -> bool
         return notifier.notify_subtitle_translation(stats)
     except (ValueError, IndexError) as e:
         print(f"Error procesando argumentos de subtitle_translation: {e}")
+        return False
+
+
+def _handle_subtitle_paused(notifier: TelegramNotifier, args: list) -> bool:
+    """Maneja el comando subtitle_paused"""
+    if len(args) < 9:
+        print(
+            "Error: subtitle_paused requiere 7 argumentos: total_files processed extracted translated with_spanish_audio with_spanish_subs errors"
+        )
+        return False
+
+    try:
+        stats = {
+            "total_files": int(args[2]),  # args[0]=script, args[1]=command
+            "processed": int(args[3]),
+            "extracted": int(args[4]),
+            "translated": int(args[5]),
+            "with_spanish_audio": int(args[6]),
+            "with_spanish_subs": int(args[7]),
+            "errors": int(args[8]),
+        }
+        return notifier.notify_subtitle_paused(stats)
+    except (ValueError, IndexError) as e:
+        print(f"Error procesando argumentos de subtitle_paused: {e}")
         return False
 
 
