@@ -22,8 +22,9 @@ config/*/
 # ARCHIVOS DE MEDIOS Y DATOS
 # ============================================================================
 
-# Archivos de medios (demasiado grandes)
-media/
+# Archivos de medios y descargas (demasiado grandes)
+media
+data/
 
 # Archivos de trabajo temporal
 scripts/tmp/
