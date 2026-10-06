@@ -6,18 +6,21 @@ x-logging: &default-logging
 
 services:
   transmission:
-    image: jaymoulin/transmission:4.0.6
+    image: lscr.io/linuxserver/transmission:latest
     container_name: transmission
     networks:
       - mynetwork
     environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
       - TZ=${TZ}
-    command: transmission-daemon -f -g /config
+      # Sin USER/PASS la imagen de LinuxServer desactiva la autenticación del RPC
+      - USER=${TRANSMISSION_USERNAME}
+      - PASS=${TRANSMISSION_PASSWORD}
     volumes:
       - ./config/transmission:/config:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
+      # Solo ve las descargas; Sonarr/Radarr las enlazan a /data/media
+      - ./data/torrents:/data/torrents:rw
     ports:
       - "9091:9091"
       - "51413:51413"
@@ -28,7 +31,8 @@ services:
     mem_reservation: 192m
     cpus: "0.75"
     healthcheck:
-      test: ["CMD", "pgrep", "transmission-daemon"]
+      # El pgrep de la imagen de LinuxServer no reconoce el nombre completo del proceso
+      test: ["CMD-SHELL", "nc -z localhost 9091 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -36,19 +40,24 @@ services:
   samba:
     image: dperson/samba
     container_name: samba
-    command: '-u "${SAMBA_USER};${SAMBA_PASSWORD}" -s "media;/media;yes;no;yes;all;${SAMBA_USER}" -s "downloads;/downloads;yes;no;yes;all;${SAMBA_USER}" -s "scripts;/scripts;yes;no;yes;all;${SAMBA_USER}"'
+    # Sin campo de "admin users": smbd crea como root todo lo que hace un admin,
+    # y el bot/pipeline (uid 1000) luego no puede escribir en esas carpetas.
+    command: '-u "${SAMBA_USER};${SAMBA_PASSWORD}" -s "media;/media;yes;no;yes;all" -s "downloads;/downloads;yes;no;yes;all" -s "scripts;/scripts;yes;no;yes;all"'
     stdin_open: true
     tty: true
     environment:
       - TZ=${TZ}
       - PUID=${PUID}
       - PGID=${PGID}
+      # dperson/samba: uid/gid de "smbuser" (force user) -> archivos creados como 1000:1000
+      - USERID=${PUID}
+      - GROUPID=${PGID}
     ports:
       - "139:139"
       - "445:445"
     volumes:
-      - ./media:/media:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./data/media:/media:rw
+      - ./data/torrents:/downloads:rw
       - ./scripts:/scripts:ro
     restart: unless-stopped
     logging: *default-logging
@@ -69,10 +78,10 @@ services:
       - "7878:7878"
     volumes:
       - ./config/radarr-config:/config:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/anime:/anime:rw
+      # Un solo montaje con descargas y biblioteca: así la importación es un
+      # enlace duro instantáneo en vez de una copia (esquema de TRaSH Guides)
+      - ./data:/data:rw
       - ./scripts:/scripts:ro
-      - ./config/1tb1/Bittorrent:/downloads:rw
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 640m
@@ -96,9 +105,7 @@ services:
     volumes:
       - ./config/sonarr-config:/config:rw
       - ./scripts:/scripts:ro
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./data:/data:rw
     ports:
       - "8989:8989"
     restart: unless-stopped
@@ -117,6 +124,8 @@ services:
     image: lscr.io/linuxserver/prowlarr:latest
     networks:
       - mynetwork
+    dns:
+      - 172.20.0.53
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -136,6 +145,63 @@ services:
       timeout: 10s
       retries: 3
 
+  # DNS cifrado (DoH) para los contenedores de indexadores: el DNS del proveedor de
+  # internet no resuelve varios sitios de torrents en español aunque están en línea.
+  dns-doh:
+    image: adguard/dnsproxy:latest
+    container_name: dns-doh
+    command: ["-l", "0.0.0.0", "-p", "53", "-u", "https://1.1.1.1/dns-query", "-u", "https://1.0.0.1/dns-query", "--cache"]
+    networks:
+      mynetwork:
+        ipv4_address: 172.20.0.53
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 64m
+    cpus: "0.25"
+
+  # Resuelve los desafíos de Cloudflare de los indexadores (lo usa Prowlarr)
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    networks:
+      - mynetwork
+    dns:
+      - 172.20.0.53
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: "1.0"
+
+  # Indexadores en español que Prowlarr no trae (DonTorrent, MejorTorrent, Wolfmax4K,
+  # DivxTotal). Prowlarr los consume como Torznab genérico en http://jackett:9117
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: jackett
+    networks:
+      - mynetwork
+    dns:
+      - 172.20.0.53
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - AUTO_UPDATE=false
+    volumes:
+      - ./config/jackett-config:/config:rw
+    # Sin puerto publicado: no tiene contraseña y solo lo usa Prowlarr por la red interna
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 384m
+    mem_reservation: 128m
+    cpus: "0.75"
+    depends_on:
+      - flaresolverr
+      - dns-doh
+
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
     container_name: bazarr
@@ -149,10 +215,7 @@ services:
       - "6767:6767"
     volumes:
       - ./config/bazarr-config:/config:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
-      - ./config/1tb1/Bittorrent:/downloads:ro
+      - ./data/media:/data/media:rw
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 384m
@@ -179,9 +242,10 @@ services:
     volumes:
       - ./config/jellyfin-config:/config:rw
       - ./config/jellyfin-cache:/cache:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
+      # Rutas internas sin cambios para no alterar las bibliotecas existentes
+      - ./data/media/Peliculas:/movies:rw
+      - ./data/media/series:/tvshows:rw
+      - ./data/media/anime:/anime:rw
     ports:
       - "8096:8096"
     restart: unless-stopped
@@ -202,6 +266,7 @@ services:
       args:
         PUID: ${PUID:-1000}
         PGID: ${PGID:-1000}
+        TZ: ${TZ:-UTC}
     container_name: mediajelly-cron
     # SE RECOMIENDA ELIMINAR O COMENTAR LA SIGUIENTE LÍNEA:
     # user: "${PUID:-1000}:${PGID:-1000}"
@@ -225,15 +290,15 @@ services:
     volumes:
       - ./scripts:/mediajelly/scripts:rw
       - ./config:/mediajelly/config:ro
-      - ./media:/mediajelly/media:rw
-      - ./config/1tb1/Bittorrent:/mediajelly/downloads:rw
+      - ./data/media:/mediajelly/media:rw
+      - ./data/torrents:/mediajelly/downloads:rw
     devices:
       - /dev/dri:/dev/dri
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 4g
     mem_reservation: 2g
-    cpus: "3.0"
+    cpus: "5.0"
     depends_on:
       - transmission
       - radarr
