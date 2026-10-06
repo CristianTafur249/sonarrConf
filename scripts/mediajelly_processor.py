@@ -414,11 +414,11 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
             resource.setrlimit(resource.RLIMIT_AS, (soft_limit, target_hard))
 
-            # Límite de tiempo de CPU (en segundos)
-            resource.setrlimit(resource.RLIMIT_CPU, (FFMPEG_TIMEOUT, FFMPEG_TIMEOUT))
-
+            # Sin RLIMIT_CPU: cuenta segundos de CPU sumados entre hilos, no tiempo real, y
+            # mataba con SIGKILL las compresiones por CPU de películas largas (18000 s de
+            # CPU se agotan en ~1 h con 5 núcleos). El tope real es el timeout de ffmpeg.
             self.logger.info(
-                f"Límites de recursos establecidos: {effective_gb}GB RAM (soft, techo {target_hard // (1024 ** 3)}GB), {FFMPEG_TIMEOUT}s CPU"
+                f"Límites de recursos establecidos: {effective_gb}GB RAM (soft, techo {target_hard // (1024 ** 3)}GB), timeout ffmpeg {FFMPEG_TIMEOUT}s"
             )
         except Exception as e:
             self.logger.warning(f"No se pudieron establecer límites de recursos: {e}")
