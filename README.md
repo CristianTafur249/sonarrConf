@@ -106,7 +106,10 @@ graph TB
 ```text
 mediaJelly/
 ├── docker-compose.yaml          # Configuración de servicios con límites de recursos
-├── media/                       # Contenido multimedia
+├── data/                        # Raíz única de datos (un solo montaje: permite enlaces duros)
+│   ├── media/                   # Biblioteca: Peliculas/, series/, anime/
+│   └── torrents/                # Descargas: complete/, incomplete/
+├── media -> data/media          # Enlace de compatibilidad
 │   ├── Peliculas/              # Películas organizadas
 │   ├── series/                 # Series organizadas
 │   └── anime/
@@ -364,6 +367,29 @@ docker-compose exec redis redis-cli FLUSHALL
 # Verificar logs del detector
 docker-compose logs mediajelly-cron | grep -i whisper
 ```
+
+#### ❌ Subtítulos desincronizados
+
+Los subtítulos sin pista embebida se transcriben con faster-whisper (modelo en `scripts/tmp/models`), solo de noche (00:00-05:59).
+
+```bash
+# Rehacer el subtítulo de un video desde el audio
+docker exec -u mediauser mediajelly-cron python3 mediajelly_subtitle_translator.py --regenerate "/mediajelly/media/..."
+
+# Encolar los subtítulos generados antes con Whisper (se rehacen de noche)
+docker exec -u mediauser mediajelly-cron python3 requeue_whisper_subtitles.py --write
+```
+
+#### ❌ Campos de `.nfo` traducidos por error
+
+Versiones anteriores del traductor de NFO tradujeron campos técnicos (`<watched>FALSO`, `<codec>CAA`).
+
+```bash
+# Restaurar los booleanos (sin --write solo informa)
+docker exec -u mediauser mediajelly-cron python3 repair_nfo_fields.py --write
+```
+
+Los datos de `streamdetails` (codec, idioma de pistas) no se restauran con el script: Jellyfin los regenera al refrescar los metadatos del elemento.
 
 #### ❌ Compresión se queda atascada
 
@@ -636,6 +662,8 @@ Los siguientes archivos se excluyen del control de versiones:
 | **mediajelly_language_detector.py** | 🗣️ Detector de idiomas | Usa Whisper AI para analizar audio y detectar idiomas |
 | **mediajelly_processor.py** | 🗜️ Procesador multimedia | Compresión inteligente con algoritmos adaptativos |
 | **mediajelly_subtitle_translator.py** | 🌐 Traductor de subtítulos | Traducción automática con doble pasada para calidad |
+| **requeue_whisper_subtitles.py** | ♻️ Cola de regeneración | Encola subtítulos generados con Whisper para rehacerlos de noche |
+| **repair_nfo_fields.py** | 🩹 Reparación de NFO | Restaura campos booleanos de `.nfo` traducidos por error (`FALSO` → `false`) |
 | **mediajelly_notifier.py** | 📱 Notificador Telegram | Sistema de notificaciones con emojis y estado persistente |
 
 ### Utility Scripts
