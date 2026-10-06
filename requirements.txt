@@ -13,6 +13,8 @@ PyYAML>=6.0
 
 # Whisper (detección de idioma) - PyTorch instalado por separado
 openai-whisper>=20231117
+# Transcripción de subtítulos (VAD + marcas por palabra); openai-whisper queda como fallback
+faster-whisper>=1.0.0
 numpy>=1.24.0,<2.0.0
 
 # Telethon (descarga de archivos grandes)

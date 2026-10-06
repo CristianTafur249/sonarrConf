@@ -45,7 +45,31 @@ RUN mkdir -p /mediajelly/scripts /mediajelly/config /mediajelly/media && \
 # Copiar requirements y scripts
 COPY requirements.txt /tmp/requirements.txt
 
-# Copiar entrypoint y crontabs. NOTA sobre doble crontab: docker-entrypoint-hybrid.sh
+# Instalar dependencias de Python
+RUN pip3 install --no-cache-dir --default-timeout=100 \
+    "requests>=2.31.0" \
+    "psutil>=5.9.0" \
+    "translatepy>=2.3" \
+    "langdetect>=1.0.9" \
+    "PyYAML>=6.0" \
+    "telethon>=1.34.0" \
+    "redis>=5.0.0" \
+    "numpy>=1.24.0,<2.0.0"
+
+RUN pip3 install --no-cache-dir --default-timeout=1000 \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    "torch>=2.0.0,<2.2.0" \
+    "torchaudio>=2.0.0,<2.2.0"
+
+RUN pip3 install --no-cache-dir --default-timeout=1000 --retries 10 \
+    "openai-whisper>=20231117" \
+    "faster-whisper>=1.0.0"
+
+RUN pip3 cache purge
+
+# Entrypoint y crontabs van DESPUÉS de las dependencias: así un cambio en ellos no
+# invalida las capas de pip (≈3 GB de descargas).
+# NOTA sobre doble crontab: docker-entrypoint-hybrid.sh
 # activa solo UNO de los dos según MEDIAJELLY_MODE (mediajelly-python en modo
 # "python", que es el default en docker-compose.yaml; mediajelly en modo
 # "bash", legacy). No hay doble disparo: config/crontab.example está
@@ -59,27 +83,6 @@ COPY config/crontab.example /etc/cron.d/mediajelly
 RUN chmod +x /docker-entrypoint.sh && \
     chmod 644 /etc/cron.d/mediajelly-python && \
     chmod 644 /etc/cron.d/mediajelly
-
-# Instalar dependencias de Python
-RUN pip3 install --no-cache-dir --default-timeout=100 \
-    requests>=2.31.0 \
-    psutil>=5.9.0 \
-    translatepy>=2.3 \
-    langdetect>=1.0.9 \
-    PyYAML>=6.0 \
-    telethon>=1.34.0 \
-    redis>=5.0.0 \
-    numpy>=1.24.0,<2.0.0
-
-RUN pip3 install --no-cache-dir --default-timeout=1000 \
-    --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch>=2.0.0,<2.2.0 \
-    torchaudio>=2.0.0,<2.2.0
-
-RUN pip3 install --no-cache-dir --default-timeout=100 \
-    openai-whisper>=20231117
-
-RUN pip3 cache purge
 
 # Copiar scripts
 COPY scripts/ /mediajelly/scripts/
