@@ -40,15 +40,20 @@ See Also:
     - mediajelly_language_detector.py: Detección de idiomas con Whisper
 """
 
+import json
 import sys
 import time
 import logging
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
 
 from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
 from mediajelly_db import add_pending, get_pending_files, get_all_completed_files
+
+# Comprobaciones simultáneas de subtítulos (un ffprobe por video)
+SUBTITLE_CHECK_WORKERS = 4
 
 
 class MediaScanner:
@@ -337,19 +342,23 @@ class MediaScanner:
 
     def _find_files_needing_subtitles_fresh(self, video_files: List[Path]) -> List[str]:
         """Determina qué archivos necesitan subtítulos (sin filtrar por pending existente)"""
-        files_needing_subtitles = []
+        candidates = []
         for video_file in video_files:
-            video_path_str = str(video_file)
-
             # Validación: excluir archivos con ".compressed" en el nombre
             if ".compressed" in video_file.name:
                 self.logger.debug(f"Excluyendo archivo comprimido de subtítulos: {video_file.name}")
                 continue
+            # Carpeta marcada para no generar subtítulos (p. ej. ya vienen incrustados)
+            if MediaJellyPaths.has_nosubs_marker(video_file):
+                continue
+            candidates.append(video_file)
 
-            # Solo agregar si NO tiene subtítulos en español
-            if not self._has_spanish_subtitle(video_file):
-                files_needing_subtitles.append(video_path_str)
-        return files_needing_subtitles
+        # La comprobación lanza un ffprobe por video (espera de E/S): en paralelo, conservando el orden
+        with ThreadPoolExecutor(max_workers=SUBTITLE_CHECK_WORKERS) as executor:
+            has_spanish = list(executor.map(self._has_spanish_subtitle, candidates))
+
+        # Solo agregar los que NO tienen subtítulos en español
+        return [str(video_file) for video_file, spanish in zip(candidates, has_spanish) if not spanish]
 
     def _has_spanish_subtitle(self, video_file: Path) -> bool:
         """Verifica si el archivo ya tiene subtítulos en español (externos o embebidos)"""
@@ -384,7 +393,7 @@ class MediaScanner:
             # Verificar si es español mediante detección simple
             try:
                 with open(generic_srt, "r", encoding="utf-8", errors="ignore") as f:
-                    sample = f.read(500)  # Leer muestra
+                    sample = f.read(4000)  # Leer muestra
                     # Palabras comunes en español
                     spanish_words = [
                         "el",
@@ -409,9 +418,8 @@ class MediaScanner:
             except Exception:
                 pass
 
-        # Si encuentra subtítulos externos, retorna True
-        if any(sub_file.exists() for sub_file in [generic_srt]):
-            return True
+        # Un .srt genérico que no es español NO cuenta: queda pendiente para que el
+        # traductor lo traduzca (antes el video nunca volvía a la cola).
 
         # 2. Verificar subtítulos embebidos en español con ffprobe
         try:
@@ -422,9 +430,9 @@ class MediaScanner:
                 "-select_streams",
                 "s",
                 "-show_entries",
-                "stream_tags=language",
+                "stream_tags=language:stream_disposition=forced",
                 "-of",
-                "csv=p=0",
+                "json",
                 str(video_file),
             ]
             result = subprocess.run(
@@ -436,16 +444,15 @@ class MediaScanner:
             )
 
             if result.returncode == 0:
-                # Buscar idiomas español en los subtítulos embebidos
-                subtitle_languages = result.stdout.strip().split("\n")
+                # Buscar pistas completas en español (las forzadas solo traen carteles)
                 spanish_codes = {"spa", "es", "esp", "spanish"}
 
-                for lang in subtitle_languages:
-                    lang_clean = lang.strip().lower()
-                    if lang_clean in spanish_codes:
+                for stream in json.loads(result.stdout).get("streams", []):
+                    lang = (stream.get("tags", {}).get("language") or "").strip().lower()
+                    if lang in spanish_codes and not stream.get("disposition", {}).get("forced"):
                         return True
 
-        except (subprocess.TimeoutExpired, Exception) as e:
+        except Exception as e:
             # Si hay error verificando embebidos, asumir que no tiene para ser conservador
             self.logger.debug(f"Error verificando subtítulos embebidos en {video_file.name}: {e}")
 
