@@ -6,7 +6,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from mediajelly_scanner import MediaScanner  # noqa: E402
-from mediajelly_subtitle_translator import SubtitleTranslator  # noqa: E402
+from mediajelly_subtitle_translator import SubtitleQualityImprover, SubtitleTranslator  # noqa: E402
 from mediajelly_whisper_extractor import (  # noqa: E402
     MAX_CUE_SECONDS,
     MIN_CUE_SECONDS,
@@ -285,3 +285,91 @@ def test_non_spanish_source_still_goes_to_translation(translator, tmp_path, monk
 
     assert translator.translate_srt(srt) is None
     assert called == [1]
+
+
+def _extractor(tmp_path):
+    class _Extractor(WhisperAudioExtractorMixin):
+        logger = _Logger()
+        tmp_dir = tmp_path
+
+    return _Extractor()
+
+
+def test_hints_for_episode_come_from_series_nfo(tmp_path):
+    season = tmp_path / "Vikings" / "Season 6"
+    season.mkdir(parents=True)
+    (tmp_path / "Vikings" / "tvshow.nfo").write_text(
+        "<tvshow><title>Vikings</title><actor><name>X</name><role>Bjorn Ironside</role></actor>"
+        "<actor><name>Y</name><role>Ubbe (voice)</role></actor><actor><name>Z</name><role>Ubbe</role></actor></tvshow>",
+        encoding="utf-8",
+    )
+    video = season / "Vikings S06E02.mp4"
+    video.with_suffix(".nfo").write_text("<episodedetails><title>The Prophet</title></episodedetails>", encoding="utf-8")
+
+    assert _extractor(tmp_path)._transcription_hints(video) == "Personajes: Bjorn Ironside, Ubbe, The Prophet, Vikings."
+
+
+def test_hints_for_movie_and_missing_nfo(tmp_path):
+    folder = tmp_path / "Movie (2005)"
+    folder.mkdir()
+    video = folder / "Movie (2005).mp4"
+    assert _extractor(tmp_path)._transcription_hints(video) is None
+
+    video.with_suffix(".nfo").write_text(
+        "<movie><title>Cruzada</title><actor><role>Balian de Ibelin</role></actor></movie>", encoding="utf-8"
+    )
+    assert _extractor(tmp_path)._transcription_hints(video) == "Personajes: Balian de Ibelin, Cruzada."
+
+
+def test_hints_respect_length_limit(tmp_path):
+    folder = tmp_path / "Big"
+    folder.mkdir()
+    video = folder / "Big.mp4"
+    roles = "".join(f"<actor><role>Personaje Numero {i:03d}</role></actor>" for i in range(200))
+    video.with_suffix(".nfo").write_text(f"<movie>{roles}</movie>", encoding="utf-8")
+
+    hints = _extractor(tmp_path)._transcription_hints(video)
+
+    assert len(hints) <= 400
+    assert hints.startswith("Personajes: Personaje Numero 000, Personaje Numero 001")
+
+
+def _words(text, start=0.0, step=0.4):
+    return [(start + i * step, start + i * step + 0.35, " " + w) for i, w in enumerate(text.split())]
+
+
+def test_cues_close_at_sentence_end():
+    words = _words("No habrá clemencia si este muro cae. Si bajan las armas, sus familias morirán.")
+
+    cues = WhisperAudioExtractorMixin._split_words_into_cues(words)
+
+    assert [cue["text"] for cue in cues] == [
+        "No habrá clemencia si este muro cae.",
+        "Si bajan las armas, sus familias morirán.",
+    ]
+
+
+def test_long_cue_breaks_at_comma_not_mid_idea():
+    text = (
+        "Aunque dijiste que Kattegat se dedicaría solamente al comercio con todos los pueblos vecinos, "
+        "no a conquistar otras tierras lejanas"
+    )
+    cues = WhisperAudioExtractorMixin._split_words_into_cues(_words(text, step=0.2))
+
+    assert len(cues) == 2
+    assert cues[0]["text"].endswith("vecinos,")
+    assert cues[1]["text"].startswith("no a conquistar")
+
+
+def test_continuation_line_keeps_lowercase():
+    improver = SubtitleQualityImprover(logger=None)
+    srt = (
+        "1\n00:00:01,000 --> 00:00:03,000\nNo habrá clemencia si bajan las armas sus\n\n"
+        "2\n00:00:03,000 --> 00:00:05,000\nfamilias morirán.\n\n"
+        "3\n00:00:06,000 --> 00:00:08,000\nretírate o moriremos.\n"
+    )
+
+    out = improver.improve_subtitle_quality(srt, "es")
+
+    assert "\nfamilias morirán." in out  # continúa la frase anterior: sin mayúscula forzada
+    assert "\nRetírate o moriremos." in out  # tras un punto sí empieza frase
