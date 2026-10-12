@@ -18,6 +18,7 @@ SubtitleTranslator.__init__): `self.logger`, `self.tmp_dir`,
 
 import os
 import re
+import sys
 import subprocess
 import shutil
 from pathlib import Path
@@ -45,8 +46,14 @@ except ImportError:
 # Hay transcripción disponible con cualquiera de los dos motores
 WHISPER_AVAILABLE = FASTER_WHISPER_AVAILABLE or OPENAI_WHISPER_AVAILABLE
 
-# Modelo usado para transcribir (faster-whisper y fallback openai-whisper)
-WHISPER_MODEL_NAME = "small"
+# Modelo de faster-whisper para transcribir. WHISPER_MODEL permite probar otro en una
+# ejecución manual; los jobs de cron corren con entorno limpio y usan este valor.
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+# Modelo al que se recurre si el anterior no carga, y el del motor openai-whisper
+WHISPER_FALLBACK_MODEL_NAME = "small"
+
+# Tope de las palabras de referencia (personajes, título) que se pasan al modelo
+MAX_HINT_CHARS = 400
 
 # Límites de un cue de subtítulo generado desde audio
 MAX_CUE_SECONDS = 7.0
@@ -58,6 +65,10 @@ CUE_LINGER_SECONDS = 0.3
 MAX_CUE_CHARS = 100
 # Una pausa mayor entre palabras parte el cue aunque no se alcancen los límites
 CUE_SPLIT_GAP_SECONDS = 1.5
+# Al terminar una frase se cierra el cue si ya tiene al menos este texto
+MIN_CUE_CHARS_AT_SENTENCE_END = 25
+SENTENCE_END_MARKS = (".", "?", "!", "…")
+CLAUSE_BREAK_MARKS = (",", ";", ":") + SENTENCE_END_MARKS
 
 # Path to whisper.cpp binary if compiled in the image
 WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
@@ -97,6 +108,7 @@ class WhisperAudioExtractorMixin:
                 return None
 
             # Transcribir audio con Whisper
+            self._transcription_hotwords = self._transcription_hints(video_file)
             transcription_result = self._transcribe_audio_with_whisper(audio_file)
             if not transcription_result:
                 return None
@@ -554,6 +566,53 @@ class WhisperAudioExtractorMixin:
 
         return result
 
+    def _transcription_hints(self, video_file: Path) -> Optional[str]:
+        """
+        Reúne palabras de referencia para la transcripción (personajes y títulos) desde
+        los .nfo que acompañan al video: el del propio archivo, movie.nfo y el
+        tvshow.nfo de la serie.
+
+        Args:
+            video_file: Ruta del archivo de video.
+
+        Returns:
+            Optional[str]: Lista separada por comas (máx. MAX_HINT_CHARS) o None si no hay datos.
+        """
+        candidates = [
+            video_file.with_suffix(".nfo"),
+            video_file.parent / "movie.nfo",
+            video_file.parent / "tvshow.nfo",
+            video_file.parent.parent / "tvshow.nfo",
+        ]
+        roles: List[str] = []
+        titles: List[str] = []
+        for nfo in candidates:
+            try:
+                content = nfo.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            roles += re.findall(r"<role>([^<]+)</role>", content)
+            titles += re.findall(r"<(?:title|originaltitle)>([^<]+)</(?:title|originaltitle)>", content)
+
+        hints: List[str] = []
+        seen = set()
+        # Primero los personajes: son lo que más se repite en los diálogos
+        for raw in roles + titles:
+            name = re.sub(r"\s*\([^)]*\)", "", raw).replace("&amp;", "&").strip(" .,-")
+            if len(name) < 3 or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            if len(", ".join(hints + [name])) > MAX_HINT_CHARS - len("Personajes: ."):
+                break
+            hints.append(name)
+
+        if not hints:
+            return None
+        self.logger.info(f"Palabras de referencia para la transcripción: {len(hints)} (desde .nfo)")
+        # Como frase con punto final: una lista suelta hace que el modelo imite ese estilo
+        # y deje de poner puntuación en los diálogos.
+        return "Personajes: " + ", ".join(hints) + "."
+
     def _transcribe_with_faster_whisper(self, audio_file: Path) -> Optional[dict]:
         """
         Transcribe audio con faster-whisper usando filtro de voz (VAD) y marcas por
@@ -571,14 +630,24 @@ class WhisperAudioExtractorMixin:
                 # Carpeta montada: el modelo sobrevive a la recreación del contenedor
                 models_dir = self.tmp_dir / "models"
                 models_dir.mkdir(parents=True, exist_ok=True)
-                self.logger.info(f"Cargando modelo faster-whisper ({WHISPER_MODEL_NAME})...")
-                model = FasterWhisperModel(
-                    WHISPER_MODEL_NAME,
-                    device="cpu",
-                    compute_type="int8",
-                    cpu_threads=min(4, os.cpu_count() or 2),
-                    download_root=str(models_dir),
-                )
+                model = None
+                for model_name in dict.fromkeys((WHISPER_MODEL_NAME, WHISPER_FALLBACK_MODEL_NAME)):
+                    self.logger.info(f"Cargando modelo faster-whisper ({model_name})...")
+                    try:
+                        # Un modelo copiado a mano en models/<nombre>/ tiene prioridad sobre la descarga
+                        local_model = models_dir / model_name
+                        model = FasterWhisperModel(
+                            str(local_model) if (local_model / "model.bin").is_file() else model_name,
+                            device="cpu",
+                            compute_type="int8",
+                            cpu_threads=min(4, os.cpu_count() or 2),
+                            download_root=str(models_dir),
+                        )
+                        break
+                    except Exception as e:
+                        self.logger.warning(f"No se pudo cargar el modelo {model_name}: {e}")
+                if model is None:
+                    raise RuntimeError("No se pudo cargar ningún modelo de faster-whisper")
                 self._faster_whisper_model = model
 
             segments_iter, info = model.transcribe(
@@ -589,26 +658,48 @@ class WhisperAudioExtractorMixin:
                 vad_parameters={"min_silence_duration_ms": 500},
                 word_timestamps=True,
                 condition_on_previous_text=False,
+                # Nombres de personajes y título: evita que el modelo invente su grafía
+                hotwords=getattr(self, "_transcription_hotwords", None),
             )
             self.logger.info(f"Idioma detectado por faster-whisper: {info.language}")
 
             segments: List[Dict[str, Union[float, str]]] = []
+            # Barra de progreso solo en ejecuciones manuales (terminal interactiva)
+            show_progress = sys.stderr.isatty() and getattr(info, "duration", 0) > 0
             for segment in segments_iter:
+                if show_progress:
+                    self._print_progress(segment.end, info.duration)
                 words = [(w.start, w.end, w.word) for w in (segment.words or [])]
                 if words:
                     segments.extend(self._split_words_into_cues(words))
                 else:
                     segments.append({"start": segment.start, "end": segment.end, "text": segment.text})
 
+            if show_progress:
+                self._print_progress(info.duration, info.duration)
+                sys.stderr.write("\n")
+
         if not segments:
             return None
         return {"segments": segments, "language": info.language}
 
     @staticmethod
+    def _print_progress(position: float, total: float, width: int = 40) -> None:
+        """Dibuja en stderr una barra de progreso de la transcripción (se reescribe en la misma línea)."""
+        fraction = min(max(position / total, 0.0), 1.0)
+        filled = int(width * fraction)
+        clock = lambda t: f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}"
+        sys.stderr.write(
+            f"\rTranscribiendo [{'#' * filled}{'-' * (width - filled)}] {fraction * 100:5.1f}%  {clock(position)} / {clock(total)}"
+        )
+        sys.stderr.flush()
+
+    @staticmethod
     def _split_words_into_cues(words: List[tuple]) -> List[Dict[str, Union[float, str]]]:
         """
         Agrupa palabras con marca de tiempo en cues, partiendo cuando se superan
-        MAX_CUE_SECONDS/MAX_CUE_CHARS o hay una pausa larga entre palabras.
+        MAX_CUE_SECONDS/MAX_CUE_CHARS o hay una pausa larga entre palabras. Los cortes
+        se hacen al final de frase o en una coma siempre que se puede.
 
         Args:
             words: Lista de tuplas (inicio, fin, texto) en orden.
@@ -626,6 +717,23 @@ class WhisperAudioExtractorMixin:
                     cues.append({"start": current[0][0], "end": current[-1][1], "text": text})
                 current.clear()
 
+        def flush_at_clause_break():
+            """Cierra el cue en la última coma o fin de frase pasada su mitad; el resto pasa al siguiente."""
+            total = sum(len(w[2]) for w in current)
+            seen = 0
+            cut = None
+            for i, w in enumerate(current[:-1]):
+                seen += len(w[2])
+                if seen >= total / 2 and w[2].rstrip().endswith(CLAUSE_BREAK_MARKS):
+                    cut = i
+            if cut is None:
+                flush()
+                return
+            rest = current[cut + 1:]
+            del current[cut + 1:]
+            flush()
+            current.extend(rest)
+
         for word in words:
             if current:
                 too_long = word[1] - current[0][0] > MAX_CUE_SECONDS
@@ -636,9 +744,17 @@ class WhisperAudioExtractorMixin:
                     # Se une a lo que sigue en vez de dejar un cue huérfano.
                     word = (word[0], word[1], current[0][2] + word[2])
                     current.clear()
-                elif too_long or too_wide or paused:
+                elif paused:
                     flush()
+                elif too_long or too_wide:
+                    flush_at_clause_break()
             current.append(word)
+            # Fin de frase: cerrar aquí en vez de arrastrar el inicio de la siguiente
+            if (
+                word[2].rstrip().endswith(SENTENCE_END_MARKS)
+                and sum(len(w[2]) for w in current) >= MIN_CUE_CHARS_AT_SENTENCE_END
+            ):
+                flush()
         flush()
         return cues
 
@@ -683,12 +799,12 @@ class WhisperAudioExtractorMixin:
                 self.whisper_model = None
                 return
 
-            self.logger.info(f"Cargando modelo Whisper ({WHISPER_MODEL_NAME})...")
+            self.logger.info(f"Cargando modelo Whisper ({WHISPER_FALLBACK_MODEL_NAME})...")
             try:
                 # Importar localmente para evitar usar el objeto global que puede ser None
                 import whisper as _whisper  # type: ignore
 
-                self.whisper_model = _whisper.load_model(WHISPER_MODEL_NAME)
+                self.whisper_model = _whisper.load_model(WHISPER_FALLBACK_MODEL_NAME)
             except Exception as e:
                 self.logger.error(f"No se pudo cargar el modelo Whisper: {e}")
                 self.whisper_model = None

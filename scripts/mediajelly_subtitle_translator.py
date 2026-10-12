@@ -148,6 +148,9 @@ class SubtitleQualityImprover:
             # Parsear el contenido SRT
             lines = srt_content.split("\n")
             improved_lines = []
+            # Una frase puede continuar en la línea o el cue siguiente: solo se fuerza la
+            # mayúscula inicial cuando la línea de texto anterior cerró su frase.
+            previous_closed_sentence = True
 
             for line in lines:
                 line = line.strip()
@@ -158,8 +161,11 @@ class SubtitleQualityImprover:
                 # Identificar líneas de diálogo (no números de secuencia ni timestamps)
                 if not self._is_sequence_number(line) and not self._is_timestamp(line):
                     # Aplicar mejoras de calidad al texto
-                    improved_text = self._improve_text_quality(line, source_language)
+                    improved_text = self._improve_text_quality(
+                        line, source_language, capitalize_first=previous_closed_sentence
+                    )
                     improved_lines.append(improved_text)
+                    previous_closed_sentence = improved_text.rstrip("\"')»] ").endswith((".", "?", "!", "…"))
                 else:
                     improved_lines.append(line)
 
@@ -170,7 +176,7 @@ class SubtitleQualityImprover:
                 self.logger.warning(f"Error mejorando calidad de subtítulos: {e}")
             return srt_content
 
-    def _improve_text_quality(self, text: str, source_language: str = "auto") -> str:
+    def _improve_text_quality(self, text: str, source_language: str = "auto", capitalize_first: bool = True) -> str:
         """
         Aplica mejoras específicas al texto de los subtítulos.
 
@@ -195,7 +201,7 @@ class SubtitleQualityImprover:
             text = self._improve_spanish_text(text)
 
         # Mejoras generales aplicables a todos los idiomas
-        text = self._apply_general_improvements(text)
+        text = self._apply_general_improvements(text, capitalize_first)
 
         return text
 
@@ -284,8 +290,12 @@ class SubtitleQualityImprover:
 
         return text
 
-    def _apply_general_improvements(self, text: str) -> str:
-        """Mejoras generales aplicables a cualquier idioma"""
+    def _apply_general_improvements(self, text: str, capitalize_first: bool = True) -> str:
+        """Mejoras generales aplicables a cualquier idioma.
+
+        `capitalize_first=False` deja como está la primera letra (la línea continúa
+        una frase empezada en la línea anterior).
+        """
         # Eliminar espacios múltiples
         text = self.re_spaces.sub(" ", text)
 
@@ -305,7 +315,7 @@ class SubtitleQualityImprover:
         for i, sentence in enumerate(sentences):
             if i % 2 == 0 and sentence.strip():  # Contenido de oración
                 sentence = sentence.strip()
-                if sentence:
+                if sentence and (i > 0 or capitalize_first):
                     # Solo capitalizar si la oración no comienza con un número (para listas)
                     if not sentence[0].isdigit():
                         sentence = sentence[0].upper() + sentence[1:]
@@ -3238,6 +3248,9 @@ def _run_regeneration(args, translator, env_config: dict):
     # Los que aún esperan compresión se quedan en la cola para otra noche
     remaining = [str(video_file) for video_file in video_files]
     pending_compression = translator._pending_compression_paths()
+    for video_file in video_files:
+        if str(video_file) in pending_compression:
+            logger.warning(f"Pendiente de compresión, se deja para un ciclo posterior: {video_file.name}")
     video_files = [video_file for video_file in video_files if str(video_file) not in pending_compression]
 
     logger.info(f"=== Regenerando subtítulos con Whisper para {len(video_files)} archivo(s) ===")
