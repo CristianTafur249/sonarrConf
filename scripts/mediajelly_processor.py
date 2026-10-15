@@ -80,6 +80,14 @@ MAX_MEMORY_GB = 4
 MAX_MEMORY_GB_UHD = 10
 UHD_WIDTH_THRESHOLD = 3800   # cubre 3840x2160 (2160p) y variantes cercanas
 UHD_HEIGHT_THRESHOLD = 2000
+# El contenido 4K/UHD se reduce a 1080p al comprimir: el Roku Express no
+# decodifica 2160p y Jellyfin no reescala al transcodificar, así que un
+# archivo 4K simplemente no reproduce.
+DOWNSCALE_MAX_WIDTH = 1920
+DOWNSCALE_MAX_HEIGHT = 1080
+# Transferencias HDR (PQ / HLG). Al bajar a 1080p SDR hay que hacer
+# tonemapping o la imagen queda apagada y desaturada.
+HDR_COLOR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 FFMPEG_TIMEOUT = 18000 # 5 horas por archivo
 COMPRESSED_FILE_SUFFIX = ".compressed.mp4"
 STREAM_LANGUAGE_QUERY = "stream=index:stream_tags=language"
@@ -1050,7 +1058,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height,pix_fmt",
+                "stream=width,height,pix_fmt,color_transfer",
                 "-of",
                 "csv=s=x:p=0",
                 str(file_path),
@@ -1060,6 +1068,13 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             )
             if result.returncode == 0 and result.stdout.strip():
                 parts = result.stdout.strip().split("x")
+                if len(parts) >= 4:
+                    return {
+                        "width": int(parts[0]),
+                        "height": int(parts[1]),
+                        "pix_fmt": parts[2],
+                        "color_transfer": parts[3],
+                    }
                 if len(parts) == 3:
                     width, height, pix_fmt = parts
                     return {"width": int(width), "height": int(height), "pix_fmt": pix_fmt}
@@ -1087,6 +1102,47 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             return False
         pix_fmt = (resolution.get("pix_fmt") or "").lower()
         return "10" in pix_fmt
+
+    def _is_hdr_transfer(self, resolution: Optional[Dict[str, Any]]) -> bool:
+        """True si el video usa una transferencia HDR (PQ o HLG)."""
+        if not resolution:
+            return False
+        return (resolution.get("color_transfer") or "").lower() in HDR_COLOR_TRANSFERS
+
+    def _downscale_size(self, resolution: Optional[Dict[str, Any]]) -> Optional[Tuple[int, int]]:
+        """Tamaño de salida (ancho, alto) para contenido 4K/UHD, conservando
+        la proporción dentro de 1920x1080. None si no hay que reescalar."""
+        if not resolution or not self._is_uhd_resolution(resolution):
+            return None
+        width, height = resolution.get("width", 0), resolution.get("height", 0)
+        if width <= 0 or height <= 0:
+            return None
+        factor = min(DOWNSCALE_MAX_WIDTH / width, DOWNSCALE_MAX_HEIGHT / height)
+        # Dimensiones pares: requisito de yuv420p / nv12
+        return int(width * factor) // 2 * 2, int(height * factor) // 2 * 2
+
+    def _tonemap_filter(self, resolution: Optional[Dict[str, Any]]) -> str:
+        """Cadena zscale+tonemap (software) de HDR a SDR bt709. Se usa la
+        versión por software porque tonemap_vaapi exige metadatos de mastering
+        display que no todos los archivos traen."""
+        transfer = (resolution or {}).get("color_transfer", "smpte2084").lower()
+        return (
+            f"zscale=tin={transfer}:min=bt2020nc:pin=bt2020:rin=tv:t=linear:npl=100,"
+            "format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv"
+        )
+
+    def _build_cpu_video_filter(self, resolution: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Filtro de video para el path CPU: reescala 4K/UHD a 1080p y aplica
+        tonemapping si es HDR. None si el archivo no necesita filtro."""
+        size = self._downscale_size(resolution)
+        if not size:
+            return None
+        filters = [f"scale={size[0]}:{size[1]}"]
+        if self._is_hdr_transfer(resolution):
+            filters.append(self._tonemap_filter(resolution))
+        filters.append("format=yuv420p")
+        return ",".join(filters)
 
     def _build_remux_command(
         self,
@@ -1254,30 +1310,49 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         # Asegurarnos de que los códigos de idioma sean ISO 639-2 (tres letras) para MP4
         audio_languages = self._ensure_three_letter_codes(audio_languages)
 
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-y",
-            "-probesize",
-            "100M",
-            "-analyzeduration",
-            "100M",
-            "-hwaccel",
-            "vaapi",
-            "-hwaccel_device",
-            VAAPI_DEVICE_PATH,
-            "-hwaccel_output_format",
-            "vaapi",
-            "-i",
-            str(file_path),
-        ]
+        downscale_size = self._downscale_size(resolution)
+        needs_tonemap = bool(downscale_size) and self._is_hdr_transfer(resolution)
 
+        ffmpeg_cmd = ["ffmpeg", "-hide_banner", "-y", "-probesize", "100M", "-analyzeduration", "100M"]
+        if needs_tonemap:
+            # El tonemapping baja los frames a memoria (hwdownload) y los
+            # vuelve a subir (hwupload), y hwupload necesita un dispositivo
+            # con nombre declarado para los filtros.
+            ffmpeg_cmd.extend(
+                [
+                    "-init_hw_device",
+                    f"vaapi=va:{VAAPI_DEVICE_PATH}",
+                    "-filter_hw_device",
+                    "va",
+                    "-hwaccel",
+                    "vaapi",
+                    "-hwaccel_device",
+                    "va",
+                ]
+            )
+        else:
+            ffmpeg_cmd.extend(["-hwaccel", "vaapi", "-hwaccel_device", VAAPI_DEVICE_PATH])
+        ffmpeg_cmd.extend(["-hwaccel_output_format", "vaapi", "-i", str(file_path)])
+
+        if downscale_size:
+            # 4K/UHD: decodificar y reescalar a 1080p en GPU. Si además es HDR,
+            # el tonemapping se hace por software sobre el frame ya reducido.
+            width, height = downscale_size
+            if needs_tonemap:
+                hw_fmt, sw_fmt = ("p010", "p010le") if self._is_10bit_pix_fmt(resolution) else ("nv12", "nv12")
+                video_filter = (
+                    f"scale_vaapi=w={width}:h={height}:format={hw_fmt},hwdownload,format={sw_fmt},"
+                    f"{self._tonemap_filter(resolution)},format=nv12,hwupload"
+                )
+            else:
+                video_filter = f"scale_vaapi=w={width}:h={height}:format=nv12"
+            ffmpeg_cmd.extend(["-vf", video_filter])
         # Contenido 10-bit (yuv420p10le, p010le, etc.): h264_vaapi sólo puede
         # codificar superficies de 8-bit. Confirmado en este hardware que hay
         # que convertir explícitamente vía VPP (scale_vaapi=format=nv12)
         # antes de encodear, o falla con "No usable encoding profile found".
         # No depende de la resolución: se aplica igual a 1080p que a 4K.
-        if self._is_10bit_pix_fmt(resolution):
+        elif self._is_10bit_pix_fmt(resolution):
             ffmpeg_cmd.extend(["-vf", "scale_vaapi=format=nv12"])
 
         ffmpeg_cmd.extend(
@@ -1384,6 +1459,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
         threads: Optional[int] = None,
+        resolution: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg fallback sin aceleración de hardware"""
         if audio_languages is None:
@@ -1406,6 +1482,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Video config
         ffmpeg_cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-map", "0:v:0"])  # Más rápido
+        video_filter = self._build_cpu_video_filter(resolution)
+        if video_filter:
+            ffmpeg_cmd.extend(["-vf", video_filter])
         if threads:
             ffmpeg_cmd.extend(["-threads", str(threads)])
 
@@ -1494,6 +1573,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         audio_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
         threads: Optional[int] = None,
+        resolution: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         """Construye comando ffmpeg sin subtítulos para archivos con subtítulos corruptos"""
         if audio_languages is None:
@@ -1520,6 +1600,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             "-map",
             "0:v:0",
         ]
+        video_filter = self._build_cpu_video_filter(resolution)
+        if video_filter:
+            ffmpeg_cmd.extend(["-vf", video_filter])
         if threads:
             ffmpeg_cmd.extend(["-threads", str(threads)])
 
@@ -2083,9 +2166,16 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 self._prepare_compression(file_path, resolution=resolution)
             )
             if not is_prepared:
-                # Si se skippeó, considerarlo exitoso
+                # Si se skippeó, considerarlo exitoso y registrarlo como completado:
+                # si no, se queda en pendientes y se reprocesa en cada ciclo.
                 if compression_info.get("skipped", False):
                     result["success"] = True
+                    try:
+                        mark_completed(str(file_path))
+                        with open(self.completed_file, "a") as f:
+                            f.write(f"{file_path}\n")
+                    except Exception as e:
+                        self.logger.error(f"Error marcando como completado archivo omitido {file_path}: {e}")
                 return {**result, **compression_info}
 
             if temp_output is None:
@@ -2142,6 +2232,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 sub_indices,
                 audio_languages,
                 use_remux=use_remux,
+                resolution=resolution,
             )
 
             result.update(compression_result)
@@ -2308,7 +2399,15 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         # Verificar si ya está en codec eficiente
         efficient_codecs = {"h264", "hevc", "av1"}
-        if video_codec in efficient_codecs and not is_av1:  # AV1 usa remux, otros eficientes se procesan normalmente
+        if self._is_uhd_resolution(resolution):
+            # 4K/UHD nunca se remuxa: hay que recodificar para bajarlo a 1080p,
+            # aunque el codec y el bitrate ya sean eficientes.
+            self.logger.info(
+                f"{EmojiGenerator.refresh()} Archivo 4K/UHD detectado, se recodifica a 1080p: {file_path.name}"
+            )
+            use_gpu = self._should_use_gpu_compression(file_path, resolution=resolution)
+            use_remux = False
+        elif video_codec in efficient_codecs and not is_av1:  # AV1 usa remux, otros eficientes se procesan normalmente
             # Para h264/hevc, verificar si el bitrate es razonable
             bitrate_info = self._get_video_bitrate(file_path)
             if bitrate_info and bitrate_info.get("bitrate_kbps", 0) < 9000:  # Menos de 9 Mbps (aumentado de 8)
@@ -2362,8 +2461,9 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             sub_indices: Lista de índices de streams de subtítulos a conservar.
             use_remux: Si True, usa modo remux (copia de streams) en lugar de recodificar.
             audio_languages: Diccionario de idiomas de audio {index: lang_code}.
-            resolution: Resolución/pix_fmt ya detectados (evita reprobar); usado
-                sólo en el path GPU para decidir si hace falta convertir a 8-bit.
+            resolution: Resolución/pix_fmt/transferencia ya detectados (evita
+                reprobar); decide la conversión a 8-bit en GPU y, en 4K/UHD,
+                el reescalado a 1080p con tonemapping.
 
         Returns:
             Tuple conteniendo:
@@ -2380,7 +2480,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
 
         if skip_subtitles:
             ffmpeg_cmd = self._build_ffmpeg_command_no_subtitles(
-                file_path, temp_output, audio_indices, audio_languages, threads=threads
+                file_path, temp_output, audio_indices, audio_languages, threads=threads, resolution=resolution
             )
             cmd_str = " ".join(ffmpeg_cmd[:10]) + " ... [CPU/audio/no-subs]"
             self.logger.info(f"Comando ffmpeg NO-SUBS: {cmd_str}")
@@ -2397,7 +2497,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             self.logger.info(f"Comando ffmpeg GPU: {cmd_str}")
         else:
             ffmpeg_cmd = self._build_fallback_ffmpeg_command(
-                file_path, temp_output, audio_indices, sub_indices, audio_languages, threads=threads
+                file_path, temp_output, audio_indices, sub_indices, audio_languages, threads=threads,
+                resolution=resolution,
             )
             cmd_str = " ".join(ffmpeg_cmd[:8]) + " ... [CPU/audio/output]"
             self.logger.info(f"Comando ffmpeg CPU: {cmd_str}")
@@ -2441,6 +2542,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
         sub_indices: List[int],
         audio_languages: Optional[Dict[int, str]] = None,
         use_remux: bool = False,
+        resolution: Optional[Dict[str, Any]] = None,
     ) -> Dict:
         """Maneja la lógica de fallback CPU"""
         if audio_languages is None:
@@ -2455,7 +2557,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if temp_output.exists():
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
-                file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages
+                file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages,
+                resolution=resolution,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
@@ -2467,7 +2570,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
             if temp_output.exists():
                 temp_output.unlink()
             process, new_elapsed_time = self._execute_compression_attempt(
-                file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages
+                file_path, temp_output, False, audio_indices, sub_indices, False, audio_languages,
+                resolution=resolution,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
@@ -2484,7 +2588,8 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 if temp_output.exists():
                     temp_output.unlink()
                 process, new_elapsed_time = self._execute_compression_attempt(
-                    file_path, temp_output, False, audio_indices, [], False, audio_languages, skip_subtitles=True
+                    file_path, temp_output, False, audio_indices, [], False, audio_languages, skip_subtitles=True,
+                    resolution=resolution,
                 )
                 compression_result = self._process_compression_result(
                     process, file_path, temp_output, new_elapsed_time, False
@@ -2509,6 +2614,7 @@ class MediaJellyProcessor(FilenameNormalizerMixin, PendingFilesMixin, LanguageDe
                 False,
                 audio_languages,
                 skip_subtitles=True,
+                resolution=resolution,
             )
             compression_result = self._process_compression_result(
                 process, file_path, temp_output, new_elapsed_time, False
