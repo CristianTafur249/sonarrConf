@@ -8,6 +8,7 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 
 - **Zona horaria en los jobs de cron**: el entrypoint aplica `TZ` a `/etc/localtime` en cada arranque. Antes cron lanzaba los scripts sin `TZ` y veían UTC, por lo que la "noche" caía entre las 19:00 y las 00:59 hora local.
 - **Corte real de subtítulos a las 06:00**: el cron runner lanza el traductor como subproceso y lo termina (con ffmpeg/Whisper) al acabar la ventana 00:00-05:59. El progreso se conserva y se reanuda la noche siguiente.
+- **4K/UHD a 1080p en la compresión**: el procesador recodifica el contenido 2160p a 1080p (con tonemapping a SDR si es HDR) en lugar de remuxarlo. Antes un H.264 4K de bitrate bajo pasaba como "ya optimizado" y el Roku Express no podía reproducirlo.
 - **Escáner**: un `.srt` genérico que no está en español ya no cuenta como "tiene subtítulos"; el video queda pendiente para traducirlo.
 
 ### Rendimiento del ciclo
@@ -22,6 +23,8 @@ Registro de cambios del proyecto MediaJelly, un servidor multimedia automatizado
 ### Mejoras de subtítulos
 
 - **Transcripción con faster-whisper** (VAD + marcas por palabra) en lugar de openai-whisper, que queda como fallback: mejor sincronía y menos tiempo por episodio. Los cues se limitan a 7 s y no se solapan; el audio se extrae alineado a t=0.
+- **Modelo `large-v3-turbo`** para transcribir (antes `small`), con `small` como respaldo si no carga. Se le pasan los personajes y el título del `.nfo` como referencia para los nombres propios.
+- **Cortes de línea** en fin de frase o coma, y sin mayúscula forzada cuando la línea continúa una frase.
 - **Selección de pista embebida por metadatos**: se descartan pistas forzadas y de carteles/canciones, se prioriza inglés y se extrae solo la pista elegida.
 - **Regla de cobertura**: un subtítulo existente o embebido solo se usa como fuente si llega al 60 % de la duración del video y tiene al menos 2 cues por minuto; si no, se recurre a Whisper.
 - **Un solo `ffprobe` por archivo** en el traductor.
