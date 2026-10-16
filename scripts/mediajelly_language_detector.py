@@ -860,7 +860,9 @@ def detect_language_with_whisper(model, audio_file: str) -> Tuple[Optional[str],
         return None, {}
 
 
-def detect_language_with_multiple_samples(model, file_path: Union[str, Path], stream_index: int, total_duration: float) -> str:
+def detect_language_with_multiple_samples(
+    model, file_path: Union[str, Path], stream_index: int, total_duration: float
+) -> Optional[str]:
     """
     Detecta el idioma usando múltiples muestras aleatorias y votación.
 
@@ -874,7 +876,8 @@ def detect_language_with_multiple_samples(model, file_path: Union[str, Path], st
         total_duration: Duración total del archivo en segundos.
 
     Returns:
-        str: Código de idioma detectado en formato ISO 639-2 (3 letras).
+        Optional[str]: Código ISO 639-2 (3 letras), o None si no se pudo analizar
+        ninguna muestra (no se asume español: etiquetarlo así engaña a Sonarr/Jellyfin).
     """
     if total_duration < 60:
         log(f"Archivo muy corto ({total_duration:.1f}s), usando muestra única", "WARNING")
@@ -928,8 +931,8 @@ def detect_language_with_multiple_samples(model, file_path: Union[str, Path], st
 
     # Determinar idioma ganador
     if not language_votes:
-        log("No se pudieron analizar muestras, usando 'spa' por defecto", "WARNING")
-        return "spa"
+        log("No se pudieron analizar muestras, idioma desconocido", "WARNING")
+        return None
 
     # Ordenar por votos
     sorted_votes = sorted(language_votes.items(), key=lambda x: x[1], reverse=True)
@@ -963,7 +966,9 @@ def detect_language_with_multiple_samples(model, file_path: Union[str, Path], st
     return LANGUAGE_CODE_MAP.get(final_lang, final_lang)
 
 
-def detect_single_sample(model, file_path: Union[str, Path], stream_index: int, total_duration: float) -> str:
+def detect_single_sample(
+    model, file_path: Union[str, Path], stream_index: int, total_duration: float
+) -> Optional[str]:
     """
     Detecta el idioma usando una única muestra (para archivos cortos).
 
@@ -981,7 +986,7 @@ def detect_single_sample(model, file_path: Union[str, Path], stream_index: int, 
     temp_audio = extract_audio_sample(file_path, stream_index, start_time, min(30, total_duration))
 
     if not temp_audio:
-        return "spa"
+        return None
 
     try:
         detected_lang, probs = detect_language_with_whisper(model, temp_audio)
@@ -998,7 +1003,7 @@ def detect_single_sample(model, file_path: Union[str, Path], stream_index: int, 
 
             return final_lang
 
-        return "spa"
+        return None
 
     finally:
         try:
@@ -1148,6 +1153,10 @@ def process_files(files_to_analyze: List[Dict[str, Any]], cache: Dict[str, Any])
                 log(f"Stream {stream_index}: {detected_lang} (cacheado)", "SUCCESS")
             else:
                 detected_lang = detect_language_with_multiple_samples(model, absolute_path, stream_index, duration)
+                if not detected_lang:
+                    # Sin cachear: se reintenta en la próxima corrida
+                    log(f"Stream {stream_index}: idioma no detectado", "WARNING")
+                    continue
                 set_cached_language(absolute_path, stream_index, detected_lang)
                 log(f"Stream {stream_index}: {detected_lang}", "SUCCESS")
 
