@@ -5,10 +5,11 @@ Script para normalizar rutas en archivos completed.txt y pending-compression.txt
 
 import os
 from pathlib import Path
+from mediajelly_utils import MediaJellyPaths
 
-# Detecta entorno
-is_container = Path("/mediajelly").exists()
-base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+# Detecta entorno usando MediaJellyPaths
+is_container = MediaJellyPaths.is_container()
+base_dir = MediaJellyPaths.get_base_path()
 media_dir = base_dir / "media"
 completed_file = base_dir / "scripts" / "completed.txt"
 pending_file = base_dir / "scripts" / "pending-compression.txt"

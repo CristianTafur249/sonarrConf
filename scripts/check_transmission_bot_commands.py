@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from urllib.request import urlopen, Request
 
 # Logging
@@ -13,7 +14,7 @@ LOG_FILE = os.path.join(LOG_DIR, 'check_transmission_bot_commands.log')
 logger = logging.getLogger('check_transmission_bot_commands')
 if not logger.handlers:
     logger.setLevel(logging.INFO)
-    fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
     fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))

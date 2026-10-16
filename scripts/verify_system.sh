@@ -70,8 +70,8 @@ echo ""
 
 # 4. Verificar logs del sistema
 echo "📋 Verificando últimas ejecuciones..."
-if [ -f "scripts/logs/language-detection.log" ]; then
-    LAST_SUCCESS=$(grep "✅ ANÁLISIS COMPLETADO" scripts/logs/language-detection.log | tail -1)
+if [ -f "scripts/tmp/logs/language-detection.log" ]; then
+    LAST_SUCCESS=$(grep "✅ ANÁLISIS COMPLETADO" scripts/tmp/logs/language-detection.log | tail -1)
     if [ -n "$LAST_SUCCESS" ]; then
         echo -e "${GREEN}✅ Detector de idiomas funcionando${NC}"
         echo "   Último éxito: $LAST_SUCCESS"
@@ -135,5 +135,5 @@ echo ""
 echo "📝 Próximos pasos:"
 echo "   1. Revisar TODO.md para tareas pendientes"
 echo "   2. Ejecutar tests: pytest -v"
-echo "   3. Verificar logs: tail -f scripts/logs/language-detection.log"
+echo "   3. Verificar logs: tail -f scripts/tmp/logs/language-detection.log"
 echo ""

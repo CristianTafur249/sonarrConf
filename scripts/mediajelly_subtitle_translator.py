@@ -19,8 +19,13 @@ from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple, Dict, Any, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import shutil
+import tempfile
 
 from mediajelly_emoji import EmojiGenerator
+from mediajelly_utils import MediaJellyPaths, create_compressed_rotating_file_handler
+from mediajelly_whisper_extractor import WhisperAudioExtractorMixin, WHISPER_AVAILABLE
+from mediajelly_db import get_pending_files, load_progress, save_progress
 
 # Importar configuración centralizada
 try:
@@ -30,16 +35,12 @@ try:
 except ImportError:
     MediaJellyConfig = None
     CONFIG_AVAILABLE = False
+try:
+    from mediajelly_config import get_config
+except Exception:
+    get_config = None
 
 # Importaciones opcionales con manejo de errores
-try:
-    import whisper  # type: ignore
-
-    WHISPER_AVAILABLE = True
-except ImportError:
-    whisper = None
-    WHISPER_AVAILABLE = False
-
 try:
     from langdetect import detect as langdetect_detect  # type: ignore
 
@@ -56,6 +57,22 @@ except ImportError:
     YandexTranslate = None
     YANDEX_AVAILABLE = False
 
+try:
+    import webrtcvad  # type: ignore
+    import soundfile as sf  # type: ignore
+
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtcvad = None
+    sf = None
+    WEBRTC_AVAILABLE = False
+
+# Path to whisper.cpp binary if compiled in the image
+WHISPER_CPP_BIN = Path("/usr/local/bin/whisper_cpp")
+# Buscar por defecto el modelo en la carpeta montada persistente del proyecto
+# Permite sobrescribir vía env WHISPER_CPP_MODEL
+WHISPER_CPP_DEFAULT_MODEL = Path(os.environ.get("WHISPER_CPP_MODEL", "/mediajelly/media/models/ggml-small.bin"))
+
 # Lock global para Whisper (solo un proceso a la vez)
 whisper_lock = threading.Lock()
 
@@ -69,12 +86,34 @@ STATUS_COMPLETED = "completed"
 
 # Constantes de rutas
 MEDIAJELLY_PATH = "/mediajelly"
-HOST_MEDIAJELLY_PATH = "/home/tafurc/mediaJelly"
 
 # Configuración de timeouts
 FFPROBE_TIMEOUT = 120  # segundos
 FFPROBE_QUICK_TIMEOUT = 30  # segundos para verificación rápida
 EXCLUDED_FOLDERS = {".delete", ".deleted", ".tmp", ".temp", ".trash", ".recycle"}
+
+# Un subtítulo existente/embebido solo se usa como fuente de traducción si cubre el
+# video: su último cue llega al menos a esta fracción de la duración...
+MIN_SUBTITLE_COVERAGE = 0.6
+# ...y tiene al menos esta densidad de cues (descarta pistas de carteles/canciones)
+MIN_CUES_PER_MINUTE = 2
+MIN_SUBTITLE_CUES = 3
+
+# Tope por petición al servicio de traducción: sin él, una petición sin respuesta
+# bloqueaba el proceso toda la noche
+TRANSLATE_REQUEST_TIMEOUT = 60
+# Fallos o timeouts seguidos tras los que se abandona la traducción de un archivo
+MAX_TRANSLATE_FAILURES = 5
+
+SPANISH_LANG_CODES = {"spa", "es", "esp", "spanish"}
+ENGLISH_LANG_CODES = {"eng", "en", "english"}
+TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text"}
+# Títulos de pistas parciales (no contienen el diálogo completo)
+PARTIAL_SUBTITLE_TITLE_RE = re.compile(r"sign|song|forced|forzad|commentar|karaoke", re.IGNORECASE)
+SDH_SUBTITLE_TITLE_RE = re.compile(r"\bsdh\b|\bcc\b|hearing", re.IGNORECASE)
+SRT_TIMESTAMP_RE = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[,\.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,\.](\d{3})"
+)
 
 
 class SubtitleQualityImprover:
@@ -82,6 +121,14 @@ class SubtitleQualityImprover:
 
     def __init__(self, logger=None):
         self.logger = logger
+        # Compilar patrones regex frecuentes para mejorar rendimiento
+        self.re_spaces = re.compile(r"\s+")
+        self.re_space_before_punct = re.compile(r"\s+([,.!?;:])")
+        self.re_multi_punct = re.compile(r"([,.!?;:])\s*([,.!?;:])")
+        self.re_quote_open = re.compile(r'"\s+')
+        self.re_quote_close = re.compile(r'\s+"')
+        self.re_paren_open = re.compile(r"\(\s+")
+        self.re_paren_close = re.compile(r"\s+\)")
 
     def improve_subtitle_quality(self, srt_content: str, source_language: str = "auto") -> str:
         """
@@ -101,6 +148,9 @@ class SubtitleQualityImprover:
             # Parsear el contenido SRT
             lines = srt_content.split("\n")
             improved_lines = []
+            # Una frase puede continuar en la línea o el cue siguiente: solo se fuerza la
+            # mayúscula inicial cuando la línea de texto anterior cerró su frase.
+            previous_closed_sentence = True
 
             for line in lines:
                 line = line.strip()
@@ -111,8 +161,11 @@ class SubtitleQualityImprover:
                 # Identificar líneas de diálogo (no números de secuencia ni timestamps)
                 if not self._is_sequence_number(line) and not self._is_timestamp(line):
                     # Aplicar mejoras de calidad al texto
-                    improved_text = self._improve_text_quality(line, source_language)
+                    improved_text = self._improve_text_quality(
+                        line, source_language, capitalize_first=previous_closed_sentence
+                    )
                     improved_lines.append(improved_text)
+                    previous_closed_sentence = improved_text.rstrip("\"')»] ").endswith((".", "?", "!", "…"))
                 else:
                     improved_lines.append(line)
 
@@ -123,7 +176,7 @@ class SubtitleQualityImprover:
                 self.logger.warning(f"Error mejorando calidad de subtítulos: {e}")
             return srt_content
 
-    def _improve_text_quality(self, text: str, source_language: str = "auto") -> str:
+    def _improve_text_quality(self, text: str, source_language: str = "auto", capitalize_first: bool = True) -> str:
         """
         Aplica mejoras específicas al texto de los subtítulos.
 
@@ -148,7 +201,7 @@ class SubtitleQualityImprover:
             text = self._improve_spanish_text(text)
 
         # Mejoras generales aplicables a todos los idiomas
-        text = self._apply_general_improvements(text)
+        text = self._apply_general_improvements(text, capitalize_first)
 
         return text
 
@@ -171,7 +224,13 @@ class SubtitleQualityImprover:
             if len(clean_text) < 3:
                 return "en"
 
-            detected = langdetect_detect(clean_text)
+            # Importar localmente para evitar llamadas a objetos None en análisis estático
+            try:
+                    from langdetect import detect as _langdetect_detect
+            except Exception:
+                return "en"
+
+            detected = _langdetect_detect(clean_text)
             return detected if detected in ["en", "es"] else "en"
         except Exception:
             return "en"
@@ -214,18 +273,13 @@ class SubtitleQualityImprover:
     def _improve_spanish_text(self, text: str) -> str:
         """Mejoras específicas para texto en español"""
         # Correcciones comunes en español
+        # No se tocan que/como/donde/cuando: llevar tilde o no depende de la frase, y
+        # forzarla producía "lo qué haces" o "es cómo ser" en todos los subtítulos.
         corrections = {
-            # Tildes y caracteres especiales
-            r"\b(que|QUE)\b": "qué",
-            r"\b(como|COMO)\b": "cómo",
-            r"\b(donde|DONDE)\b": "dónde",
-            r"\b(cuando|CUANDO)\b": "cuándo",
-            r"\b(porque|PORQUE)\b": "porque",
             # Errores comunes de traducción automática
             r"\b(el|EL)\s+(is|IS)\b": "es",
             r"\b(la|LA)\s+(is|IS)\b": "es",
             r"\b(yes|YES)\b": "sí",
-            r"\b(no|NO)\b": "no",
             # Corregir artículos
             r"\b(un|UN)\s+(a|A)\b": "una",
             r"\b(una|UNA)\s+(a|A)\b": "una",
@@ -236,20 +290,24 @@ class SubtitleQualityImprover:
 
         return text
 
-    def _apply_general_improvements(self, text: str) -> str:
-        """Mejoras generales aplicables a cualquier idioma"""
+    def _apply_general_improvements(self, text: str, capitalize_first: bool = True) -> str:
+        """Mejoras generales aplicables a cualquier idioma.
+
+        `capitalize_first=False` deja como está la primera letra (la línea continúa
+        una frase empezada en la línea anterior).
+        """
         # Eliminar espacios múltiples
-        text = re.sub(r"\s+", " ", text)
+        text = self.re_spaces.sub(" ", text)
 
         # Corregir puntuación
-        text = re.sub(r"\s+([,.!?;:])", r"\1", text)  # Quitar espacios antes de puntuación
-        text = re.sub(r"([,.!?;:])\s*([,.!?;:])", r"\1\2", text)  # Corregir puntuación duplicada
+        text = self.re_space_before_punct.sub(r"\1", text)  # Quitar espacios antes de puntuación
+        text = self.re_multi_punct.sub(r"\1\2", text)  # Corregir puntuación duplicada
 
         # Corregir comillas y paréntesis
-        text = re.sub(r'"\s+', '"', text)  # Quitar espacios después de comillas de apertura
-        text = re.sub(r'\s+"', '"', text)  # Quitar espacios antes de comillas de cierre
-        text = re.sub(r"\(\s+", "(", text)  # Quitar espacios después de paréntesis de apertura
-        text = re.sub(r"\s+\)", ")", text)  # Quitar espacios antes de paréntesis de cierre
+        text = self.re_quote_open.sub('"', text)  # Quitar espacios después de comillas de apertura
+        text = self.re_quote_close.sub('"', text)  # Quitar espacios antes de comillas de cierre
+        text = self.re_paren_open.sub("(", text)  # Quitar espacios después de paréntesis de apertura
+        text = self.re_paren_close.sub(")", text)  # Quitar espacios antes de paréntesis de cierre
 
         # Capitalizar primera letra de oraciones
         sentences = re.split(r"([.!?]+\s*)", text)
@@ -257,7 +315,7 @@ class SubtitleQualityImprover:
         for i, sentence in enumerate(sentences):
             if i % 2 == 0 and sentence.strip():  # Contenido de oración
                 sentence = sentence.strip()
-                if sentence:
+                if sentence and (i > 0 or capitalize_first):
                     # Solo capitalizar si la oración no comienza con un número (para listas)
                     if not sentence[0].isdigit():
                         sentence = sentence[0].upper() + sentence[1:]
@@ -280,6 +338,10 @@ class SubtitleQualityImprover:
         return bool(re.match(r"^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$", line.strip()))
 
 
+class TranslationStalledError(Exception):
+    """El servicio de traducción dejó de responder; se abandona el archivo en curso."""
+
+
 @dataclass
 class TranslationStats:
     """Estadísticas de traducción de subtítulos"""
@@ -290,41 +352,24 @@ class TranslationStats:
     files_processed: int = 0
 
 
-class SubtitleTranslator:
+class SubtitleTranslator(WhisperAudioExtractorMixin):
     """Gestor de extracción y traducción de subtítulos con soporte de Whisper"""
 
     PROGRESS_FILE_NAME = "progress.json"
 
-    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None) -> None:
+    def __init__(self, max_workers: int = 2, use_whisper: bool = True, allow_retranslate: bool = False, lock_file: Optional[Path] = None, force_language: Optional[str] = None) -> None:
         # Configurar rutas desde configuración
-        self.is_container = Path("/mediajelly").exists()
-        self.base_dir = Path("/mediajelly" if self.is_container else "/home/tafurc/mediaJelly")
+        self.is_container = MediaJellyPaths.is_container()
+        self.base_dir = MediaJellyPaths.get_base_path()
         self.scripts_dir = self.base_dir / "scripts"
-        self.logs_dir = self.scripts_dir / "logs"
+        self.logs_dir = self.scripts_dir / "tmp" / "logs"
         self.tmp_dir = self.scripts_dir / "tmp"
 
         # Crear directorios
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # Configurar logging
-        self.logger = logging.getLogger("mediajelly")
-        self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
-
-        # Configurar handlers para archivo
-        log_file = self.logs_dir / "subtitle_translator.log"
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-
-        # También loggear a consola
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
+        self.setup_logging()
 
         # Cargar configuración centralizada
         if CONFIG_AVAILABLE:
@@ -349,14 +394,32 @@ class SubtitleTranslator:
         self.max_workers = max_workers  # Procesamiento concurrente
         self.use_whisper = use_whisper
         self.allow_retranslate = allow_retranslate  # Permitir re-traducción de archivos .es.srt existentes
+        # Forzar idioma de transcripción si se indica (ej: 'ja', 'en', 'es')
+        self.force_language = force_language
         self.progress_lock = threading.Lock()  # Lock para sincronizar progreso y estadísticas
+        self.file_locks: Dict[str, threading.Lock] = {}  # Lock por archivo para evitar carreras
+        self.file_locks_guard = threading.Lock()  # Protege creación de locks por archivo
         self.lock_file = lock_file  # Archivo de lock para sincronización
+        self._probe_cache: Dict[str, Dict[str, Any]] = {}  # Un ffprobe por archivo y ejecución
+        # Estadísticas de la ejecución en curso, para poder avisar del avance si se pausa
+        self.current_stats: Optional[Dict[str, Any]] = None
 
         # Verificar disponibilidad de dependencias
         self.whisper_available = WHISPER_AVAILABLE if self.use_whisper else False
         if self.use_whisper and not self.whisper_available:
             self.logger.warning("Whisper solicitado pero no disponible, se usarán solo subtítulos embebidos")
             self.use_whisper = False
+
+        # Inicializar traductor Yandex (reutilizable) para batching
+        self.yandex_translator = None
+        if YANDEX_AVAILABLE:
+            try:
+                # Importar localmente para evitar warnings de análisis estático
+                from translatepy.translators.yandex import YandexTranslate as _YandexTranslate
+
+                self.yandex_translator = _YandexTranslate()
+            except Exception:
+                self.yandex_translator = None
 
     def setup_logging(self) -> None:
         """Configura el sistema de logging."""
@@ -371,17 +434,18 @@ class SubtitleTranslator:
 
         formatter = LocalTimeFormatter("[%(asctime)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
 
-        file_handler = logging.FileHandler(log_file)
+        file_handler = create_compressed_rotating_file_handler(log_file)
         file_handler.setFormatter(formatter)
 
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
 
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("mediajelly")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers.clear()
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+        self.logger.propagate = False
 
     def _is_file_in_excluded_folder(self, file_path: Path) -> bool:
         """
@@ -394,6 +458,71 @@ class SubtitleTranslator:
             bool: True si está en una carpeta excluida.
         """
         return any(part.lower() in EXCLUDED_FOLDERS for part in file_path.parts)
+
+    def _probe_media(self, video_file: Path) -> Dict[str, Any]:
+        """
+        Ejecuta un único ffprobe por archivo (formato + streams) y cachea el resultado
+        durante la ejecución.
+
+        Args:
+            video_file: Ruta del archivo de video.
+
+        Returns:
+            Dict[str, Any]: `returncode` (None si hubo timeout), `stderr` y `data` (JSON o None).
+        """
+        key = str(video_file)
+        cached = self._probe_cache.get(key)
+        if cached is not None:
+            return cached
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=index,codec_type,codec_name,start_time"
+            ":stream_tags=language,title:stream_disposition=default,forced",
+            "-of",
+            "json",
+            str(video_file),
+        ]
+
+        probe: Dict[str, Any] = {"returncode": None, "stderr": "", "data": None}
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT)
+            probe["returncode"] = result.returncode
+            probe["stderr"] = result.stderr or ""
+            try:
+                probe["data"] = json.loads(result.stdout)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"Timeout analizando archivo con ffprobe ({FFPROBE_TIMEOUT}s): {video_file}")
+
+        self._probe_cache[key] = probe
+        return probe
+
+    def _media_duration(self, video_file: Path) -> Optional[float]:
+        """
+        Obtiene la duración del video en segundos.
+
+        Args:
+            video_file: Ruta del archivo de video.
+
+        Returns:
+            Optional[float]: Duración en segundos o None si no se pudo determinar.
+        """
+        try:
+            data = self._probe_media(video_file)["data"] or {}
+            return float(data["format"]["duration"])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _stream_language(stream: Dict[str, Any]) -> str:
+        """Devuelve el idioma etiquetado de un stream en minúsculas ('und' si no tiene)."""
+        tags = stream.get("tags", {})
+        return (tags.get("language") or tags.get("LANGUAGE") or "und").lower()
 
     def _is_file_accessible(self, video_file: Path) -> bool:
         """
@@ -415,15 +544,8 @@ class SubtitleTranslator:
                 self.logger.warning(f"Archivo muy pequeño, posiblemente corrupto: {video_file}")
                 return False
 
-            # Verificación rápida con ffprobe (solo duración)
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_file)]
+            return self._probe_media(video_file)["returncode"] == 0
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_QUICK_TIMEOUT)
-            return result.returncode == 0
-
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"Archivo inaccesible (timeout en verificación rápida): {video_file}")
-            return False
         except Exception as e:
             self.logger.warning(f"Error verificando accesibilidad del archivo {video_file}: {e}")
             return False
@@ -444,54 +566,20 @@ class SubtitleTranslator:
             return False, []
 
         try:
-            # Primero intentamos una verificación rápida (solo duración) para archivos grandes
-            quick_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_file)]
-
-            # Timeout más corto para la verificación rápida
-            result = subprocess.run(quick_cmd, capture_output=True, text=True, timeout=FFPROBE_QUICK_TIMEOUT)
-
-            if result.returncode != 0:
-                self.logger.warning(f"Error rápido verificando archivo: {video_file}")
-                # Si falla la verificación rápida, continuamos con la completa
-
-            # Verificación completa de pistas de audio
-            cmd = [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "a",
-                "-show_entries",
-                "stream=index:stream_tags=language",
-                "-of",
-                "json",
-                str(video_file),
-            ]
-
-            # Timeout aumentado para archivos complejos
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT)
-
-            if result.returncode != 0:
+            data = self._probe_media(video_file)["data"]
+            if not data:
                 self.logger.warning(f"Error al analizar pistas de audio: {video_file}")
                 return False, []
 
-            data = json.loads(result.stdout)
-            streams = data.get("streams", [])
-
-            languages = []
-            has_spanish = False
-
-            for stream in streams:
-                lang = stream.get("tags", {}).get("language", "und")
-                languages.append(lang)
-                if lang in ["spa", "es", "esp"]:
-                    has_spanish = True
+            languages = [
+                self._stream_language(stream)
+                for stream in data.get("streams", [])
+                if stream.get("codec_type") == "audio"
+            ]
+            has_spanish = any(lang in SPANISH_LANG_CODES for lang in languages)
 
             return has_spanish, languages
 
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Timeout verificando audio ({FFPROBE_TIMEOUT}s): {video_file}")
-            return False, []
         except Exception as e:
             self.logger.error(f"Error verificando audio: {e}")
             return False, []
@@ -599,9 +687,22 @@ class SubtitleTranslator:
                 continue
 
             # Validar que sea realmente un archivo SRT válido
-            if self._is_valid_srt_file(srt_file):
-                self.logger.info(f"Subtítulo encontrado para traducir: {srt_file.name}")
-                return srt_file
+            if not self._is_valid_srt_file(srt_file):
+                continue
+
+            # Debe cubrir el video; si no (pista parcial o extracción incompleta) se ignora
+            if not self._subtitle_covers_video(srt_file, self._media_duration(video_file)):
+                self.logger.info(f"Subtítulo existente insuficiente para la duración del video: {srt_file.name}")
+                if srt_file.name == f"{video_stem}.srt":
+                    # La extracción escribe en este mismo nombre: conservar copia del original
+                    try:
+                        srt_file.rename(srt_file.with_suffix(".srt.bak"))
+                    except Exception as e:
+                        self.logger.warning(f"No se pudo respaldar {srt_file.name}: {e}")
+                continue
+
+            self.logger.info(f"Subtítulo encontrado para traducir: {srt_file.name}")
+            return srt_file
 
         # Si no encontró nada y hay un .es.srt, permitir re-traducirlo solo si está habilitado
         if self.allow_retranslate:
@@ -685,11 +786,14 @@ class SubtitleTranslator:
             if not text_lines:
                 return "unknown"
 
-            # Tomar una muestra de las primeras líneas de texto para detectar idioma
-            sample_text = " ".join(text_lines[:10])  # Primeras 10 líneas
+            # Muestra repartida por todo el archivo: las primeras líneas suelen ser
+            # canciones o créditos y pueden estar en otro idioma que el diálogo
+            step = max(1, len(text_lines) // 40)
+            sample_text = " ".join(text_lines[::step][:40])
 
             try:
-                detected_lang = langdetect_detect(sample_text)
+                from langdetect import detect as _langdetect_detect
+                detected_lang = _langdetect_detect(sample_text)
                 return detected_lang
             except Exception:
                 return "unknown"
@@ -755,575 +859,6 @@ class SubtitleTranslator:
 
         return stats
 
-    def detect_embedded_subtitle_language(self, video_file: Path) -> Optional[str]:
-        """
-        Detecta el idioma de los subtítulos embebidos en el video.
-
-        Args:
-            video_file: Ruta del archivo de video.
-
-        Returns:
-            Optional[str]: Código de idioma detectado o None.
-        """
-        try:
-            # Extraer una muestra más grande de los subtítulos embebidos para detectar idioma
-            cmd = [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(video_file),
-                "-map",
-                "0:s:0",
-                "-c:s",
-                "srt",
-                "-t",
-                "360",  # Primeros 6 minutos para tener más texto
-                "-f",
-                "srt",
-                "pipe:1",  # Salida a stdout
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-            if result.returncode != 0:
-                self.logger.debug(f"No se pudieron extraer subtítulos para detección de idioma: {result.stderr[:200]}")
-                return None
-
-            subtitle_sample = result.stdout.strip()
-
-            if not subtitle_sample:
-                self.logger.debug("No se encontraron subtítulos embebidos")
-                return None
-
-            # Usar langdetect para detectar el idioma
-            if not LANGDETECT_AVAILABLE:
-                self.logger.warning("langdetect no disponible, no se puede detectar idioma de subtítulos embebidos")
-                return None
-
-            try:
-                # Extraer solo líneas de texto (no números ni timestamps)
-                lines = subtitle_sample.split("\n")
-                text_lines = []
-
-                for line in lines:
-                    line_stripped = line.strip()
-                    if (
-                        line_stripped
-                        and not line_stripped.isdigit()
-                        and "-->" not in line_stripped
-                        and not line_stripped.lower().startswith("http")
-                        and "www" not in line_stripped.lower()
-                        and "@" not in line_stripped
-                    ):
-                        text_lines.append(line_stripped)
-
-                if not text_lines:
-                    self.logger.debug("No se encontraron líneas de texto en los subtítulos")
-                    return None
-
-                # Tomar una muestra de las primeras líneas de texto
-                sample_text = " ".join(text_lines[:10])  # Primeras 10 líneas
-
-                detected_lang = langdetect_detect(sample_text)
-                self.logger.debug(
-                    f"Idioma detectado en subtítulos embebidos: {detected_lang} (muestra: {sample_text[:100]}...)"
-                )
-                return detected_lang
-
-            except Exception as e:
-                self.logger.debug(f"Error en detección de idioma: {e}")
-                return None
-
-        except Exception as e:
-            self.logger.debug(f"Error detectando idioma de subtítulos embebidos: {e}")
-            return None
-
-    def extract_subtitles_from_audio(self, video_file: Path) -> Optional[Path]:
-        """
-        Extrae subtítulos del audio usando Whisper (procesamiento secuencial con lock global).
-
-        Args:
-            video_file: Ruta del archivo de video.
-
-        Returns:
-            Optional[Path]: Ruta del archivo SRT generado o None si falló.
-        """
-        if not WHISPER_AVAILABLE:
-            self.logger.warning("Whisper no disponible, no se pueden extraer subtítulos del audio")
-            return None
-
-        audio_file = None
-        output_srt = None
-
-        try:
-            # Preparar archivos temporales
-            temp_files = self._prepare_temp_files(video_file)
-            audio_file, output_srt = temp_files
-
-            # Extraer audio del video (sin límite de duración)
-            if not self._extract_audio_from_video(video_file, audio_file):
-                return None
-
-            # Transcribir audio con Whisper
-            transcription_result = self._transcribe_audio_with_whisper(audio_file)
-            if not transcription_result:
-                return None
-
-            # Generar archivo SRT desde la transcripción
-            return self._generate_srt_from_transcription(transcription_result, output_srt)
-
-        except subprocess.TimeoutExpired:
-            self.logger.error("Timeout extrayendo audio (15 minutos)")
-            return None
-        except Exception as e:
-            self.logger.error(f"Error extrayendo subtítulos del audio: {e}")
-            return None
-        finally:
-            # LIMPIEZA: Eliminar archivos temporales SIEMPRE, incluso en errores
-            self._cleanup_temp_files(audio_file)
-
-    def _prepare_temp_files(self, video_file: Path) -> tuple[Path, Path]:
-        """
-        Prepara archivos temporales únicos para el procesamiento.
-
-        Args:
-            video_file: Ruta del archivo de video.
-
-        Returns:
-            tuple[Path, Path]: (Ruta archivo audio temporal, Ruta archivo SRT salida).
-        """
-        temp_prefix = f"{video_file.stem}_{video_file.stat().st_mtime_ns}"
-        audio_file = self.tmp_dir / f"{temp_prefix}_temp.wav"
-        output_srt = video_file.parent / f"{video_file.stem}.srt"
-        return audio_file, output_srt
-
-    def _extract_audio_from_video(self, video_file: Path, audio_file: Path) -> bool:
-        """
-        Extrae audio completo del video usando ffmpeg (con fallback para archivos corruptos).
-
-        Args:
-            video_file: Ruta del archivo de video.
-            audio_file: Ruta del archivo de audio temporal.
-
-        Returns:
-            bool: True si se extrajo correctamente.
-        """
-        self.logger.info(f"Extrayendo audio temporal: {audio_file.name}")
-
-        # Intentar primero con opciones normales
-        if self._extract_audio_normal(video_file, audio_file):
-            return True
-
-        # Si falla, intentar con opciones tolerantes a corrupción
-        self.logger.warning("Extracción normal falló, intentando con opciones tolerantes a corrupción...")
-        if self._extract_audio_corruption_tolerant(video_file, audio_file):
-            return True
-
-        # Si aún falla, intentar método alternativo con codec copy y re-mux
-        self.logger.warning("Extracción tolerante falló, intentando método de re-mux...")
-        return self._extract_audio_remux(video_file, audio_file)
-
-    def _extract_audio_normal(self, video_file: Path, audio_file: Path) -> bool:
-        """
-        Extrae audio con opciones normales de FFmpeg.
-
-        Args:
-            video_file: Ruta del archivo de video.
-            audio_file: Ruta del archivo de audio temporal.
-
-        Returns:
-            bool: True si se extrajo correctamente.
-        """
-        cmd = [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-i",
-            str(video_file),
-            "-ar",
-            "16000",  # Whisper requiere 16kHz
-            "-ac",
-            "1",  # Mono
-            "-c:a",
-            "pcm_s16le",
-            str(audio_file),
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6 horas timeout
-
-        if result.returncode != 0:
-            self.logger.error(f"Error extrayendo audio (modo normal): ffmpeg código {result.returncode}")
-            if result.stderr:
-                self.logger.error(f"FFmpeg stderr: {result.stderr[:500]}...")
-            return False
-
-        return self._validate_extracted_audio(audio_file)
-
-    def _extract_audio_corruption_tolerant(self, video_file: Path, audio_file: Path) -> bool:
-        """
-        Extrae audio con opciones tolerantes a corrupción.
-
-        Args:
-            video_file: Ruta del archivo de video.
-            audio_file: Ruta del archivo de audio temporal.
-
-        Returns:
-            bool: True si se extrajo correctamente.
-        """
-        cmd = [
-            "ffmpeg",
-            "-v",
-            "error",
-            "-y",
-            "-fflags",
-            "+discardcorrupt+genpts+igndts",  # Ignorar corrupción y generar timestamps
-            "-err_detect",
-            "ignore_err",  # Ignorar errores de decodificación
-            "-i",
-            str(video_file),
-            "-ar",
-            "16000",  # Whisper requiere 16kHz
-            "-ac",
-            "1",  # Mono
-            "-c:a",
-            "pcm_s16le",
-            str(audio_file),
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=21600)  # 6 horas timeout
-
-        if result.returncode != 0:
-            self.logger.error(f"Error extrayendo audio (modo tolerante): ffmpeg código {result.returncode}")
-            if result.stderr:
-                self.logger.error(f"FFmpeg stderr: {result.stderr[:500]}...")
-            return False
-
-        return self._validate_extracted_audio(audio_file)
-
-    def _extract_audio_remux(self, video_file: Path, audio_file: Path) -> bool:
-        """
-        Extrae audio usando re-mux para evitar decodificación de streams corruptos.
-
-        Args:
-            video_file: Ruta del archivo de video.
-            audio_file: Ruta del archivo de audio temporal.
-
-        Returns:
-            bool: True si se extrajo correctamente.
-        """
-        # Crear archivo temporal intermedio
-        temp_audio = audio_file.with_suffix(".temp.aac")
-
-        try:
-            # Paso 1: Extraer audio sin re-encodear (codec copy)
-            cmd1 = [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-fflags",
-                "+discardcorrupt",
-                "-i",
-                str(video_file),
-                "-vn",  # Sin video
-                "-acodec",
-                "copy",  # Copiar codec sin re-encodear
-                "-map",
-                "0:a:0",  # Solo primera pista de audio
-                str(temp_audio),
-            ]
-
-            result1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=3600)
-
-            if result1.returncode != 0 or not temp_audio.exists() or temp_audio.stat().st_size == 0:
-                self.logger.error(f"Error en re-mux paso 1: ffmpeg código {result1.returncode}")
-                return False
-
-            # Paso 2: Convertir a WAV desde el archivo extraído
-            cmd2 = [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-y",
-                "-fflags",
-                "+discardcorrupt+igndts",
-                "-err_detect",
-                "ignore_err",
-                "-i",
-                str(temp_audio),
-                "-ar",
-                "16000",  # Whisper requiere 16kHz
-                "-ac",
-                "1",  # Mono
-                "-c:a",
-                "pcm_s16le",
-                str(audio_file),
-            ]
-
-            result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=3600)
-
-            if result2.returncode != 0:
-                self.logger.error(f"Error en re-mux paso 2: ffmpeg código {result2.returncode}")
-                if result2.stderr:
-                    self.logger.error(f"FFmpeg stderr: {result2.stderr[:500]}...")
-                return False
-
-            return self._validate_extracted_audio(audio_file)
-
-        finally:
-            # Limpiar archivo temporal
-            if temp_audio.exists():
-                temp_audio.unlink()
-
-    def _validate_extracted_audio(self, audio_file: Path) -> bool:
-        """
-        Valida que el audio extraído sea usable.
-
-        Args:
-            audio_file: Ruta del archivo de audio.
-
-        Returns:
-            bool: True si el audio es válido.
-        """
-        if not audio_file.exists() or audio_file.stat().st_size == 0:
-            self.logger.error("Archivo de audio temporal no se creó o está vacío")
-            return False
-
-        # VALIDACIÓN: Verificar que el archivo de audio no esté corrupto
-        if not self._validate_audio_file(audio_file):
-            self.logger.error("Archivo de audio temporal está corrupto o vacío")
-            return False
-
-        self.logger.info(f"Audio extraído ({audio_file.stat().st_size} bytes), transcribiendo con Whisper...")
-        return True
-
-    def _transcribe_audio_with_whisper(self, audio_file: Path) -> Optional[dict]:
-        """
-        Transcribe audio usando Whisper con lock global.
-
-        Args:
-            audio_file: Ruta del archivo de audio.
-
-        Returns:
-            Optional[dict]: Resultado de la transcripción o None.
-        """
-        # LOCK GLOBAL: Solo un proceso puede usar Whisper a la vez
-        with whisper_lock:
-            self.logger.info(f"{EmojiGenerator.lock()} Adquiriendo lock global de Whisper...")
-
-            # Cargar modelo si no está cargado
-            self._ensure_whisper_model_loaded()
-
-            if self.whisper_model is None:
-                raise RuntimeError("No se pudo cargar el modelo Whisper")
-
-            # Transcribir con Whisper con manejo específico de errores
-            try:
-                result = self.whisper_model.transcribe(
-                    str(audio_file),
-                    language=None,  # Auto-detectar idioma
-                    task="transcribe",
-                    fp16=False,  # CPU mode
-                    verbose=False,
-                )
-            except Exception as whisper_error:
-                return self._handle_whisper_error(whisper_error)
-
-            self.logger.info(f"{EmojiGenerator.unlock()} Liberando lock global de Whisper...")
-
-        # Verificar que tenemos segmentos
-        if not result.get("segments"):
-            self.logger.warning("Whisper no generó segmentos de transcripción")
-            return None
-
-        return result
-
-    def _ensure_whisper_model_loaded(self) -> None:
-        """Asegura que el modelo Whisper esté cargado."""
-        if self.whisper_model is None:
-            self.logger.info("Cargando modelo Whisper (small)...")
-            self.whisper_model = whisper.load_model("small")
-
-    def _handle_whisper_error(self, whisper_error: Exception) -> Optional[Dict[str, Any]]:
-        """
-        Maneja errores específicos de Whisper.
-
-        Args:
-            whisper_error: Excepción capturada.
-
-        Returns:
-            Optional[Dict[str, Any]]: None (siempre retorna None o lanza excepción).
-        """
-        error_msg = str(whisper_error).lower()
-        if "cannot reshape tensor" in error_msg or "tensor" in error_msg:
-            self.logger.error(f"Error de tensor en Whisper (archivo posiblemente corrupto): {whisper_error}")
-        elif "nan" in error_msg:
-            self.logger.error(f"Error NaN en Whisper (datos de audio inválidos): {whisper_error}")
-        else:
-            # Re-lanzar otros errores
-            raise RuntimeError(f"Error inesperado en Whisper: {whisper_error}") from whisper_error
-        return None
-
-    def _generate_srt_from_transcription(self, result: dict, output_srt: Path) -> Optional[Path]:
-        """
-        Genera archivo SRT desde el resultado de la transcripción.
-
-        Args:
-            result: Resultado de Whisper.
-            output_srt: Ruta de salida para el SRT.
-
-        Returns:
-            Optional[Path]: Ruta del archivo SRT generado o None.
-        """
-        self.logger.info(f"Generando archivo SRT con {len(result['segments'])} segmentos")
-
-        with open(output_srt, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(result["segments"], start=1):
-                start_time = self._format_timestamp(segment["start"])
-                end_time = self._format_timestamp(segment["end"])
-                text = segment["text"].strip()
-
-                # Solo escribir si hay texto
-                if text:
-                    f.write(f"{i}\n")
-                    f.write(f"{start_time} --> {end_time}\n")
-                    f.write(f"{text}\n\n")
-
-        # Verificar que el archivo SRT se creó correctamente
-        if not output_srt.exists() or output_srt.stat().st_size == 0:
-            self.logger.error("Archivo SRT no se creó o está vacío")
-            return None
-
-        detected_lang = result.get("language", "unknown")
-        self.logger.info(
-            f"{EmojiGenerator.check_mark()} Subtítulos extraídos del audio (idioma: {detected_lang}): {output_srt.name}"
-        )
-
-        # Aplicar mejora de calidad a los subtítulos generados por Whisper
-        self._improve_extracted_subtitles_quality(output_srt, detected_lang)
-
-        return output_srt
-
-    def _cleanup_temp_files(self, *temp_files):
-        """
-        Limpia archivos temporales de forma segura.
-
-        Args:
-            *temp_files: Archivos temporales a eliminar.
-        """
-        for temp_file in temp_files:
-            if temp_file and temp_file.exists():
-                try:
-                    temp_file.unlink()
-                    self.logger.debug(f"Archivo temporal eliminado: {temp_file.name}")
-                except Exception as e:
-                    self.logger.warning(f"No se pudo eliminar archivo temporal {temp_file}: {e}")
-
-    def _validate_audio_file(self, audio_file: Path) -> bool:
-        """
-        Valida que el archivo de audio sea válido antes de procesarlo con Whisper.
-
-        Args:
-            audio_file: Ruta del archivo de audio.
-
-        Returns:
-            bool: True si el archivo es válido.
-        """
-        try:
-            # Verificar tamaño mínimo (al menos header WAV + algo de audio)
-            if audio_file.stat().st_size < 1024:  # Al menos 1KB
-                self.logger.warning(f"Archivo de audio muy pequeño: {audio_file.stat().st_size} bytes")
-                return False
-
-            # Verificar que sea un archivo WAV válido leyendo el header
-            with open(audio_file, "rb") as f:
-                header = f.read(44)  # Leer header WAV (44 bytes)
-
-                # Verificar firma RIFF
-                if header[:4] != b"RIFF":
-                    self.logger.error("Archivo de audio no tiene firma RIFF válida")
-                    return False
-
-                # Verificar firma WAVE
-                if header[8:12] != b"WAVE":
-                    self.logger.error("Archivo de audio no tiene firma WAVE válida")
-                    return False
-
-                # Buscar la sección de datos (puede estar en diferentes posiciones)
-                data_found = False
-                data_size = 0
-
-                # Buscar "data" en el archivo
-                f.seek(0)
-                file_content = f.read()
-                data_pos = file_content.find(b"data")
-                if data_pos >= 0 and data_pos < 100:  # Encontrado en una posición razonable
-                    data_size = int.from_bytes(file_content[data_pos + 4 : data_pos + 8], byteorder="little")
-                    data_found = True
-
-                if not data_found or data_size == 0:
-                    self.logger.warning(f"No se encontró sección de datos válida en el WAV (data_size: {data_size})")
-                    # En lugar de rechazar, ser más permisivo - verificar que haya contenido
-                    if len(file_content) > 1024:  # Si el archivo es lo suficientemente grande
-                        self.logger.warning(
-                            "Archivo WAV tiene formato no estándar pero tamaño aceptable, continuando..."
-                        )
-                    else:
-                        return False
-
-                # Verificar formato de audio (si está disponible)
-                try:
-                    channels = int.from_bytes(header[22:24], byteorder="little")
-                    sample_rate = int.from_bytes(header[24:28], byteorder="little")
-
-                    # Ser más flexible con los formatos
-                    if sample_rate not in [8000, 16000, 22050, 44100, 48000]:
-                        self.logger.warning(f"Sample rate inusual: {sample_rate}Hz")
-                    if channels not in [1, 2]:
-                        self.logger.warning(f"Número de canales inusual: {channels}")
-                except (ValueError, IndexError) as e:
-                    self.logger.warning(f"No se pudo leer información de formato del WAV: {e}")
-
-                # Verificar que no sea solo silencio (bytes cero)
-                f.seek(44)  # Ir después del header
-                sample_data = f.read(min(2048, len(file_content) - 44))  # Leer hasta 2KB de datos
-
-                # Contar bytes no cero
-                non_zero_bytes = sum(1 for b in sample_data if b != 0)
-                if non_zero_bytes < len(sample_data) * 0.01:  # Menos del 1% de bytes no cero
-                    self.logger.warning("Archivo de audio parece contener solo silencio")
-                    return False
-
-            self.logger.debug(f"Archivo de audio validado: {audio_file.stat().st_size} bytes")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error validando archivo de audio {audio_file}: {e}")
-            return False
-
-    def _format_timestamp(self, seconds: float) -> str:
-        """
-        Convierte segundos a formato SRT (HH:MM:SS,mmm).
-
-        Args:
-            seconds: Tiempo en segundos.
-
-        Returns:
-            str: Timestamp formateado.
-        """
-        try:
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            secs = int(seconds % 60)
-            millis = int((seconds % 1) * 1000)
-            return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-        except Exception as e:
-            self.logger.error(f"Error formateando timestamp {seconds}: {e}")
-            return "00:00:00,000"
-
     def translate_srt(self, srt_file: Path, force_translate: bool = False) -> Optional[Path]:
         """
         Traduce archivo SRT al español usando Yandex Translate con verificación doble.
@@ -1335,13 +870,25 @@ class SubtitleTranslator:
         Returns:
             Optional[Path]: Ruta del archivo traducido o None.
         """
+        # Si ya está en español (audio doblado, pista sin etiquetar) no hay nada que
+        # traducir: pasarlo por el traductor solo gastaba minutos y peticiones.
+        if not force_translate and self.detect_srt_language(srt_file) == "es":
+            return self._save_spanish_copy(srt_file)
+
         if not self._translation_dependencies_available():
             return None
 
         try:
             import time
 
-            translator = YandexTranslate()
+            translator = getattr(self, 'yandex_translator', None)
+            if translator is None and YANDEX_AVAILABLE:
+                try:
+                    from translatepy.translators.yandex import YandexTranslate as _YandexTranslate
+
+                    translator = _YandexTranslate()
+                except Exception:
+                    translator = None
 
             # Primera traducción
             with open(srt_file, "r", encoding="utf-8", errors="ignore") as f:
@@ -1365,6 +912,10 @@ class SubtitleTranslator:
                 self.logger.debug(f"No se encontraron líneas para traducir en: {srt_file.name}")
                 return None
 
+        except TranslationStalledError as e:
+            # Se conserva el .srt original; el video se reintenta en otra ejecución
+            self.logger.error(f"Traducción abandonada para {srt_file.name}: {e}")
+            return None
         except ImportError as e:
             self.logger.error(f"Faltan dependencias para traducción: {e}")
             return None
@@ -1395,15 +946,97 @@ class SubtitleTranslator:
         Returns:
             tuple[List[str], int]: (Líneas traducidas, Número de traducciones realizadas).
         """
-        translated_lines = []
+        translated_lines: List[str] = []
         translations_made = 0
+        consecutive_failures = 0
 
-        for line in lines:
-            translated_line, made_translation = self._translate_single_line(line, translator, force_translate)
-            translated_lines.append(translated_line)
-            translations_made += made_translation
+        if translator is None:
+            # No translator available: return original lines
+            return [line if line.endswith("\n") else line + "\n" for line in lines], 0
+
+        i = 0
+        N = len(lines)
+        while i < N:
+            line = lines[i]
+            if self._should_skip_translation(line.strip()):
+                translated_lines.append(line)
+                i += 1
+                continue
+
+            # Agrupar un bloque contiguo de líneas traducibles
+            block_lines = []
+            j = i
+            char_count = 0
+            while j < N and not self._should_skip_translation(lines[j].strip()) and char_count < 3000:
+                block_lines.append(lines[j].strip())
+                char_count += len(lines[j])
+                j += 1
+
+            # Traducir el bloque en batch
+            joined = " ||| ".join(block_lines)
+            block_translated = True
+            try:
+                translated_obj = self._translate_with_timeout(translator, joined)
+                translated_text = translated_obj.result if hasattr(translated_obj, "result") else str(translated_obj)
+                parts = translated_text.split(" ||| ")
+                if len(parts) != len(block_lines):
+                    # Fallback: split por nueva línea
+                    parts = translated_text.split("\n")
+                consecutive_failures = 0
+            except Exception as e:
+                self.logger.debug(f"Batch translation failed: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_TRANSLATE_FAILURES:
+                    raise TranslationStalledError(
+                        f"{consecutive_failures} fallos seguidos del servicio de traducción (último: {e})"
+                    ) from e
+                parts = [b + "\n" for b in block_lines]
+                block_translated = False
+
+            # Añadir resultados preservando saltos
+            for p in parts:
+                translated_lines.append(p if p.endswith("\n") else p + "\n")
+                if block_translated and p.strip():
+                    translations_made += 1
+
+            i = j
 
         return translated_lines, translations_made
+
+    def _translate_with_timeout(self, translator, text: str):
+        """
+        Traduce un texto al español con tope de tiempo.
+
+        La librería de traducción no fija timeout en sus peticiones; se ejecuta en un
+        hilo auxiliar para poder abandonarla si el servicio deja de responder.
+
+        Args:
+            translator: Instancia del traductor.
+            text: Texto a traducir.
+
+        Returns:
+            Resultado devuelto por `translator.translate`.
+
+        Raises:
+            TimeoutError: Si no hubo respuesta en TRANSLATE_REQUEST_TIMEOUT segundos.
+        """
+        outcome: Dict[str, Any] = {}
+
+        def work():
+            try:
+                outcome["result"] = translator.translate(text, "es")
+            except Exception as e:
+                outcome["error"] = e
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        worker.join(TRANSLATE_REQUEST_TIMEOUT)
+
+        if worker.is_alive():
+            raise TimeoutError(f"El servicio de traducción no respondió en {TRANSLATE_REQUEST_TIMEOUT}s")
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
 
     def _translate_single_line(self, line: str, translator, force_translate: bool = False) -> tuple[str, int]:
         """
@@ -1462,15 +1095,22 @@ class SubtitleTranslator:
         text_to_detect = clean_text if clean_text else text_to_translate
 
         # Detectar idioma y traducir solo si no es español
-        try:
-            lang = langdetect_detect(text_to_detect)
+        lang = None
+        if LANGDETECT_AVAILABLE:
+            try:
+                from langdetect import detect as _langdetect_detect
+                lang = _langdetect_detect(text_to_detect)
+            except Exception:
+                lang = None
+
+        if lang:
             if self._should_translate_language(lang, force_translate):
                 return self._perform_translation(text_to_translate, translator)
             else:
                 return text_to_translate + "\n", 0
-        except Exception:
-            # Si falla detección de idioma, intentar traducir asumiendo que puede ser inglés
-            return self._perform_translation(text_to_translate, translator)
+
+        # Si no se detectó idioma, o no está disponible la librería, intentar traducir
+        return self._perform_translation(text_to_translate, translator)
 
     def _should_translate_language(self, lang: str, force_translate: bool) -> bool:
         """
@@ -1501,7 +1141,7 @@ class SubtitleTranslator:
         try:
             import time
 
-            translated = translator.translate(text_to_translate, "es")
+            translated = self._translate_with_timeout(translator, text_to_translate)
             translated_text = translated.result
             time.sleep(0.1)  # Pequeño delay para evitar límites de rate
             return translated_text + "\n", 1
@@ -1536,8 +1176,32 @@ class SubtitleTranslator:
         self._improve_translated_subtitles_quality(output_file)
 
         # Eliminar archivo original si fue extraído (no tiene _ES)
-        self._cleanup_original_file(srt_file)
+        # Conservar el archivo original; no eliminarlo para mantener ambas versiones (.srt y .es.srt)
+        # Anteriormente se borraba aquí, pero ahora preferimos mantener ambos archivos.
+        # self._cleanup_original_file(srt_file)
 
+        return output_file
+
+    def _save_spanish_copy(self, srt_file: Path) -> Optional[Path]:
+        """
+        Publica como .es.srt un subtítulo que ya está en español, sin traducirlo.
+
+        Args:
+            srt_file: Ruta del archivo SRT en español.
+
+        Returns:
+            Optional[Path]: Ruta del .es.srt o None si no se pudo escribir.
+        """
+        output_file = srt_file.parent / f"{self._prepare_output_filename(srt_file)}{SPANISH_SUBTITLE_SUFFIX}"
+        try:
+            if output_file != srt_file:
+                shutil.copyfile(srt_file, output_file)
+        except OSError as e:
+            self.logger.error(f"No se pudo guardar {output_file.name}: {e}")
+            return None
+
+        self.logger.info(f"Subtítulo ya en español, se guarda sin traducir: {output_file.name}")
+        self._improve_translated_subtitles_quality(output_file)
         return output_file
 
     def _prepare_output_filename(self, srt_file: Path) -> str:
@@ -1572,12 +1236,17 @@ class SubtitleTranslator:
             except Exception:
                 pass
 
-    def process_video(self, video_file: Path) -> dict:
+            # Mantener comportamiento no destructivo: no eliminar el archivo original por defecto.
+            self.logger.debug(f"_cleanup_original_file: conservar {srt_file.name} (no se elimina)")
+
+    def process_video(self, video_file: Path, force_regenerate: bool = False) -> dict:
         """
-        Procesa un archivo de video para subtítulos en español.
+        Procesa un único archivo de video: extrae o traduce subtítulos, y devuelve un resumen.
 
         Args:
             video_file: Ruta del archivo de video.
+            force_regenerate: Si True, ignora los subtítulos existentes y vuelve a
+                transcribir el audio con Whisper (reemplaza .srt y .es.srt).
 
         Returns:
             dict: Resultado del procesamiento.
@@ -1594,7 +1263,7 @@ class SubtitleTranslator:
 
         try:
             # 0. Verificación rápida inicial
-            if not self.quick_check_needs_processing(video_file):
+            if not force_regenerate and not self.quick_check_needs_processing(video_file):
                 result["had_spanish_subtitles"] = True  # Consideramos que ya está "procesado"
                 self.logger.debug(f"Verificación rápida: omitiendo {video_file.name}")
                 return result
@@ -1613,35 +1282,42 @@ class SubtitleTranslator:
                 self.logger.debug(f"Audio en español detectado, pero se procesarán subtítulos: {video_file.name}")
                 # No retornamos aquí, continuamos para crear subtítulos incluso con audio en español
 
-            # 2. Verificar si ya tiene subtítulos en español (verificación adicional)
-            if self.check_existing_spanish_subtitles(video_file) and not self.allow_retranslate:
-                result["had_spanish_subtitles"] = True
-                self.logger.debug(f"Ya tiene subtítulos en español: {video_file.name}")
-                return result
+            if force_regenerate:
+                # Rehacer desde el audio: los archivos anteriores se conservan hasta ser reemplazados
+                srt_file = self._try_extract_audio_subtitles(video_file)
+            else:
+                # 2. Verificar si ya tiene subtítulos en español (sidecar o pista embebida)
+                has_spanish_subs = self.check_existing_spanish_subtitles(
+                    video_file
+                ) or self._has_embedded_spanish_subtitles(video_file)
+                if has_spanish_subs and not self.allow_retranslate:
+                    result["had_spanish_subtitles"] = True
+                    self.logger.debug(f"Ya tiene subtítulos en español: {video_file.name}")
+                    return result
 
-            # 3. Buscar subtítulos existentes para traducir
-            existing_srt = self.find_existing_srt_file(video_file)
-            if existing_srt:
-                self.logger.debug(f"Encontrados subtítulos existentes para traducir: {existing_srt.name}")
-                # Traducir subtítulos existentes
-                start_time = time.time()
-                translated_file = self.translate_srt(existing_srt, force_translate=self.allow_retranslate)
-                translation_time = time.time() - start_time
+                # 3. Buscar subtítulos existentes para traducir
+                existing_srt = self.find_existing_srt_file(video_file)
+                if existing_srt:
+                    self.logger.debug(f"Encontrados subtítulos existentes para traducir: {existing_srt.name}")
+                    # Traducir subtítulos existentes
+                    start_time = time.time()
+                    translated_file = self.translate_srt(existing_srt, force_translate=self.allow_retranslate)
+                    translation_time = time.time() - start_time
 
-                if translated_file:
-                    result["translated"] = True
-                    result["subtitle_file"] = str(translated_file)
-                    self.translation_stats.subtitles_translated += 1
-                    self.translation_stats.total_translation_time += translation_time
-                    self.logger.info(
-                        f"{EmojiGenerator.check_mark()} Subtítulos traducidos desde existentes: {video_file.name}"
-                    )
-                else:
-                    result["error"] = "No se pudieron traducir los subtítulos existentes"
-                return result
+                    if translated_file:
+                        result["translated"] = True
+                        result["subtitle_file"] = str(translated_file)
+                        self.translation_stats.subtitles_translated += 1
+                        self.translation_stats.total_translation_time += translation_time
+                        self.logger.info(
+                            f"{EmojiGenerator.check_mark()} Subtítulos traducidos desde existentes: {video_file.name}"
+                        )
+                    else:
+                        result["error"] = "No se pudieron traducir los subtítulos existentes"
+                    return result
 
-            # 4. Extraer subtítulos si no hay ninguno
-            srt_file = self.extract_subtitles(video_file)
+                # 4. Extraer subtítulos si no hay ninguno
+                srt_file = self.extract_subtitles(video_file)
 
             if srt_file:
                 result["extracted"] = True
@@ -1673,7 +1349,7 @@ class SubtitleTranslator:
 
     def _is_video_corrupted(self, video_file: Path) -> bool:
         """
-        Detecta si un archivo de video está corrupto mediante análisis rápido con ffprobe.
+        Detecta si un archivo de video está corrupto a partir del análisis de ffprobe.
 
         Args:
             video_file: Ruta del archivo de video.
@@ -1682,23 +1358,15 @@ class SubtitleTranslator:
             bool: True si el video está corrupto, False si está OK.
         """
         try:
-            # Análisis rápido con ffprobe (timeout corto)
-            cmd = [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration:stream=codec_name,codec_type",
-                "-of",
-                "json",
-                str(video_file),
-            ]
+            probe = self._probe_media(video_file)
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # Timeout rápido
+            if probe["returncode"] is None:
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} Timeout verificando {video_file.name}")
+                return True
 
             # Si ffprobe falla, el archivo está corrupto
-            if result.returncode != 0:
-                stderr = result.stderr.lower()
+            if probe["returncode"] != 0:
+                stderr = probe["stderr"].lower()
 
                 # Detectar errores específicos de corrupción
                 corruption_indicators = [
@@ -1718,36 +1386,28 @@ class SubtitleTranslator:
                     )
                     return True
 
-            # Verificar que tenga streams válidos
-            try:
-                import json
-
-                data = json.loads(result.stdout)
-
-                # Debe tener al menos un stream de video y audio
-                if "streams" not in data or len(data.get("streams", [])) == 0:
-                    self.logger.warning(f"{EmojiGenerator.warning_msg()} No se detectaron streams en {video_file.name}")
-                    return True
-
-                # Verificar que tenga duración válida
-                if "format" in data:
-                    duration = data["format"].get("duration")
-                    if not duration or float(duration) < 1.0:
-                        self.logger.warning(f"{EmojiGenerator.warning_msg()} Duración inválida en {video_file.name}")
-                        return True
-
-            except json.JSONDecodeError:
+            data = probe["data"]
+            if data is None:
                 self.logger.warning(
                     f"{EmojiGenerator.warning_msg()} No se pudo parsear salida de ffprobe para {video_file.name}"
                 )
                 return True
 
+            # Debe tener al menos un stream
+            if not data.get("streams"):
+                self.logger.warning(f"{EmojiGenerator.warning_msg()} No se detectaron streams en {video_file.name}")
+                return True
+
+            # Verificar que tenga duración válida
+            if "format" in data:
+                duration = data["format"].get("duration")
+                if not duration or float(duration) < 1.0:
+                    self.logger.warning(f"{EmojiGenerator.warning_msg()} Duración inválida en {video_file.name}")
+                    return True
+
             # Si llegó aquí, el video parece estar OK
             return False
 
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"{EmojiGenerator.warning_msg()} Timeout verificando {video_file.name}")
-            return True
         except Exception as e:
             self.logger.debug(f"Error verificando corrupción de {video_file.name}: {e}")
             # En caso de error, asumir que no está corrupto para no bloquear
@@ -2031,6 +1691,22 @@ class SubtitleTranslator:
         self.logger.info(f"Archivos a procesar: {stats['total_files']}")
         return stats
 
+    def _pending_compression_paths(self) -> set:
+        """
+        Devuelve las rutas de los videos que aún esperan compresión.
+
+        El procesador corre en paralelo y renombra el video al comprimirlo, así que
+        esos archivos se dejan para un ciclo posterior (ya con su nombre definitivo).
+
+        Returns:
+            set: Rutas (str) pendientes de compresión; vacío si no se pudo consultar.
+        """
+        try:
+            return {str(path) for path in get_pending_files()}
+        except Exception as e:
+            self.logger.warning(f"No se pudo consultar la cola de compresión: {e}")
+            return set()
+
     def _filter_valid_files(self, file_paths: List[Path], stats: dict) -> List[Path]:
         """
         Filtra archivos que existen, son válidos y necesitan procesamiento.
@@ -2045,17 +1721,32 @@ class SubtitleTranslator:
         # Cargar información de archivos ya procesados
         processed_files = self._get_processed_files_info()
 
+        pending_compression = self._pending_compression_paths()
+
         valid_files = []
+        seen_files = set()
         missing_files = []
 
         for video_file in file_paths:
+            normalized_path = str(video_file)
+
+            if normalized_path in pending_compression:
+                self.logger.info(f"Pendiente de compresión, se deja para un ciclo posterior: {video_file.name}")
+                continue
+
+            # Evitar procesamiento duplicado del mismo archivo en el mismo lote
+            if normalized_path in seen_files:
+                self.logger.debug(f"Archivo duplicado en entrada, se omite repetido: {video_file}")
+                continue
+            seen_files.add(normalized_path)
+
             if not video_file.exists():
                 self.logger.warning(f"Archivo no encontrado: {video_file}")
                 missing_files.append(str(video_file))
                 stats["errors"] += 1
             else:
                 # Verificar si el archivo ya fue procesado y tiene subtítulos
-                file_path_str = str(video_file)
+                file_path_str = normalized_path
                 if file_path_str in processed_files:
                     processed_info = processed_files[file_path_str]
                     if processed_info.get("has_subtitles", False):
@@ -2131,14 +1822,8 @@ class SubtitleTranslator:
         Args:
             file_paths: Lista de rutas de archivos a remover.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
-        if not progress_file.exists():
-            return
-
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             # Verificar si hay last_input_args
             subtitle_translation = progress_data.get("subtitle_translation", {})
@@ -2161,8 +1846,7 @@ class SubtitleTranslator:
                 progress_data["subtitle_translation"]["last_input_args"] = None
 
             # Guardar cambios
-            with open(progress_file, "w") as f:
-                json.dump(progress_data, f, indent=2)
+            save_progress(progress_data)
 
         except Exception as e:
             self.logger.error(f"Error removiendo archivos de last_input_args: {e}")
@@ -2178,14 +1862,15 @@ class SubtitleTranslator:
             List[str]: Lista de rutas normalizadas.
         """
         normalized_missing_files = []
+        host_base_prefix = str(MediaJellyPaths.get_base_path()) + "/"
         for file_path in file_paths:
             # Si la ruta ya está en formato /mediajelly, mantenerla
             if file_path.startswith(MEDIAJELLY_PATH):
                 normalized_missing_files.append(file_path)
             # Si está en formato absoluto del host, convertirla
-            elif file_path.startswith(HOST_MEDIAJELLY_PATH):
-                # Convertir /home/tafurc/mediaJelly/... a /mediajelly/...
-                normalized_path = file_path.replace(HOST_MEDIAJELLY_PATH, MEDIAJELLY_PATH, 1)
+            elif file_path.startswith(host_base_prefix):
+                # Convertir <base>/... a /mediajelly/...
+                normalized_path = file_path.replace(host_base_prefix, MEDIAJELLY_PATH + "/", 1)
                 normalized_missing_files.append(normalized_path)
             else:
                 # Mantener la ruta tal cual si no coincide con ninguno de los formatos conocidos
@@ -2285,6 +1970,7 @@ class SubtitleTranslator:
             stats: Estadísticas de procesamiento.
             config: Configuración de procesamiento.
         """
+        self.current_stats = stats
         if config["use_concurrent"] and config["actual_workers"] > 1:
             self._process_concurrent(valid_files, stats, config["actual_workers"])
         else:
@@ -2300,7 +1986,7 @@ class SubtitleTranslator:
             max_workers: Número máximo de workers.
         """
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.process_video, vf): vf for vf in valid_files}
+            futures = {executor.submit(self._process_video_with_file_lock, vf): vf for vf in valid_files}
 
             for future in as_completed(futures):
                 # Verificar si el lock file sigue existiendo (para cancelación externa)
@@ -2328,6 +2014,27 @@ class SubtitleTranslator:
                     file_status,
                 )
                 self.logger.info(f"Progreso: {stats['processed']}/{stats['total_files']}")
+
+    def _process_video_with_file_lock(self, video_file: Path) -> dict:
+        """
+        Procesa un video serializando por path para evitar condiciones de carrera
+        cuando el mismo archivo aparece más de una vez.
+
+        Args:
+            video_file: Archivo de video a procesar.
+
+        Returns:
+            dict: Resultado de `process_video`.
+        """
+        file_key = str(video_file)
+        with self.file_locks_guard:
+            file_lock = self.file_locks.get(file_key)
+            if file_lock is None:
+                file_lock = threading.Lock()
+                self.file_locks[file_key] = file_lock
+
+        with file_lock:
+            return self.process_video(video_file)
 
     def _process_sequential(self, valid_files: List[Path], stats: dict):
         """
@@ -2409,12 +2116,7 @@ class SubtitleTranslator:
             bool: True si es duplicada.
         """
         try:
-            progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-            if not progress_file.exists():
-                return False
-
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             last_notification = progress_data.get("subtitle_translation", {}).get("last_notification")
             if not last_notification:
@@ -2447,14 +2149,8 @@ class SubtitleTranslator:
             stats: Estadísticas enviadas.
         """
         try:
-            progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
             with self.progress_lock:
-                if progress_file.exists():
-                    with open(progress_file, "r") as f:
-                        progress_data = json.load(f)
-                else:
-                    progress_data = {}
+                progress_data = load_progress() or {}
 
                 if "subtitle_translation" not in progress_data:
                     progress_data["subtitle_translation"] = {}
@@ -2474,8 +2170,7 @@ class SubtitleTranslator:
                     "sent_at": datetime.now().isoformat(),
                 }
 
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+                save_progress(progress_data)
 
                 self.logger.info("Signature de notificación guardada")
 
@@ -2516,6 +2211,11 @@ class SubtitleTranslator:
             bool: True si necesita procesamiento.
         """
         try:
+            # 0. Carpeta marcada para no generar subtítulos (p. ej. ya vienen incrustados)
+            if MediaJellyPaths.has_nosubs_marker(video_file):
+                self.logger.debug(f"Carpeta marcada con .nosubs, omitiendo: {video_file.name}")
+                return False
+
             # 1. Verificar si ya tiene subtítulos en español (solo si no se permite re-traducción)
             if not self.allow_retranslate and self.check_existing_spanish_subtitles(video_file):
                 return False
@@ -2673,13 +2373,8 @@ class SubtitleTranslator:
         Returns:
             dict: Diccionario de archivos procesados.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-        if not progress_file.exists():
-            return {}
-
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             subtitle_translation = progress_data.get("subtitle_translation", {})
             return subtitle_translation.get("processed_files", {})
@@ -2694,10 +2389,8 @@ class SubtitleTranslator:
         Returns:
             dict: Estadísticas recuperadas.
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
         try:
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
+            progress_data = load_progress() or {}
 
             subtitle_translation = progress_data.get("subtitle_translation", {})
             stats = subtitle_translation.get("stats", {})
@@ -2718,17 +2411,11 @@ class SubtitleTranslator:
 
     def _clear_input_args_from_progress(self):
         """Limpia los argumentos de entrada guardados cuando el procesamiento se completa."""
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
         try:
-            if progress_file.exists():
-                with open(progress_file, "r") as f:
-                    progress_data = json.load(f)
-
-                if "subtitle_translation" in progress_data:
-                    progress_data["subtitle_translation"]["last_input_args"] = None
-
-                    with open(progress_file, "w") as f:
-                        json.dump(progress_data, f, indent=2)
+            progress_data = load_progress() or {}
+            if "subtitle_translation" in progress_data:
+                progress_data["subtitle_translation"]["last_input_args"] = None
+                save_progress(progress_data)
 
         except Exception as e:
             self.logger.warning(f"Error limpiando argumentos de entrada: {e}")
@@ -2757,12 +2444,10 @@ class SubtitleTranslator:
             file_status: Estado del archivo procesado (opcional).
             input_args: Argumentos de entrada (opcional).
         """
-        progress_file = self.tmp_dir / self.PROGRESS_FILE_NAME
-
         with self.progress_lock:
             try:
                 # Leer o inicializar progreso
-                progress_data = self._load_or_initialize_progress_data(progress_file)
+                progress_data = self._load_or_initialize_progress_data()
 
                 # Asegurar estructura completa
                 self._ensure_progress_structure(progress_data)
@@ -2782,29 +2467,23 @@ class SubtitleTranslator:
                     progress_data["subtitle_translation"]["last_input_args"] = input_args
 
                 # Guardar cambios
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+                save_progress(progress_data)
 
                 self.logger.info("Archivo de progreso actualizado con estadísticas de subtítulos")
 
             except Exception as e:
                 self.logger.error(f"Error actualizando archivo de progreso: {e}")
 
-    def _load_or_initialize_progress_data(self, progress_file: Path) -> dict:
+    def _load_or_initialize_progress_data(self) -> dict:
         """
         Lee progreso existente o inicializa estructura nueva.
 
         Args:
-            progress_file: Ruta del archivo de progreso.
-
         Returns:
             dict: Datos de progreso.
         """
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                return json.load(f)
-        else:
-            return self._create_initial_progress_structure()
+        data = load_progress() or {}
+        return data if data else self._create_initial_progress_structure()
 
     def _create_initial_progress_structure(self) -> dict:
         """
@@ -3056,7 +2735,10 @@ class SubtitleTranslator:
 
     def _try_extract_embedded_subtitles(self, video_file: Path) -> Optional[Path]:
         """
-        Intenta extraer subtítulos embebidos del video.
+        Intenta extraer la mejor pista de subtítulos embebida del video.
+
+        Las pistas se ordenan por metadatos (ver `_rank_embedded_subtitle_streams`) y
+        se extrae solo la primera que cubra el video.
 
         Args:
             video_file: Ruta del archivo de video.
@@ -3064,19 +2746,46 @@ class SubtitleTranslator:
         Returns:
             Optional[Path]: Ruta del archivo SRT extraído o None.
         """
-        embedded_streams = self._detect_embedded_subtitle_streams(video_file)
-        if not embedded_streams:
+        ranked = self._rank_embedded_subtitle_streams(self._detect_embedded_subtitle_streams(video_file))
+        if not ranked:
             return None
 
-        detected_lang = self.detect_embedded_subtitle_language(video_file)
+        duration = self._media_duration(video_file)
 
-        if detected_lang and self._should_extract_embedded_subtitles(detected_lang):
-            return self._extract_embedded_subtitles(video_file, detected_lang)
-        elif detected_lang:
-            self._log_embedded_subtitles_info(detected_lang)
-            return None
-        else:
-            return None
+        for relative_index, stream in ranked:
+            lang = self._stream_language(stream)
+            extracted = self._extract_embedded_subtitles(video_file, relative_index, None if lang == "und" else lang)
+            if not extracted:
+                continue
+
+            if not self._subtitle_covers_video(extracted, duration):
+                self.logger.info(
+                    f"Pista embebida 0:s:{relative_index} ({lang}) insuficiente para la duración del video, descartada"
+                )
+                try:
+                    extracted.unlink()
+                except Exception:
+                    pass
+                continue
+
+            # Mover a nombre base .srt de forma atómica (overwrite)
+            base_srt = video_file.parent / f"{video_file.stem}.srt"
+            try:
+                base_srt_tmp = base_srt.with_suffix(base_srt.suffix + ".tmp")
+                if base_srt_tmp.exists():
+                    base_srt_tmp.unlink()
+                shutil.move(str(extracted), str(base_srt_tmp))
+                base_srt_tmp.replace(base_srt)
+            except Exception as e:
+                self.logger.warning(f"No se pudo mover subtítulo embebido a destino: {e}")
+                # En caso de fallo, devolver el path original
+                return extracted
+
+            self.logger.info(f"Seleccionado subtítulo embebido: {base_srt.name} (stream 0:s:{relative_index}, {lang})")
+            return base_srt
+
+        self.logger.debug("Ninguna pista embebida útil, se intentará Whisper")
+        return None
 
     def _detect_embedded_subtitle_streams(self, video_file: Path) -> list:
         """
@@ -3086,79 +2795,181 @@ class SubtitleTranslator:
             video_file: Ruta del archivo de video.
 
         Returns:
-            list: Lista de streams de subtítulos encontrados.
+            list: Lista de streams de subtítulos encontrados, en el orden del contenedor.
         """
         try:
-            cmd = [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "s",
-                "-show_entries",
-                "stream=index:stream_tags=language",
-                "-of",
-                "json",
-                str(video_file),
-            ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT)
-
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                return data.get("streams", [])
-
-            return []
-        except subprocess.TimeoutExpired:
-            self.logger.warning(f"Timeout detectando subtítulos embebidos ({FFPROBE_TIMEOUT}s): {video_file}")
-            return []
+            data = self._probe_media(video_file)["data"] or {}
+            return [stream for stream in data.get("streams", []) if stream.get("codec_type") == "subtitle"]
         except Exception as e:
             self.logger.warning(f"Error detectando subtítulos embebidos: {e}")
             return []
 
-    def _should_extract_embedded_subtitles(self, detected_lang: str) -> bool:
+    @staticmethod
+    def _stream_title(stream: Dict[str, Any]) -> str:
+        """Devuelve el título de un stream ('' si no tiene)."""
+        tags = stream.get("tags", {})
+        return tags.get("title") or tags.get("TITLE") or ""
+
+    def _is_partial_subtitle_stream(self, stream: Dict[str, Any]) -> bool:
         """
-        Determina si se deben extraer subtítulos embebidos basados en el idioma.
+        Indica si una pista de subtítulos no contiene el diálogo completo
+        (forzada, carteles/canciones, comentarios).
 
         Args:
-            detected_lang: Código de idioma detectado.
+            stream: Stream de subtítulos reportado por ffprobe.
 
         Returns:
-            bool: True si se deben extraer.
+            bool: True si es una pista parcial.
         """
-        supported_langs = ["ja", "en", "fr", "de", "it", "pt", "ru", "ko", "zh", "es", "ca", "eu"]
-        return bool(detected_lang and detected_lang in supported_langs)
+        if stream.get("disposition", {}).get("forced"):
+            return True
+        return bool(PARTIAL_SUBTITLE_TITLE_RE.search(self._stream_title(stream)))
 
-    def _extract_embedded_subtitles(self, video_file: Path, detected_lang: str) -> Optional[Path]:
+    def _has_embedded_spanish_subtitles(self, video_file: Path) -> bool:
         """
-        Extrae subtítulos embebidos del video.
+        Verifica si el video ya trae una pista de subtítulos completa en español.
 
         Args:
             video_file: Ruta del archivo de video.
-            detected_lang: Idioma detectado.
+
+        Returns:
+            bool: True si existe una pista en español que no sea parcial.
+        """
+        return any(
+            self._stream_language(stream) in SPANISH_LANG_CODES and not self._is_partial_subtitle_stream(stream)
+            for stream in self._detect_embedded_subtitle_streams(video_file)
+        )
+
+    def _rank_embedded_subtitle_streams(self, streams: list) -> List[Tuple[int, Dict[str, Any]]]:
+        """
+        Ordena las pistas embebidas utilizables como fuente de traducción.
+
+        Solo se consideran pistas de texto completas y no españolas. Prioridad:
+        inglés, luego otros idiomas etiquetados, luego sin etiqueta; a igualdad, las
+        que no son para sordos (SDH) y el orden del contenedor.
+
+        Args:
+            streams: Streams de subtítulos en el orden del contenedor.
+
+        Returns:
+            List[Tuple[int, Dict[str, Any]]]: (índice relativo 0:s:N, stream) de mejor a peor.
+        """
+        candidates = []
+        for relative_index, stream in enumerate(streams):
+            if (stream.get("codec_name") or "").lower() not in TEXT_SUBTITLE_CODECS:
+                continue
+            if self._is_partial_subtitle_stream(stream):
+                continue
+
+            lang = self._stream_language(stream)
+            if lang in SPANISH_LANG_CODES:
+                continue
+
+            if lang in ENGLISH_LANG_CODES:
+                lang_rank = 0
+            elif lang != "und":
+                lang_rank = 1
+            else:
+                lang_rank = 2
+            is_sdh = 1 if SDH_SUBTITLE_TITLE_RE.search(self._stream_title(stream)) else 0
+
+            candidates.append(((lang_rank, is_sdh, relative_index), relative_index, stream))
+
+        candidates.sort(key=lambda candidate: candidate[0])
+        return [(relative_index, stream) for _, relative_index, stream in candidates]
+
+    def _subtitle_covers_video(self, srt_file: Path, duration: Optional[float]) -> bool:
+        """
+        Determina si un SRT es lo bastante completo para usarse como subtítulo del video:
+        su último cue alcanza MIN_SUBTITLE_COVERAGE de la duración y tiene al menos
+        MIN_CUES_PER_MINUTE cues por minuto.
+
+        Args:
+            srt_file: Ruta del archivo SRT.
+            duration: Duración del video en segundos (None si se desconoce).
+
+        Returns:
+            bool: True si el subtítulo cubre el video.
+        """
+        try:
+            with open(srt_file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return False
+
+        cues = 0
+        last_end = 0.0
+        for match in SRT_TIMESTAMP_RE.finditer(content):
+            cues += 1
+            hours, minutes, seconds, millis = (int(value) for value in match.groups()[4:])
+            last_end = max(last_end, hours * 3600 + minutes * 60 + seconds + millis / 1000.0)
+
+        if cues < MIN_SUBTITLE_CUES:
+            return False
+
+        # Sin duración conocida solo se puede exigir el mínimo de cues
+        if not duration or duration <= 0:
+            return True
+
+        return last_end >= duration * MIN_SUBTITLE_COVERAGE and cues >= (duration / 60.0) * MIN_CUES_PER_MINUTE
+
+    def _extract_embedded_subtitles(
+        self, video_file: Path, relative_index: int, detected_lang: Optional[str]
+    ) -> Optional[Path]:
+        """
+        Extrae una pista de subtítulos embebida del video.
+
+        Args:
+            video_file: Ruta del archivo de video.
+            relative_index: Índice de la pista entre los streams de subtítulos (0:s:N).
+            detected_lang: Idioma etiquetado de la pista.
 
         Returns:
             Optional[Path]: Ruta del archivo SRT extraído o None.
         """
-        output_srt = video_file.parent / f"{video_file.stem}.srt"
+        # Guardar candidatos en tmp_dir para evitar condiciones de carrera
+        try:
+            self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        output_srt = self.tmp_dir / f"{video_file.stem}.stream{relative_index}.srt"
 
-        cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(video_file), "-map", "0:s:0", "-c:s", "srt", str(output_srt)]
+        cmd = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(video_file),
+            "-map",
+            f"0:s:{relative_index}",
+            "-c:s",
+            "srt",
+            str(output_srt),
+        ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode == 0 and output_srt.exists():
-            self.logger.info(
-                f"{EmojiGenerator.check_mark()} Subtítulos embebidos en '{detected_lang}' extraídos: {output_srt.name}"
-            )
+            if detected_lang:
+                self.logger.info(
+                    f"{EmojiGenerator.check_mark()} Subtítulos embebidos en '{detected_lang}' extraídos: {output_srt}"
+                )
+            else:
+                self.logger.info(f"{EmojiGenerator.check_mark()} Subtítulos embebidos extraídos: {output_srt}")
 
             # Aplicar mejora de calidad a los subtítulos extraídos
-            self._improve_extracted_subtitles_quality(output_srt, detected_lang)
+            quality_lang = "en" if detected_lang in ENGLISH_LANG_CODES else detected_lang
+            self._improve_extracted_subtitles_quality(output_srt, quality_lang)
 
             return output_srt
 
+        # Log stderr for diagnostics if extraction failed
+        if result.returncode != 0:
+            self.logger.debug(f"ffmpeg stderr (sub extract): {result.stderr[:1000]}")
         return None
 
-    def _improve_extracted_subtitles_quality(self, srt_file: Path, language: str):
+    def _improve_extracted_subtitles_quality(self, srt_file: Path, language: Optional[str]):
         """
         Aplica mejora de calidad a los subtítulos extraídos.
 
@@ -3172,7 +2983,7 @@ class SubtitleTranslator:
                 original_content = f.read()
 
             # Aplicar mejora de calidad
-            improved_content = self.quality_improver.improve_subtitle_quality(original_content, language)
+            improved_content = self.quality_improver.improve_subtitle_quality(original_content, language or "und")
 
             # Solo guardar si hubo cambios
             if improved_content != original_content:
@@ -3369,12 +3180,24 @@ def main():
     _handle_lock_file(env_config["subtitle_lock_file"])
 
     # Registrar cleanup para señales de terminación
-    signal.signal(signal.SIGTERM, lambda signum, frame: _signal_handler(signum, env_config["subtitle_lock_file"]))
-    signal.signal(signal.SIGINT, lambda signum, frame: _signal_handler(signum, env_config["subtitle_lock_file"]))
+    # El traductor se crea después; el manejador lo lee de aquí para avisar del avance
+    run_state: Dict[str, Any] = {"translator": None, "env_config": env_config}
+    signal.signal(
+        signal.SIGTERM, lambda signum, frame: _signal_handler(signum, env_config["subtitle_lock_file"], run_state)
+    )
+    signal.signal(
+        signal.SIGINT, lambda signum, frame: _signal_handler(signum, env_config["subtitle_lock_file"], run_state)
+    )
 
     try:
         # Parsear argumentos y configurar traductor
         args, translator = _parse_arguments_and_setup_translator(env_config)
+        run_state["translator"] = translator
+
+        # Regeneración con Whisper: bucle aparte, no usa el sistema de progreso/reanudación
+        if args.regenerate or args.redo_queue:
+            _run_regeneration(args, translator, env_config)
+            return
 
         # Procesar archivos
         stats = _execute_processing(args, translator)
@@ -3392,6 +3215,92 @@ def main():
         _cleanup_lock_file(env_config["subtitle_lock_file"])
 
 
+def _run_regeneration(args, translator, env_config: dict):
+    """
+    Regenera con Whisper los subtítulos de los videos indicados o de la cola de rehacer.
+
+    Con --redo-queue, cada entrada se quita de la cola al terminar (las fallidas pasan
+    a whisper_redo_failed.txt), de modo que una interrupción solo pierde el video en curso.
+    """
+    logger = translator.logger
+    queue_file = env_config["tmp_dir"] / "whisper_redo_queue.txt" if args.redo_queue else None
+
+    if not translator.whisper_available:
+        logger.error("Whisper no disponible: no se pueden regenerar subtítulos")
+        return
+
+    if queue_file is not None:
+        if not queue_file.exists():
+            logger.info("No hay cola de subtítulos por rehacer")
+            return
+        raw_paths = [line.strip() for line in queue_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    else:
+        raw_paths = list(args.paths)
+
+    video_files: List[Path] = []
+    for path_str in _correct_container_paths(raw_paths, translator):
+        path = Path(path_str)
+        video_files.extend(translator._find_video_files_in_directory(path) if path.is_dir() else [path])
+
+    # Los videos bajo una carpeta marcada con .nosubs salen de la cola sin rehacerse
+    video_files = [video_file for video_file in video_files if not MediaJellyPaths.has_nosubs_marker(video_file)]
+
+    # Los que aún esperan compresión se quedan en la cola para otra noche
+    remaining = [str(video_file) for video_file in video_files]
+    pending_compression = translator._pending_compression_paths()
+    for video_file in video_files:
+        if str(video_file) in pending_compression:
+            logger.warning(f"Pendiente de compresión, se deja para un ciclo posterior: {video_file.name}")
+    video_files = [video_file for video_file in video_files if str(video_file) not in pending_compression]
+
+    logger.info(f"=== Regenerando subtítulos con Whisper para {len(video_files)} archivo(s) ===")
+    regenerated = 0
+    failed: List[str] = []
+    # Mismo formato que las estadísticas normales, para el aviso de pausa
+    translator.current_stats = {
+        "total_files": len(video_files),
+        "processed": 0,
+        "with_spanish_audio": 0,
+        "with_spanish_subs": 0,
+        "extracted": 0,
+        "translated": 0,
+        "errors": 0,
+    }
+
+    for video_file in video_files:
+        if not _check_lock_file_exists(env_config["subtitle_lock_file"]):
+            logger.warning("Lock file eliminado externamente. Cancelando regeneración...")
+            break
+
+        if not video_file.is_file():
+            logger.warning(f"Archivo no encontrado, se descarta de la cola: {video_file}")
+        else:
+            result = translator.process_video(video_file, force_regenerate=True)
+            if result["error"]:
+                failed.append(str(video_file))
+                translator.current_stats["errors"] += 1
+                logger.error(f"No se pudo regenerar {video_file.name}: {result['error']}")
+            else:
+                regenerated += 1
+                translator.current_stats["extracted"] += 1
+                translator.current_stats["translated"] += 1
+        translator.current_stats["processed"] += 1
+
+        remaining.remove(str(video_file))
+        if queue_file is not None:
+            queue_tmp = queue_file.with_suffix(".tmp")
+            queue_tmp.write_text("".join(f"{path}\n" for path in remaining), encoding="utf-8")
+            queue_tmp.replace(queue_file)
+
+    if failed and queue_file is not None:
+        with open(queue_file.with_name("whisper_redo_failed.txt"), "a", encoding="utf-8") as f:
+            f.writelines(f"{path}\n" for path in failed)
+
+    logger.info(
+        f"Regeneración finalizada: {regenerated} rehechos, {len(failed)} con error, {len(remaining)} pendientes"
+    )
+
+
 def _setup_environment() -> dict:
     """Configura el entorno y paths necesarios"""
     # Cargar configuración centralizada
@@ -3407,8 +3316,8 @@ def _setup_environment() -> dict:
         raise ImportError("MediaJellyConfig no disponible")
 
     # Detectar entorno para paths
-    is_container = Path("/mediajelly").exists()
-    base_dir = Path("/mediajelly" if is_container else "/home/tafurc/mediaJelly")
+    is_container = MediaJellyPaths.is_container()
+    base_dir = MediaJellyPaths.get_base_path()
     scripts_dir = base_dir / "scripts"
     tmp_dir = scripts_dir / "tmp"
 
@@ -3498,6 +3407,24 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
     parser.add_argument(
         "--retranslate", action="store_true", help="Permitir re-traducción de archivos .es.srt existentes"
     )
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="Volver a transcribir el audio con Whisper aunque ya existan subtítulos (reemplaza .srt y .es.srt)",
+    )
+    parser.add_argument(
+        "--redo-queue",
+        dest="redo_queue",
+        action="store_true",
+        help="Regenerar los videos listados en tmp/whisper_redo_queue.txt (ver requeue_whisper_subtitles.py)",
+    )
+    parser.add_argument(
+        "--force-language",
+        dest="force_language",
+        type=str,
+        default=None,
+        help="Forzar idioma de transcripción (ej: 'ja', 'en', 'es'). Si no se indica, se detecta automáticamente.",
+    )
 
     args = parser.parse_args()
 
@@ -3508,7 +3435,11 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
 
     # Crear traductor con parámetros
     translator = SubtitleTranslator(
-        max_workers=args.max_workers, use_whisper=not args.no_whisper, allow_retranslate=args.retranslate, lock_file=env_config["subtitle_lock_file"]
+        max_workers=args.max_workers,
+        use_whisper=not args.no_whisper,
+        allow_retranslate=args.retranslate,
+        lock_file=env_config["subtitle_lock_file"],
+        force_language=args.force_language,
     )
 
     return args, translator
@@ -3516,15 +3447,9 @@ def _parse_arguments_and_setup_translator(env_config: Dict[str, Any]) -> tuple:
 
 def _reset_subtitle_progress(translator, input_args: dict):
     """Resetea las estadísticas y archivos procesados cuando las rutas cambian"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-
     try:
-        # Leer el archivo actual
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
-        else:
-            progress_data = {}
+        # Leer estado actual desde DB
+        progress_data = load_progress() or {}
 
         # Resetear la sección de subtitle_translation
         progress_data["subtitle_translation"] = {
@@ -3554,9 +3479,8 @@ def _reset_subtitle_progress(translator, input_args: dict):
             "last_notification": None,
         }
 
-        # Guardar el archivo actualizado
-        with open(progress_file, "w") as f:
-            json.dump(progress_data, f, indent=2, ensure_ascii=False)
+        # Guardar estado actualizado en DB
+        save_progress(progress_data)
 
         translator.logger.info("Progreso de subtítulos reseteado debido a cambio de rutas")
         translator.logger.info(f"Nueva ruta: {input_args.get('corrected_paths', [''])[0]}")
@@ -3567,11 +3491,8 @@ def _reset_subtitle_progress(translator, input_args: dict):
 
 def _resume_incomplete_process(translator) -> dict:
     """Reanuda un proceso incompleto de traducción de subtítulos"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-
     try:
-        with open(progress_file, "r") as f:
-            progress_data = json.load(f)
+        progress_data = load_progress() or {}
 
         subtitle_translation = progress_data.get("subtitle_translation", {})
         last_input_args = subtitle_translation.get("last_input_args", {})
@@ -3614,13 +3535,10 @@ def _resume_incomplete_process(translator) -> dict:
 
 def _should_resume_incomplete_process(translator, current_args=None) -> bool:
     """Verifica si hay un proceso incompleto que se puede reanudar"""
-    progress_file = translator.tmp_dir / translator.PROGRESS_FILE_NAME
-    if not progress_file.exists():
-        return False
-
     try:
-        with open(progress_file, "r") as f:
-            progress_data = json.load(f)
+        progress_data = load_progress() or {}
+        if not progress_data:
+            return False
 
         subtitle_translation = progress_data.get("subtitle_translation", {})
         percentage = subtitle_translation.get("percentage", 0)
@@ -3748,7 +3666,7 @@ def _execute_main_processing(args, translator, input_args: dict) -> dict:
 
 def _correct_container_paths(paths: list, translator) -> list:
     """Corrige las rutas para el entorno de contenedor Docker
-    Normaliza rutas del host (/home/tafurc/mediaJelly/media) a rutas Docker (/mediajelly/media)
+    Normaliza rutas del host (<base>/media) a rutas Docker (/mediajelly/media)
     """
     translator.logger.info(f"_correct_container_paths recibió {len(paths)} paths")
     translator.logger.info(f"Primeros 3 paths: {paths[:3]}")
@@ -3756,15 +3674,12 @@ def _correct_container_paths(paths: list, translator) -> list:
     for path_str in paths:
         path_str = str(path_str)  # Asegurar que es string
 
-        # Normalizar rutas del host a Docker
-        # Casos a manejar:
-        # 1. /home/tafurc/mediaJelly/media/ -> /mediajelly/media/
-        # 2. /mediaJelly/media/ -> /mediajelly/media/
-        # 3. /mediajelly/media/ -> /mediajelly/media/ (ya correcto)
+        host_media_prefix = str(MediaJellyPaths.get_media_dir()) + "/"
 
-        if "/home/tafurc/mediaJelly/media/" in path_str:
+        # Normalizar rutas del host a Docker
+        if host_media_prefix in path_str:
             # Ruta desde host, convertir a Docker
-            corrected_path = path_str.replace("/home/tafurc/mediaJelly/media/", "/mediajelly/media/")
+            corrected_path = path_str.replace(host_media_prefix, "/mediajelly/media/")
             translator.logger.debug(f"Ruta normalizada (host->docker): {path_str} -> {corrected_path}")
             corrected_paths.append(corrected_path)
         elif path_str.startswith("/mediaJelly"):
@@ -3838,16 +3753,12 @@ def _send_subtitle_notification(env_config: dict, translator, stats: dict):
 
 
 def _mark_notification_sent(translator):
-    """Marca la notificación como enviada en el archivo de progreso"""
-    progress_file = translator.tmp_dir / "progress.json"
+    """Marca la notificación como enviada en el progreso persistido (DB)."""
     try:
-        if progress_file.exists():
-            with open(progress_file, "r") as f:
-                progress_data = json.load(f)
-            if "subtitle_translation" in progress_data:
-                progress_data["subtitle_translation"]["notified"] = True
-                with open(progress_file, "w") as f:
-                    json.dump(progress_data, f, indent=2)
+        progress_data = load_progress() or {}
+        if "subtitle_translation" in progress_data:
+            progress_data["subtitle_translation"]["notified"] = True
+            save_progress(progress_data)
     except Exception as e:
         translator.logger.warning(f"Error actualizando estado de notificación: {e}")
 
@@ -3863,9 +3774,42 @@ def _cleanup_lock_file(lock_file: Path):
 
 
 # Función para limpiar lock al salir (para señales)
-def _signal_handler(signum, lock_file: Path):
-    """Manejador de señales para cleanup"""
+def _send_pause_notification(translator, env_config: dict):
+    """Avisa por Telegram del avance alcanzado cuando el proceso se interrumpe antes de terminar."""
+    stats = getattr(translator, "current_stats", None)
+    if not stats or not stats.get("total_files"):
+        return
+
+    try:
+        notifier_cmd = [
+            sys.executable,
+            str(env_config["scripts_dir"] / "mediajelly_notifier.py"),
+            "subtitle_paused",
+            str(stats["total_files"]),
+            str(stats.get("processed", 0)),
+            str(stats["extracted"]),
+            str(stats["translated"]),
+            str(stats["with_spanish_audio"]),
+            str(stats["with_spanish_subs"]),
+            str(stats["errors"]),
+        ]
+        # Debe caber en la gracia que da el cron runner antes de SIGKILL
+        result = subprocess.run(notifier_cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            translator.logger.info("Notificación de pausa de subtítulos enviada")
+        else:
+            translator.logger.warning(f"Error enviando notificación de pausa: {result.stderr}")
+    except Exception as e:
+        translator.logger.warning(f"Error al enviar notificación de pausa: {e}")
+
+
+# Función para limpiar lock al salir (para señales)
+def _signal_handler(signum, lock_file: Path, run_state: Optional[Dict[str, Any]] = None):
+    """Manejador de señales: avisa del avance, limpia el lock y termina"""
     print(f"\n{EmojiGenerator.signal()} Recibida señal {signum}, limpiando...")
+    translator = (run_state or {}).get("translator")
+    if translator is not None:
+        _send_pause_notification(translator, run_state["env_config"])
     _cleanup_lock_file(lock_file)
     sys.exit(0)
 

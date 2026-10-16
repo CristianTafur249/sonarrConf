@@ -6,29 +6,33 @@ x-logging: &default-logging
 
 services:
   transmission:
-    image: jaymoulin/transmission:4.0.6
+    image: lscr.io/linuxserver/transmission:latest
     container_name: transmission
     networks:
       - mynetwork
     environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
       - TZ=${TZ}
-    command: transmission-daemon -f -g /config
+      # Sin USER/PASS la imagen de LinuxServer desactiva la autenticación del RPC
+      - USER=${TRANSMISSION_USERNAME}
+      - PASS=${TRANSMISSION_PASSWORD}
     volumes:
       - ./config/transmission:/config:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
+      # Solo ve las descargas; Sonarr/Radarr las enlazan a /data/media
+      - ./data/torrents:/data/torrents:rw
     ports:
       - "9091:9091"
       - "51413:51413"
       - "51413:51413/udp"
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: "1.0"
+    mem_limit: 384m
+    mem_reservation: 192m
+    cpus: "0.75"
     healthcheck:
-      test: ["CMD", "pgrep", "transmission-daemon"]
+      # El pgrep de la imagen de LinuxServer no reconoce el nombre completo del proceso
+      test: ["CMD-SHELL", "nc -z localhost 9091 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -36,19 +40,24 @@ services:
   samba:
     image: dperson/samba
     container_name: samba
-    command: '-u "pi;password" -s "media;/media;yes;no;yes;all;pi" -s "downloads;/downloads;yes;no;yes;all;pi" -s "scripts;/scripts;yes;no;yes;all;pi"'
+    # Sin campo de "admin users": smbd crea como root todo lo que hace un admin,
+    # y el bot/pipeline (uid 1000) luego no puede escribir en esas carpetas.
+    command: '-u "${SAMBA_USER};${SAMBA_PASSWORD}" -s "media;/media;yes;no;yes;all" -s "downloads;/downloads;yes;no;yes;all" -s "scripts;/scripts;yes;no;yes;all"'
     stdin_open: true
     tty: true
     environment:
       - TZ=${TZ}
       - PUID=${PUID}
       - PGID=${PGID}
+      # dperson/samba: uid/gid de "smbuser" (force user) -> archivos creados como 1000:1000
+      - USERID=${PUID}
+      - GROUPID=${PGID}
     ports:
       - "139:139"
       - "445:445"
     volumes:
-      - ./media:/media:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./data/media:/media:rw
+      - ./data/torrents:/downloads:rw
       - ./scripts:/scripts:ro
     restart: unless-stopped
     logging: *default-logging
@@ -69,15 +78,15 @@ services:
       - "7878:7878"
     volumes:
       - ./config/radarr-config:/config:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/anime:/anime:rw
+      # Un solo montaje con descargas y biblioteca: así la importación es un
+      # enlace duro instantáneo en vez de una copia (esquema de TRaSH Guides)
+      - ./data:/data:rw
       - ./scripts:/scripts:ro
-      - ./config/1tb1/Bittorrent:/downloads:rw
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 1g
-    mem_reservation: 512m
-    cpus: "1.5"
+    mem_limit: 640m
+    mem_reservation: 320m
+    cpus: "1.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7878/ping"]
       interval: 30s
@@ -96,16 +105,14 @@ services:
     volumes:
       - ./config/sonarr-config:/config:rw
       - ./scripts:/scripts:ro
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
-      - ./config/1tb1/Bittorrent:/downloads:rw
+      - ./data:/data:rw
     ports:
       - "8989:8989"
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 1g
-    mem_reservation: 512m
-    cpus: "1.5"
+    mem_limit: 640m
+    mem_reservation: 320m
+    cpus: "1.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8989/ping"]
       interval: 30s
@@ -117,6 +124,8 @@ services:
     image: lscr.io/linuxserver/prowlarr:latest
     networks:
       - mynetwork
+    dns:
+      - 172.20.0.53
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -127,14 +136,82 @@ services:
       - "9696:9696"
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: "1.0"
+    mem_limit: 384m
+    mem_reservation: 192m
+    cpus: "0.75"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9696/ping"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # DNS cifrado (DoH) para los contenedores de indexadores: el DNS del proveedor de
+  # internet no resuelve varios sitios de torrents en español aunque están en línea.
+  dns-doh:
+    image: adguard/dnsproxy:latest
+    container_name: dns-doh
+    command:
+      [
+        "-l",
+        "0.0.0.0",
+        "-p",
+        "53",
+        "-u",
+        "https://1.1.1.1/dns-query",
+        "-u",
+        "https://1.0.0.1/dns-query",
+        "--cache",
+      ]
+    networks:
+      mynetwork:
+        ipv4_address: 172.20.0.53
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 64m
+    cpus: "0.25"
+
+  # Resuelve los desafíos de Cloudflare de los indexadores (lo usa Prowlarr)
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    networks:
+      - mynetwork
+    dns:
+      - 172.20.0.53
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: "1.0"
+
+  # Indexadores en español que Prowlarr no trae (DonTorrent, MejorTorrent, Wolfmax4K,
+  # DivxTotal). Prowlarr los consume como Torznab genérico en http://jackett:9117
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: jackett
+    networks:
+      - mynetwork
+    dns:
+      - 172.20.0.53
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - AUTO_UPDATE=false
+    volumes:
+      - ./config/jackett-config:/config:rw
+    # Sin puerto publicado: no tiene contraseña y solo lo usa Prowlarr por la red interna
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 384m
+    mem_reservation: 128m
+    cpus: "0.75"
+    depends_on:
+      - flaresolverr
+      - dns-doh
 
   bazarr:
     image: lscr.io/linuxserver/bazarr:latest
@@ -149,15 +226,12 @@ services:
       - "6767:6767"
     volumes:
       - ./config/bazarr-config:/config:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
-      - ./config/1tb1/Bittorrent:/downloads:ro
+      - ./data/media:/data/media:rw
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 512m
-    mem_reservation: 256m
-    cpus: "1.0"
+    mem_limit: 384m
+    mem_reservation: 192m
+    cpus: "0.75"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6767/ping"]
       interval: 30s
@@ -179,9 +253,10 @@ services:
     volumes:
       - ./config/jellyfin-config:/config:rw
       - ./config/jellyfin-cache:/cache:rw
-      - ./media/Peliculas:/movies:rw
-      - ./media/series:/tvshows:rw
-      - ./media/anime:/anime:rw
+      # Rutas internas sin cambios para no alterar las bibliotecas existentes
+      - ./data/media/Peliculas:/movies:rw
+      - ./data/media/series:/tvshows:rw
+      - ./data/media/anime:/anime:rw
     ports:
       - "8096:8096"
     restart: unless-stopped
@@ -195,43 +270,51 @@ services:
       timeout: 10s
       retries: 3
 
-  jellyseerr:
-    image: fallenbagel/jellyseerr:latest
-    container_name: jellyseerr
-    environment:
-      - LOG_LEVEL=info
-      - TZ=${TZ}
-      - PORT=5055
+  # Solicitudes de películas y series. Seerr es el sucesor de Jellyseerr; habla con Jellyfin, Sonarr y Radarr por la red interna.
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
     networks:
       - mynetwork
+    environment:
+      - TZ=${TZ}
+      - PORT=5055
+      - LOG_LEVEL=warn
+      # Tope del heap de Node para que no crezca hasta el límite del contenedor
+      - NODE_OPTIONS=--max-old-space-size=256
     ports:
       - "5055:5055"
     volumes:
-      - ./config/jellyseerr-config:/app/config:rw
+      - ./config/seerr-config:/app/config:rw
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 500m
-    mem_reservation: 256m
+    mem_limit: 512m
+    mem_reservation: 128m
     cpus: "0.5"
     healthcheck:
       test:
         [
-          "CMD",
-          "wget",
-          "--quiet",
-          "--tries=1",
-          "--spider",
-          "http://localhost:5055/api/v1/status",
+          "CMD-SHELL",
+          "wget -q --spider http://localhost:5055/api/v1/status || exit 1",
         ]
       interval: 60s
-      timeout: 30s
-      retries: 5
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - jellyfin
 
   mediajelly-cron:
     build:
       context: .
       dockerfile: Dockerfile.hybrid
+      args:
+        PUID: ${PUID:-1000}
+        PGID: ${PGID:-1000}
+        TZ: ${TZ:-UTC}
     container_name: mediajelly-cron
+    # SE RECOMIENDA ELIMINAR O COMENTAR LA SIGUIENTE LÍNEA:
+    # user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       - TZ=${TZ}
       - PUID=${PUID}
@@ -239,10 +322,11 @@ services:
       - MEDIAJELLY_MODE=${MEDIAJELLY_MODE:-python}
       - PYTHONUNBUFFERED=1
       - PYTHONOPTIMIZE=2
-      - OMP_NUM_THREADS=4
+      - OMP_NUM_THREADS=2
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - LANGUAGE_CACHE_TTL=86400
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
@@ -251,15 +335,15 @@ services:
     volumes:
       - ./scripts:/mediajelly/scripts:rw
       - ./config:/mediajelly/config:ro
-      - ./media:/mediajelly/media:rw
-      - ./config/1tb1/Bittorrent:/mediajelly/downloads:rw
+      - ./data/media:/mediajelly/media:rw
+      - ./data/torrents:/mediajelly/downloads:rw
     devices:
-      - /dev/dri:/dev/dri # Hardware acceleration
+      - /dev/dri:/dev/dri
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 6g
-    mem_reservation: 4g
-    cpus: "4.0"
+    mem_limit: 4g
+    mem_reservation: 2g
+    cpus: "5.0"
     depends_on:
       - transmission
       - radarr
@@ -272,14 +356,12 @@ services:
       - mynetwork
     volumes:
       - ./config/redis:/data
-    ports:
-      - "6379:6379"
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 256m
     mem_reservation: 128m
     cpus: "0.5"
-    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
 
   telegram-transmission-bot:
     image: kevinhalpin/transmission-telegram:latest
@@ -293,7 +375,7 @@ services:
       - TRANSMISSION_URL=${TRANSMISSION_URL:-http://transmission:9091/transmission/rpc}
       - TRANSMISSION_USERNAME=${TRANSMISSION_USERNAME:-}
       - TRANSMISSION_PASSWORD=${TRANSMISSION_PASSWORD:-}
-    command: '-token=${TELEGRAM_TRANSMISSION_BOT} -master=${TELEGRAM_MASTER_USERNAME} -url=${TRANSMISSION_URL} -username=${TRANSMISSION_USERNAME} -password=${TRANSMISSION_PASSWORD}'
+    command: "-token=${TELEGRAM_TRANSMISSION_BOT} -master=${TELEGRAM_MASTER_USERNAME} -url=${TRANSMISSION_URL} -username=${TRANSMISSION_USERNAME} -password=${TRANSMISSION_PASSWORD}"
     depends_on:
       - transmission
     restart: unless-stopped

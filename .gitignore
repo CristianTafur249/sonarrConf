@@ -22,8 +22,9 @@ config/*/
 # ARCHIVOS DE MEDIOS Y DATOS
 # ============================================================================
 
-# Archivos de medios (demasiado grandes)
-media/
+# Archivos de medios y descargas (demasiado grandes)
+media
+data/
 
 # Archivos de trabajo temporal
 scripts/tmp/
@@ -241,3 +242,5 @@ yarn-debug.log*
 yarn-error.log*
 package-lock.json
 yarn.lock
+scripts/mediajelly_bot.session
+scripts/mediajelly_bot.session-journal

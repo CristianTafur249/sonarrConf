@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Union, List
 from dataclasses import dataclass, field
 from datetime import datetime
+from mediajelly_utils import MediaJellyPaths
+
+# Evitar importación circular
+try:
+    from mediajelly_config import get_config
+except Exception:
+    get_config = None
 
 
 @dataclass
@@ -21,6 +28,9 @@ class TelegramConfig:
     notify_on_error: bool = True
     notify_on_no_files: bool = False
     emoji_enabled: bool = True
+    # Credenciales para MTProto (Telethon) - descarga de archivos grandes
+    api_id: Optional[int] = None
+    api_hash: Optional[str] = None
 
 
 @dataclass
@@ -52,6 +62,7 @@ class LanguageDetectionConfig:
     redis_host: str = "redis"
     redis_port: int = 6379
     redis_db: int = 0
+    redis_password: Optional[str] = field(default_factory=lambda: os.environ.get('REDIS_PASSWORD') or None)
     cache_ttl_seconds: int = 86400
     max_samples_per_file: int = 15
     sample_duration_seconds: int = 30
@@ -83,10 +94,10 @@ class PathsConfig:
 class LoggingConfig:
     """Configuración de logging"""
     level: str = "INFO"
-    main_log: str = "/mediajelly/scripts/logs/mediajelly.log"
-    language_detection_log: str = "/mediajelly/scripts/logs/language-detection.log"
-    subtitle_translator_log: str = "/mediajelly/scripts/logs/subtitle_translator.log"
-    processor_log: str = "/mediajelly/scripts/logs/processor.log"
+    main_log: str = "/mediajelly/scripts/tmp/logs/mediajelly.log"
+    language_detection_log: str = "/mediajelly/scripts/tmp/logs/language-detection.log"
+    subtitle_translator_log: str = "/mediajelly/scripts/tmp/logs/subtitle_translator.log"
+    processor_log: str = "/mediajelly/scripts/tmp/logs/processor.log"
 
 
 @dataclass
@@ -153,7 +164,9 @@ class MediaJellyConfig:
                 notify_on_success=telegram_data.get('notify_on_success', True),
                 notify_on_error=telegram_data.get('notify_on_error', True),
                 notify_on_no_files=telegram_data.get('notify_on_no_files', False),
-                emoji_enabled=telegram_data.get('emoji_enabled', True)
+                emoji_enabled=telegram_data.get('emoji_enabled', True),
+                api_id=telegram_data.get('api_id'),
+                api_hash=telegram_data.get('api_hash'),
             )
 
         # Configuración de procesamiento
@@ -180,6 +193,7 @@ class MediaJellyConfig:
                 redis_host=lang_data.get('redis_host', 'localhost'),
                 redis_port=lang_data.get('redis_port', 6379),
                 redis_db=lang_data.get('redis_db', 0),
+                redis_password=os.environ.get('REDIS_PASSWORD') or None,
                 cache_ttl_seconds=lang_data.get('cache_ttl_seconds', 86400),
                 max_samples_per_file=lang_data.get('max_samples_per_file', 15),
                 sample_duration_seconds=lang_data.get('sample_duration_seconds', 30),
@@ -226,10 +240,10 @@ class MediaJellyConfig:
             logging_data = data['logging']
             config.logging = LoggingConfig(
                 level=logging_data.get('level', 'INFO'),
-                main_log=logging_data.get('main_log', '/mediajelly/scripts/logs/mediajelly.log'),
-                language_detection_log=logging_data.get('language_detection_log', '/mediajelly/scripts/logs/language-detection.log'),
-                subtitle_translator_log=logging_data.get('subtitle_translator_log', '/mediajelly/scripts/logs/subtitle_translator.log'),
-                processor_log=logging_data.get('processor_log', '/mediajelly/scripts/logs/processor.log')
+                main_log=logging_data.get('main_log', '/mediajelly/scripts/tmp/logs/mediajelly.log'),
+                language_detection_log=logging_data.get('language_detection_log', '/mediajelly/scripts/tmp/logs/language-detection.log'),
+                subtitle_translator_log=logging_data.get('subtitle_translator_log', '/mediajelly/scripts/tmp/logs/subtitle_translator.log'),
+                processor_log=logging_data.get('processor_log', '/mediajelly/scripts/tmp/logs/processor.log')
             )
 
         return config
@@ -259,10 +273,9 @@ class MediaJellyConfig:
             return data
 
     def save_to_file(self, config_path: Union[str, Path]) -> None:
-        """Guarda configuración actual a archivo YAML"""
+        """Guarda la configuración actual a un archivo YAML."""
         config_path = Path(config_path)
 
-        # Convertir a diccionario
         data = {
             'telegram': {
                 'bot_token': self.telegram.bot_token,
@@ -270,7 +283,9 @@ class MediaJellyConfig:
                 'notify_on_success': self.telegram.notify_on_success,
                 'notify_on_error': self.telegram.notify_on_error,
                 'notify_on_no_files': self.telegram.notify_on_no_files,
-                'emoji_enabled': self.telegram.emoji_enabled
+                'emoji_enabled': self.telegram.emoji_enabled,
+                'api_id': self.telegram.api_id,
+                'api_hash': self.telegram.api_hash,
             },
             'processing': {
                 'max_concurrent_jobs': self.processing.max_concurrent_jobs,
@@ -279,7 +294,9 @@ class MediaJellyConfig:
                 'temp_dir': self.processing.temp_dir,
                 'log_level': self.processing.log_level,
                 'enable_compression': self.processing.enable_compression,
-                'compression_quality': self.processing.compression_quality
+                'compression_quality': self.processing.compression_quality,
+                'reprocess_on_label_change': self.processing.reprocess_on_label_change,
+                'apply_audio_tagging_on_skip': self.processing.apply_audio_tagging_on_skip,
             },
             'language_detection': {
                 'whisper_model': self.language_detection.whisper_model,
@@ -290,7 +307,8 @@ class MediaJellyConfig:
                 'cache_ttl_seconds': self.language_detection.cache_ttl_seconds,
                 'max_samples_per_file': self.language_detection.max_samples_per_file,
                 'sample_duration_seconds': self.language_detection.sample_duration_seconds,
-                'fallback_to_file_cache': self.language_detection.fallback_to_file_cache
+                'fallback_to_file_cache': self.language_detection.fallback_to_file_cache,
+                'language_code_map': self.language_detection.language_code_map,
             },
             'translation': {
                 'enabled': self.translation.enabled,
@@ -298,7 +316,18 @@ class MediaJellyConfig:
                 'target_languages': self.translation.target_languages,
                 'cache_enabled': self.translation.cache_enabled,
                 'max_retries': self.translation.max_retries,
-                'timeout_seconds': self.translation.timeout_seconds
+                'timeout_seconds': self.translation.timeout_seconds,
+            },
+            'paths': {
+                'media_paths': self.paths.media_paths,
+                'cache_file_path': self.paths.cache_file_path,
+            },
+            'logging': {
+                'level': self.logging.level,
+                'main_log': self.logging.main_log,
+                'language_detection_log': self.logging.language_detection_log,
+                'subtitle_translator_log': self.logging.subtitle_translator_log,
+                'processor_log': self.logging.processor_log,
             },
             'metrics': {
                 'enabled': self.metrics.enabled,
@@ -306,14 +335,11 @@ class MediaJellyConfig:
                 'api_port': self.metrics.api_port,
                 'collect_system_metrics': self.metrics.collect_system_metrics,
                 'collect_processing_metrics': self.metrics.collect_processing_metrics,
-                'export_interval_seconds': self.metrics.export_interval_seconds
-            }
+                'export_interval_seconds': self.metrics.export_interval_seconds,
+            },
         }
 
-        # Crear directorio si no existe
         config_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Guardar a YAML
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, indent=2)
 
@@ -351,10 +377,9 @@ def load_config(config_path: Optional[Union[str, Path]] = None) -> MediaJellyCon
     if config_path is None:
         # Buscar en ubicaciones estándar
         search_paths = [
-            Path("/mediajelly/config/mediajelly.yaml"),
-            Path("/home/tafurc/mediaJelly/config/mediajelly.yaml"),
+            MediaJellyPaths.get_config_dir() / "mediajelly.yaml",
             Path("config/mediajelly.yaml"),
-            Path("mediajelly.yaml")
+            Path("mediajelly.yaml"),
         ]
 
         for path in search_paths:
