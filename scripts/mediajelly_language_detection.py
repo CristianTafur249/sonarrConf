@@ -608,9 +608,11 @@ class LanguageDetectionMixin:
                                         f"{EmojiGenerator.warning_msg()} No se pudo detectar idioma para stream audio {audio_stream_counter}"
                                     )
 
-                            # Guardar el idioma del stream usando el índice relativo de audio
-                            if not lang or lang == "und":
-                                lang = "spa"
+                            # Guardar el idioma del stream usando el índice relativo de audio.
+                            # Si no se pudo detectar se deja "und": asumir "spa" escribía una
+                            # etiqueta falsa en el archivo y el detector ya no lo re-analizaba.
+                            if not lang:
+                                lang = "und"
                             audio_languages[audio_stream_counter] = lang
 
                             # Verificar si es español
